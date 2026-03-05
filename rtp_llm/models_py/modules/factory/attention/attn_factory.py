@@ -2,6 +2,9 @@ import logging
 from typing import Callable, Dict, List, Optional, Union
 
 from rtp_llm.model_loader.model_weight_info import ModelWeights
+from rtp_llm.models_py.modules.factory.attention.cuda_headwise_impl.headwise import (
+    ConfigManager,
+)
 from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import (
     FMHAImplBase,
     MlaImplBase,
