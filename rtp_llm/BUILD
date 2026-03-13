@@ -3,7 +3,7 @@ load("@rules_python//python:packaging.bzl", "py_package", "py_wheel")
 # make different torch for different device when in compiling
 load("//bazel:defs.bzl", "upload_pkg", "copy_target_to", "upload_wheel", "rename_wheel", "rename_wheel_aarch64")
 load("//bazel:arch_select.bzl", "requirement", "whl_deps", "internal_deps", "jit_deps", "triton_deps")
-load("//open_source/bazel:arch_select.bzl", "platform_deps")
+load("//open_source/bazel:arch_select.bzl", "platform_deps", "rtp_kernel_deps")
 load("//bazel:bundle.bzl", "bundle_files", "bundle_tar")
 
 load("@release_version//:defs.bzl", "RELEASE_VERSION")
@@ -126,6 +126,8 @@ requirement([
     "fastsafetensors",
     "pybind11_stubgen",
 ] + tensorrt + deep + flashinfer_with_cache + flashmla)
+
+rtp_kernel_deps()
 
 filegroup(
     name = "cutlass_config",
@@ -252,6 +254,9 @@ py_library(
         "@//:using_cuda12_9_x86": flashinfer_with_cache + flashmla,
         "@//:using_cuda12_arm": flashinfer_with_cache,
         "@//:cuda_pre_12_9": flashinfer,
+        "//conditions:default": []
+    }) + select({
+        "@//:using_cuda12_9_x86": ["rtp-kernel"],
         "//conditions:default": []
     }) + select({
         "@//:using_arm": [],
