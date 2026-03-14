@@ -70,8 +70,6 @@ try:
 
             PREFILL_MHA_IMPS.extend(
                 [
-                    HeadWiseFP8PrefillImpl,
-                    HeadWisePrefillImpl,
                     TRTMHAImpl,
                     PyFlashinferPrefillImpl,
                     PyFlashinferPagedPrefillImpl,
