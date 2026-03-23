@@ -38,38 +38,42 @@ if device_type == DeviceType.ROCm:
         AiterPrefillImplPaged,
     )
 
-    PREFILL_MHA_IMPS.append(AiterPrefillImplPaged)
-    PREFILL_MHA_IMPS.append(AiterPrefillImplAsm)
-    PREFILL_MHA_IMPS.append(AiterPrefillImplNonAsm)
-    DECODE_MHA_IMPS.append(AiterDecodeImplAsm)
-    DECODE_MHA_IMPS.append(AiterDecodeImplNonAsm)
-    DECODE_MHA_IMPS.append(AiterDecodeImplTriton)
-else:
-    # currently append early means impl has higher priority
-    if device_type == DeviceType.Cuda:
-        from rtp_llm.models_py.modules.factory.attention.cuda_headwise_impl.headwise import (
-            HeadWisePrefillImpl,
+        PREFILL_MHA_IMPS.append(AiterPrefillImplPaged)
+        PREFILL_MHA_IMPS.append(AiterPrefillImplAsm)
+        PREFILL_MHA_IMPS.append(AiterPrefillImplNonAsm)
+        DECODE_MHA_IMPS.append(AiterDecodeImplAsm)
+        DECODE_MHA_IMPS.append(AiterDecodeImplNonAsm)
+        DECODE_MHA_IMPS.append(AiterDecodeImplTriton)
+    else:
+        # Torch Naive implementations (fallback, lowest priority)
+        from rtp_llm.models_py.modules.factory.attention.cuda_impl.torch_naive import (
+            TorchNaiveClusteredDecodeImpl,
+            TorchNaiveClusteredPrefillImpl,
+            TorchNaiveDecodeImpl,
+            TorchNaivePrefillImpl,
         )
-        from rtp_llm.models_py.modules.factory.attention.cuda_headwise_impl.headwise_fp8 import (
-            HeadWiseFP8PrefillImpl,
-        )
-        from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
-            PyFlashinferDecodeImpl,
-            PyFlashinferPagedPrefillImpl,
-            PyFlashinferPrefillImpl,
-        )
-        from rtp_llm.models_py.modules.factory.attention.cuda_impl.trt import (
-            TRTMHAImpl,
-            TRTPagedMHAImpl,
-        )
-        from rtp_llm.models_py.modules.factory.attention.cuda_impl.trtllm_gen import (
-            FlashInferTRTLLMDecodeImpl,
-            FlashInferTRTLLMPrefillImpl,
-            FlashInferTRTLLMSpecDecodeImpl,
-        )
-        from rtp_llm.models_py.modules.factory.attention.cuda_impl.xqa import (
-            get_xqa_impl,
-        )
+
+        PREFILL_MHA_IMPS.extend([TorchNaivePrefillImpl])
+        DECODE_MHA_IMPS.extend([TorchNaiveDecodeImpl])
+        # currently append early means impl has higher priority
+        if device_type == DeviceType.Cuda:
+            from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
+                PyFlashinferDecodeImpl,
+                PyFlashinferPagedPrefillImpl,
+                PyFlashinferPrefillImpl,
+            )
+            from rtp_llm.models_py.modules.factory.attention.cuda_impl.trt import (
+                TRTMHAImpl,
+                TRTPagedMHAImpl,
+            )
+            from rtp_llm.models_py.modules.factory.attention.cuda_impl.trtllm_gen import (
+                FlashInferTRTLLMDecodeImpl,
+                FlashInferTRTLLMPrefillImpl,
+                FlashInferTRTLLMSpecDecodeImpl,
+            )
+            from rtp_llm.models_py.modules.factory.attention.cuda_impl.xqa import (
+                get_xqa_impl,
+            )
 
         PREFILL_MHA_IMPS.extend(
             [
@@ -118,16 +122,18 @@ else:
         PREFILL_MHA_IMPS.append(FlashInferPrefillImpl)
         DECODE_MHA_IMPS.append(FlashInferDecodeImpl)
 
-    from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
-        PyFlashinferDecodeImpl,
-        PyFlashinferPrefillImpl,
-    )
+        from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
+            PyFlashinferDecodeImpl,
+            PyFlashinferPrefillImpl,
+        )
 
-    PREFILL_MHA_IMPS.append(PyFlashinferPrefillImpl)
-    DECODE_MHA_IMPS.append(PyFlashinferDecodeImpl)
+        PREFILL_MHA_IMPS.append(PyFlashinferPrefillImpl)
+        DECODE_MHA_IMPS.append(PyFlashinferDecodeImpl)
 
-    from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_cp_flashinfer import (
-        CPFlashInferImpl,
-    )
+        from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_cp_flashinfer import (
+            CPFlashInferImpl,
+        )
 
-    PREFILL_MHA_IMPS.append(CPFlashInferImpl)
+        PREFILL_MHA_IMPS.append(CPFlashInferImpl)
+except Exception as e:
+    logging.warning(f"Failed to import Attention implementation: {e}")
