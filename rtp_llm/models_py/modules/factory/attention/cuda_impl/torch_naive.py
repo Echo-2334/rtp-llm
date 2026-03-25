@@ -8,6 +8,8 @@ Reference: SGLang's torch_native_backend.py
 """
 
 import logging
+import os
+import time
 from typing import Optional
 
 import torch
@@ -543,12 +545,12 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
 
         # 5. Read complete K, V from cache (including history)
         k_full, v_full = self._read_kv_from_cache(kv_cache)
-        logging.info(
-            f"[Decode] q shape: {q.shape}, k_full: {k_full.shape}, v_full: {v_full.shape}"
-        )
-        logging.info(
-            f"[Decode] q dtype: {q.dtype}, k dtype: {k_full.dtype}, v dtype: {v_full.dtype}"
-        )
+        # logging.info(
+        #     f"[Decode] q shape: {q.shape}, k_full: {k_full.shape}, v_full: {v_full.shape}"
+        # )
+        # logging.info(
+        #     f"[Decode] q dtype: {q.dtype}, k dtype: {k_full.dtype}, v dtype: {v_full.dtype}"
+        # )
 
         # 6. Execute decode attention (no causal mask needed - single query token)
         output = self._run_attention_decode(q, k_full, v_full)
@@ -645,9 +647,9 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
         sequence_lengths = params.kvlen_h[:batch_size]
         max_seq_len = sequence_lengths.max().item()
 
-        logging.info(
-            f"[_read_kv_from_cache] batch_size={batch_size}, real_seq_lengths={sequence_lengths.tolist()}, max_seq_len={max_seq_len}"
-        )
+        # logging.info(
+        #     f"[_read_kv_from_cache] batch_size={batch_size}, real_seq_lengths={sequence_lengths.tolist()}, max_seq_len={max_seq_len}"
+        # )
 
         # Get KV cache tensor and reshape if needed
         # kv_cache_base may be 2D [num_blocks, kv_block_stride_elems] and needs reshaping to 5D
@@ -961,9 +963,9 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
         kv_cache: Optional[KVCache],
     ) -> torch.Tensor:
         """Forward pass: 使用聚类加速 attention."""
-        logging.info(
-            f"[ClusteredDecode] forward: input qkv shape={qkv.shape}, need_rope={self.need_rope_kv_cache}"
-        )
+        # logging.info(
+        #     f"[ClusteredDecode] forward: input qkv shape={qkv.shape}, need_rope={self.need_rope_kv_cache}"
+        # )
 
         # 1. Apply RoPE if needed
         # NOTE: Decode RoPE may write K,V to cache directly and only return Q
@@ -1069,14 +1071,14 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
                         f"(IncrementalKMeans model not found)"
                     )
 
-    def _run_clustered_attention_decode(
+    def _run_clustered_attention_decode_old(
         self,
         q: torch.Tensor,  # [batch_size, num_heads, head_dim]
         k_full: torch.Tensor,  # [batch_size, total_seq_len, num_kv_heads, head_dim]
         v_full: torch.Tensor,  # [batch_size, total_seq_len, num_kv_heads, head_dim]
         kv_cache: Optional[KVCache],
     ) -> torch.Tensor:
-        """使用聚类加速的 Decode Attention.
+        """使用聚类加速的 Decode Attention (旧版本 - 逐 batch 逐 head).
 
         流程:
         1. Q @ centroids 计算 attention score
@@ -1218,5 +1220,341 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
             is_causal=False,
             scale=self.scaling,
         ).squeeze()
+
+        return output
+
+    def _full_attention_batch(
+        self,
+        q: torch.Tensor,  # [num_heads, head_dim]
+        k: torch.Tensor,  # [num_heads, num_selected, head_dim]
+        v: torch.Tensor,  # [num_heads, num_selected, head_dim]
+        attn_mask: torch.Tensor,  # [num_heads, num_selected], bool
+    ) -> torch.Tensor:
+        """批量执行多个 head 的 attention，使用 mask 控制每个 head 关注的 tokens.
+
+        Args:
+            q: [num_heads, head_dim]
+            k: [num_heads, num_selected, head_dim]
+            v: [num_heads, num_selected, head_dim]
+            attn_mask: [num_heads, num_selected], True 表示该 head 可以 attend 该 token
+
+        Returns:
+            output: [num_heads, head_dim]
+        """
+        # Reshape for SDPA: add batch and query_len dimensions
+        # q: [1, num_heads, 1, head_dim]
+        # k, v: [1, num_heads, num_selected, head_dim]
+        q = q.unsqueeze(0).unsqueeze(2)  # [1, num_heads, 1, head_dim]
+        k = k.unsqueeze(0)  # [1, num_heads, num_selected, head_dim]
+        v = v.unsqueeze(0)
+
+        # attn_mask: [num_heads, num_selected] -> [1, num_heads, 1, num_selected]
+        # PyTorch SDPA 要求 mask 为 bool 或 float
+        # True/False -> 转为 float，True=0.0（可见），False=-inf（屏蔽）
+        mask = torch.zeros_like(attn_mask, dtype=q.dtype)
+        mask[~attn_mask] = float("-inf")  # 屏蔽未选中的 token
+        mask = mask.unsqueeze(0).unsqueeze(2)  # [1, num_heads, 1, num_selected]
+
+        # Handle dtype mismatch
+        if not (q.dtype == k.dtype == v.dtype):
+            k = k.to(q.dtype)
+            v = v.to(q.dtype)
+
+        # Execute attention
+        output = scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scaling,
+        )
+
+        # output: [1, num_heads, 1, head_dim] -> [num_heads, head_dim]
+        return output.squeeze(0).squeeze(1)
+
+    def _run_clustered_attention_decode(
+        self,
+        q: torch.Tensor,  # [batch_size, num_heads, head_dim]
+        k_full: torch.Tensor,  # [batch_size, total_seq_len, num_kv_heads, head_dim]
+        v_full: torch.Tensor,  # [batch_size, total_seq_len, num_kv_heads, head_dim]
+        kv_cache: Optional[KVCache],
+    ) -> torch.Tensor:
+        """使用聚类加速的 Decode Attention (优化版本 - 逐 batch 多 head 并行).
+
+        优化策略: Union-based Batching
+        1. 对每个 head 独立计算 top-p 选择的 token 集合
+        2. 取所有 head 选中 token 的并集作为共同的 token set
+        3. 使用 attention mask 批量执行所有 head 的 attention
+
+        Returns:
+            output: [batch_size, num_heads, head_dim]
+        """
+        # Environment variable fallback to old implementation
+        if os.getenv("ENABLE_BATCH_CLUSTERED_ATTN", "1") == "0":
+            logging.warning(
+                "Using old sequential head implementation (ENABLE_BATCH_CLUSTERED_ATTN=0)"
+            )
+            return self._run_clustered_attention_decode_old(q, k_full, v_full, kv_cache)
+
+        batch_size = q.shape[0]
+        num_heads = q.shape[1]
+        layer_id = kv_cache.layer_id if kv_cache is not None else 0
+        total_tokens = k_full.shape[1]
+
+        # GQA handling
+        if self.enable_gqa:
+            num_groups = self.num_heads // self.num_kv_heads
+            k_full = k_full.repeat_interleave(num_groups, dim=2)
+            v_full = v_full.repeat_interleave(num_groups, dim=2)
+
+        output = torch.empty_like(q)
+
+        # 环境变量：是否启用批量质心计算
+        use_batched_centroid_scoring = (
+            os.getenv("ENABLE_BATCHED_CENTROID_SCORING", "1") == "1"
+        )
+
+        # 外层循环：只按 batch
+        for batch_idx in range(batch_size):
+            # Phase 1: 收集所有 head 的 token 选择
+            all_selected_tokens = []  # List[Set[int]], per head
+            all_cluster_info = []  # 保存每个 head 的 cluster_info，避免重复查询
+
+            centroid_scoring_start = time.perf_counter()
+
+            if not use_batched_centroid_scoring:
+                # Original sequential implementation
+                for head_idx in range(num_heads):
+                    # 将 Q head index 映射到 KV head index（GQA 场景）
+                    if self.enable_gqa:
+                        num_groups = self.num_heads // self.num_kv_heads
+                        kv_head_idx = head_idx // num_groups
+                    else:
+                        kv_head_idx = head_idx
+
+                    key = f"layer_{layer_id}_seq_{batch_idx}_head_{kv_head_idx}"
+
+                    # 如果没有聚类信息，fallback
+                    if key not in _CLUSTER_CACHE:
+                        # Fallback to old implementation for this batch
+                        logging.warning(
+                            f"Missing cluster info for {key}, falling back to old implementation"
+                        )
+                        output[batch_idx, :, :] = (
+                            self._run_clustered_attention_decode_old(
+                                q[batch_idx : batch_idx + 1, :, :],
+                                k_full[batch_idx : batch_idx + 1, :, :, :],
+                                v_full[batch_idx : batch_idx + 1, :, :, :],
+                                kv_cache,
+                            )[0]
+                        )
+                        break  # Skip to next batch
+
+                    cluster_info = _CLUSTER_CACHE[key]
+                    all_cluster_info.append(cluster_info)
+
+                    # 获取质心
+                    if "model" in cluster_info:
+                        centroids = cluster_info["model"].get_centroids()
+                    else:
+                        centroids = cluster_info["centroids"]
+
+                    cluster_indices = cluster_info["cluster_indices"]
+                    cluster_sizes = cluster_info["cluster_sizes"]
+
+                    q_single = q[batch_idx, head_idx, :]  # [head_dim]
+
+                    # Step 1: Q @ centroids 计算 attention score
+                    scores = (
+                        torch.matmul(q_single, centroids.T) * self.scaling
+                    )  # [num_clusters]
+
+                    # 加上簇大小的对数，让大簇有更高的权重
+                    scores = scores + torch.log(
+                        cluster_sizes.float() + 1e-8
+                    )  # 避免 log(0)
+                    scores = torch.softmax(scores, dim=0)
+
+                    # Step 2: Top-p 选择簇
+                    selected_cluster_ids = _top_p_selection(scores, self.top_p)
+
+                    # Step 3: 收集选中簇的所有 token 索引
+                    selected_token_ids = set()
+                    for cluster_id in selected_cluster_ids:
+                        selected_token_ids.update(cluster_indices[cluster_id.item()])
+
+                    all_selected_tokens.append(selected_token_ids)
+            else:
+                # Optimized batched centroid scoring (GQA-grouped)
+                if self.enable_gqa:
+                    num_groups = self.num_heads // self.num_kv_heads
+                else:
+                    num_groups = 1
+
+                # 按 KV head 分组批量计算
+                num_kv_heads_to_process = (
+                    self.num_kv_heads if self.enable_gqa else num_heads
+                )
+
+                for kv_head_idx in range(num_kv_heads_to_process):
+                    key = f"layer_{layer_id}_seq_{batch_idx}_head_{kv_head_idx}"
+
+                    # 如果没有聚类信息，fallback
+                    if key not in _CLUSTER_CACHE:
+                        # Fallback to old implementation for this batch
+                        logging.warning(
+                            f"Missing cluster info for {key}, falling back to old implementation"
+                        )
+                        output[batch_idx, :, :] = (
+                            self._run_clustered_attention_decode_old(
+                                q[batch_idx : batch_idx + 1, :, :],
+                                k_full[batch_idx : batch_idx + 1, :, :, :],
+                                v_full[batch_idx : batch_idx + 1, :, :, :],
+                                kv_cache,
+                            )[0]
+                        )
+                        all_selected_tokens = []  # Clear to trigger continue below
+                        break  # Skip to next batch
+
+                    cluster_info = _CLUSTER_CACHE[key]
+
+                    # 获取质心
+                    if "model" in cluster_info:
+                        centroids = cluster_info["model"].get_centroids()
+                    else:
+                        centroids = cluster_info["centroids"]
+
+                    cluster_indices = cluster_info["cluster_indices"]
+                    cluster_sizes = cluster_info["cluster_sizes"]
+
+                    # 该 KV head 对应的 Q heads
+                    if self.enable_gqa:
+                        start_head_idx = kv_head_idx * num_groups
+                        end_head_idx = start_head_idx + num_groups
+                        q_group = q[
+                            batch_idx, start_head_idx:end_head_idx, :
+                        ]  # [num_groups, head_dim]
+                    else:
+                        # 非 GQA：每个 head 独立
+                        q_group = q[
+                            batch_idx, kv_head_idx : kv_head_idx + 1, :
+                        ]  # [1, head_dim]
+
+                    # 批量计算 scores: [num_groups, head_dim] @ [head_dim, num_clusters] -> [num_groups, num_clusters]
+                    scores_batch = (
+                        torch.matmul(q_group, centroids.T) * self.scaling
+                    )  # [num_groups, num_clusters]
+
+                    # 加上簇大小的对数，让大簇有更高的权重
+                    log_cluster_sizes = torch.log(cluster_sizes.float() + 1e-8)
+                    scores_batch = (
+                        scores_batch + log_cluster_sizes
+                    )  # Broadcasting: [num_groups, num_clusters] + [num_clusters]
+                    scores_batch = torch.softmax(
+                        scores_batch, dim=1
+                    )  # Softmax over clusters dimension
+
+                    # 逐个 Q head 应用 top-p（因为选择结果不同）
+                    group_size = num_groups if self.enable_gqa else 1
+                    for local_idx in range(group_size):
+                        if self.enable_gqa:
+                            head_idx = start_head_idx + local_idx
+                        else:
+                            head_idx = kv_head_idx
+
+                        scores = scores_batch[local_idx, :]
+
+                        # Step 2: Top-p 选择簇
+                        selected_cluster_ids = _top_p_selection(scores, self.top_p)
+
+                        # Step 3: 收集选中簇的所有 token 索引
+                        selected_token_ids = set()
+                        for cluster_id in selected_cluster_ids:
+                            selected_token_ids.update(
+                                cluster_indices[cluster_id.item()]
+                            )
+
+                        all_selected_tokens.append(selected_token_ids)
+
+                        # 保存 cluster_info（每个 head 都需要，但 GQA 下会有重复）
+                        all_cluster_info.append(cluster_info)
+
+            centroid_scoring_time = (
+                time.perf_counter() - centroid_scoring_start
+            ) * 1000
+
+            logging.debug(
+                f"[Centroid Scoring] layer={layer_id}, batch={batch_idx}: "
+                f"time={centroid_scoring_time:.3f}ms, "
+                f"method={'batched_gqa' if (use_batched_centroid_scoring and self.enable_gqa) else ('batched_full' if use_batched_centroid_scoring else 'sequential')}"
+            )
+
+            # Check if we hit fallback above
+            if len(all_selected_tokens) != num_heads:
+                continue  # Already handled by fallback
+
+            # Phase 2: 计算 union token set
+            union_token_set = set()
+            for token_set in all_selected_tokens:
+                union_token_set.update(token_set)
+
+            if len(union_token_set) == 0:
+                # 没有选中任何 token
+                output[batch_idx, :, :] = 0.0
+                logging.warning(
+                    f"No tokens selected for batch {batch_idx}, using zero output"
+                )
+                continue
+
+            union_token_list = sorted(list(union_token_set))  # 排序保证确定性
+            num_selected = len(union_token_list)
+
+            # Phase 3: 构建 attention mask
+            # mask shape: [num_heads, num_selected]
+            attn_mask = torch.zeros(
+                num_heads, num_selected, dtype=torch.bool, device=q.device
+            )
+
+            # token_to_idx: 从 global token id 到 union list index 的映射
+            token_to_idx = {token: idx for idx, token in enumerate(union_token_list)}
+
+            for head_idx in range(num_heads):
+                for token in all_selected_tokens[head_idx]:
+                    idx = token_to_idx[token]
+                    attn_mask[head_idx, idx] = True  # 允许 attend
+
+            # Phase 4: 提取 K, V（union token set）
+            # k_full: [batch_size, total_seq_len, num_heads, head_dim]
+            # -> selected_k: [num_selected, num_heads, head_dim]
+            selected_k = k_full[
+                batch_idx, union_token_list, :, :
+            ]  # [num_selected, num_heads, head_dim]
+            selected_v = v_full[batch_idx, union_token_list, :, :]
+
+            # Phase 5: 批量执行 attention
+            output[batch_idx, :, :] = self._full_attention_batch(
+                q[batch_idx, :, :],  # [num_heads, head_dim]
+                selected_k.transpose(0, 1),  # [num_heads, num_selected, head_dim]
+                selected_v.transpose(0, 1),  # [num_heads, num_selected, head_dim]
+                attn_mask,  # [num_heads, num_selected]
+            )
+
+            # 统计 union set 的效率
+            total_selected = sum(len(s) for s in all_selected_tokens)
+            avg_selected = total_selected / num_heads
+            overhead_pct = (
+                (num_selected - avg_selected) / avg_selected * 100
+                if avg_selected > 0
+                else 0
+            )
+
+            logging.info(
+                f"[Clustering Batching] layer={layer_id}, batch={batch_idx}: "
+                f"union_tokens={num_selected}/{total_tokens} ({num_selected/total_tokens*100:.1f}%), "
+                f"avg_selected={avg_selected:.1f}, "
+                f"overhead={overhead_pct:.1f}%"
+            )
 
         return output
