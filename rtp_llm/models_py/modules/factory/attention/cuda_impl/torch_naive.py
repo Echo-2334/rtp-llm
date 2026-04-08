@@ -813,7 +813,7 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
             if q.ndim == 2:
                 # 2D: [batch, num_heads * head_dim] -> reshape to 3D
                 q = q.reshape(q.shape[0], self.num_heads, self.head_dim)
-            elif q.ndim == 3:
+            elif q.ndim == 4:
                 # Already 3D [batch, num_heads, head_dim] - no change needed
                 pass
             else:
