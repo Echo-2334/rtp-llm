@@ -955,8 +955,10 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
             kv_cache_tensor = kv_cache_base
 
         # Get block indices for each sequence
-        # Shape: [batch_size, max_blocks_per_seq]
+        # Shape: [batch_size, max_blocks_per_seq] or [batch_size, max_blocks_per_seq, 2]
         block_indices = self.attn_inputs.kv_cache_block_id_host[:batch_size, :]
+        if block_indices.ndim == 3:
+            block_indices = block_indices[:, :, 0]
 
         # Prepare output tensors
         k_full = torch.zeros(
