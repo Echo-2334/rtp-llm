@@ -51,6 +51,8 @@ if device_type == DeviceType.ROCm:
             TorchNaiveClusteredPrefillImpl,
             TorchNaiveDecodeImpl,
             TorchNaivePrefillImpl,
+            TorchNaiveResidualFP4DecodeImpl,
+            TorchNaiveResidualFP4PrefillImpl,
         )
 
         PREFILL_MHA_IMPS.extend([TorchNaivePrefillImpl])
