@@ -519,6 +519,7 @@ class TorchNaivePrefillImpl(FMHAImplBase):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         """Forward pass for prefill attention.
 
@@ -792,6 +793,7 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         """Forward pass for decode attention.
 
@@ -952,8 +954,10 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
             kv_cache_tensor = kv_cache_base
 
         # Get block indices for each sequence
-        # Shape: [batch_size, max_blocks_per_seq]
+        # Shape: [batch_size, max_blocks_per_seq] or [batch_size, max_blocks_per_seq, N]
         block_indices = self.attn_inputs.kv_cache_block_id_host[:batch_size, :]
+        if block_indices.ndim == 3:
+            block_indices = block_indices[0, :, :]
 
         # Prepare output tensors
         k_full = torch.zeros(
@@ -1034,7 +1038,7 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
         # Reshape for SDPA
         # q: [batch_size, num_heads, head_dim] -> [batch_size, num_heads, 1, head_dim]
         # k, v: [batch_size, seq_len, num_heads, head_dim] -> [batch_size, num_heads, seq_len, head_dim]
-        q = q.unsqueeze(2)  # Add seq_len dimension
+        # q = q.unsqueeze(2)  # Add seq_len dimension
         k = k.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
         v = v.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
 
@@ -1111,6 +1115,7 @@ class TorchNaiveClusteredPrefillImpl(TorchNaivePrefillImpl):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         """Forward pass: 先做聚类，再执行 attention."""
 
@@ -1375,6 +1380,7 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         """Forward pass: 使用聚类加速 attention."""
         # logging.info(
@@ -1825,6 +1831,7 @@ class TorchNaiveResidualFP4PrefillImpl(TorchNaivePrefillImpl):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         # 1. RoPE
         if self.need_rope_kv_cache:
@@ -1887,6 +1894,7 @@ class TorchNaiveResidualFP4DecodeImpl(TorchNaiveDecodeImpl):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         # 1. RoPE
         if self.need_rope_kv_cache:
