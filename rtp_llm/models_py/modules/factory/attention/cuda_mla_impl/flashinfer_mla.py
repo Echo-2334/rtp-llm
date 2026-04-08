@@ -17,7 +17,7 @@ from flashinfer.utils import is_sm90a_supported
 from rtp_llm.models_py.modules.factory.linear.factory import LinearFactory
 from rtp_llm.models_py.utils.arch import is_cuda
 from rtp_llm.ops import AttentionConfigs, KvCacheDataType
-from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs, rtp_llm_ops
+from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs, rtp_llm_ops
 from rtp_llm.utils.model_weight import W
 
 g_workspace_buffer = None
@@ -74,7 +74,6 @@ def check_attention_inputs(attention_inputs: PyAttentionInputs) -> None:
         "prefix_lengths": torch.empty(0, dtype=dtype, device=device),
         "sequence_lengths": torch.empty(0, dtype=dtype, device=device),
         "kv_cache_block_id_host": torch.empty(0, dtype=dtype, device=device),
-        "kv_cache_kernel_block_id_host": torch.empty(0, dtype=dtype, device=device),
     }
 
     for attr_name, default_tensor in default_tensors.items():
@@ -236,7 +235,7 @@ class MlaFlashInferPrefillOp(object):
         self,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
+        kv_cache: Optional[KVCache],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """使用融合 CUDA kernel 的优化版本"""
 
@@ -353,7 +352,7 @@ class MlaFlashInferPrefillOp(object):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
+        kv_cache: Optional[KVCache],
         layer_id: int,
     ) -> torch.Tensor:
 
@@ -472,7 +471,7 @@ class MlaFlashInferDecodeOp(object):
         self,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
+        kv_cache: Optional[KVCache],
         layer_id: int,
     ) -> torch.Tensor:
 

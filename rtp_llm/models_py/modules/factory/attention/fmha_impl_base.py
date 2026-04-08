@@ -5,7 +5,7 @@ import torch
 
 from rtp_llm.models_py.modules.base.common.kvcache_store import WriteCacheStoreOp
 from rtp_llm.ops import AttentionConfigs, FMHAConfig, FMHAType, ParallelismConfig
-from rtp_llm.ops.compute_ops import LayerKVCache, ParamsBase, PyAttentionInputs
+from rtp_llm.ops.compute_ops import KVCache, ParamsBase, PyAttentionInputs
 
 
 class MlaImplBase(object):
@@ -69,7 +69,7 @@ class MlaImplBase(object):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
+        kv_cache: Optional[KVCache],
         layer_id: int,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -87,15 +87,14 @@ class FMHAImplBase(ABC):
     def forward(
         self,
         qkv: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
-        layer_idx: int = 0,
+        kv_cache: Optional[KVCache],
     ) -> torch.Tensor:
         """执行前向传播计算。
 
         Args:
             qkv: 输入的 QKV 张量
             kv_cache: 可选的 KV Cache，用于存储历史键值对
-            layer_idx: 当前层索引，用于 headwise 等需要 per-layer 配置的实现
+            need_rope_kv_cache: 是否需要应用 RoPE 和 KV Cache 处理
 
         Returns:
             计算后的注意力输出张量

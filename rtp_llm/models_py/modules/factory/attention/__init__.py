@@ -8,7 +8,7 @@ from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import (
     FMHAImplBase,
     MlaImplBase,
 )
-from rtp_llm.ops.compute_ops import DeviceType, get_exec_ctx
+from rtp_llm.ops.compute_ops import DeviceType, get_device
 
 __all__ = [
     "FMHAImplBase",
@@ -26,17 +26,18 @@ from rtp_llm.models_py.modules.factory.attention.attn_factory import (
     PREFILL_MLA_IMPS,
 )
 
-device_type = get_exec_ctx().get_device_type()
-if device_type == DeviceType.ROCm:
-    # Import to register ROCm FMHA implementations
-    from rtp_llm.models_py.modules.factory.attention.rocm_impl.aiter import (
-        AiterDecodeImplAsm,
-        AiterDecodeImplNonAsm,
-        AiterDecodeImplTriton,
-        AiterPrefillImplAsm,
-        AiterPrefillImplNonAsm,
-        AiterPrefillImplPaged,
-    )
+device_type = get_device().get_device_type()
+try:
+    if device_type == DeviceType.ROCm:
+        # Import to register ROCm FMHA implementations
+        from rtp_llm.models_py.modules.factory.attention.rocm_impl.aiter import (
+            AiterDecodeImplAsm,
+            AiterDecodeImplNonAsm,
+            AiterDecodeImplTriton,
+            AiterPrefillImplAsm,
+            AiterPrefillImplNonAsm,
+            AiterPrefillImplPaged,
+        )
 
         PREFILL_MHA_IMPS.append(AiterPrefillImplPaged)
         PREFILL_MHA_IMPS.append(AiterPrefillImplAsm)
@@ -45,6 +46,7 @@ if device_type == DeviceType.ROCm:
         DECODE_MHA_IMPS.append(AiterDecodeImplNonAsm)
         DECODE_MHA_IMPS.append(AiterDecodeImplTriton)
     else:
+
         # Torch Naive implementations (fallback, lowest priority)
         from rtp_llm.models_py.modules.factory.attention.cuda_impl.torch_naive import (
             TorchNaiveClusteredDecodeImpl,
@@ -55,6 +57,8 @@ if device_type == DeviceType.ROCm:
             TorchNaiveResidualFP4PrefillImpl,
         )
 
+        # PREFILL_MHA_IMPS.extend([TorchNaiveResidualFP4PrefillImpl, TorchNaivePrefillImpl])
+        # DECODE_MHA_IMPS.extend([TorchNaiveResidualFP4DecodeImpl, TorchNaiveDecodeImpl])
         PREFILL_MHA_IMPS.extend([TorchNaivePrefillImpl])
         DECODE_MHA_IMPS.extend([TorchNaiveDecodeImpl])
         # currently append early means impl has higher priority
@@ -77,52 +81,50 @@ if device_type == DeviceType.ROCm:
                 get_xqa_impl,
             )
 
-        PREFILL_MHA_IMPS.extend(
-            [
-                HeadWiseFP8PrefillImpl,
-                HeadWisePrefillImpl,
-                FlashInferTRTLLMSpecDecodeImpl,
-                FlashInferTRTLLMPrefillImpl,
-                TRTMHAImpl,
-                PyFlashinferPrefillImpl,
-                PyFlashinferPagedPrefillImpl,
-                TRTPagedMHAImpl,
-            ]
-        )
-        DECODE_MHA_IMPS.extend([FlashInferTRTLLMDecodeImpl])
-        DECODE_MHA_IMPS.append(get_xqa_impl())
+            PREFILL_MHA_IMPS.extend(
+                [
+                    FlashInferTRTLLMSpecDecodeImpl,
+                    FlashInferTRTLLMPrefillImpl,
+                    TRTMHAImpl,
+                    PyFlashinferPrefillImpl,
+                    PyFlashinferPagedPrefillImpl,
+                    TRTPagedMHAImpl,
+                ]
+            )
+            DECODE_MHA_IMPS.extend([FlashInferTRTLLMDecodeImpl])
+            DECODE_MHA_IMPS.append(get_xqa_impl())
 
-        from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashinfer_mla_wrapper import (
-            MlaFlashInferDecodeImpl,
-            MlaFlashInferPrefillImpl,
-        )
+            from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashinfer_mla_wrapper import (
+                MlaFlashInferDecodeImpl,
+                MlaFlashInferPrefillImpl,
+            )
 
-        DECODE_MLA_IMPS.append(MlaFlashInferDecodeImpl)
-        PREFILL_MLA_IMPS.append(MlaFlashInferPrefillImpl)
+            DECODE_MLA_IMPS.append(MlaFlashInferDecodeImpl)
+            PREFILL_MLA_IMPS.append(MlaFlashInferPrefillImpl)
 
-        # SparseMlaImpl requires CUDA >= 12.9 for flash_mla support
-        try:
-            import torch
+            # SparseMlaImpl requires CUDA >= 12.9 for flash_mla support
+            try:
+                import torch
 
-            if torch.version.cuda:
-                major, minor = map(int, torch.version.cuda.split(".")[:2])
-                if (major, minor) >= (12, 9):
-                    from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_impl import (
-                        SparseMlaImpl,
-                    )
+                if torch.version.cuda:
+                    major, minor = map(int, torch.version.cuda.split(".")[:2])
+                    if (major, minor) >= (12, 9):
+                        from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_impl import (
+                            SparseMlaImpl,
+                        )
 
-                    DECODE_MLA_IMPS.append(SparseMlaImpl)
-                    PREFILL_MLA_IMPS.append(SparseMlaImpl)
-        except (ImportError, AttributeError, ValueError):
-            pass  # Skip SparseMlaImpl if CUDA < 12.9 or flash_mla not available
+                        DECODE_MLA_IMPS.append(SparseMlaImpl)
+                        PREFILL_MLA_IMPS.append(SparseMlaImpl)
+            except (ImportError, AttributeError, ValueError):
+                pass  # Skip SparseMlaImpl if CUDA < 12.9 or flash_mla not available
 
-        from rtp_llm.models_py.modules.factory.attention.cuda_impl.flash_infer import (
-            FlashInferDecodeImpl,
-            FlashInferPrefillImpl,
-        )
+            from rtp_llm.models_py.modules.factory.attention.cuda_impl.flash_infer import (
+                FlashInferDecodeImpl,
+                FlashInferPrefillImpl,
+            )
 
-        PREFILL_MHA_IMPS.append(FlashInferPrefillImpl)
-        DECODE_MHA_IMPS.append(FlashInferDecodeImpl)
+            PREFILL_MHA_IMPS.append(FlashInferPrefillImpl)
+            DECODE_MHA_IMPS.append(FlashInferDecodeImpl)
 
         from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
             PyFlashinferDecodeImpl,

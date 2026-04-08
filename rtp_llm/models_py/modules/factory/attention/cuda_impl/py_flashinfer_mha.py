@@ -28,7 +28,7 @@ from rtp_llm.ops import (
 )
 from rtp_llm.ops.compute_ops import (
     FusedRopeKVCacheDecodeOp,
-    LayerKVCache,
+    KVCache,
     ParamsBase,
     PyAttentionInputs,
     fill_mla_params,
@@ -92,7 +92,7 @@ class PyFlashinferPrefillPagedAttnOp(object):
         self.local_kv_head_num = attn_configs.kv_head_num
         self.head_dim_qk = attn_configs.size_per_head
         self.head_dim_vo = attn_configs.size_per_head
-        self.page_size = attn_configs.kernel_tokens_per_block
+        self.page_size = attn_configs.tokens_per_block
         self.datatype = attn_configs.dtype
         self.max_seq_len = attn_configs.max_seq_len
         self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
@@ -128,7 +128,7 @@ class PyFlashinferPrefillPagedAttnOp(object):
             attn_inputs.prefix_lengths,
             attn_inputs.sequence_lengths,
             attn_inputs.input_lengths,
-            attn_inputs.kv_cache_kernel_block_id_host,
+            attn_inputs.kv_cache_block_id_host,
             self.page_size,
             forbid_realloc,
         )
@@ -164,9 +164,7 @@ class PyFlashinferPrefillPagedAttnOp(object):
     def support(attn_inputs: PyAttentionInputs) -> bool:
         return True
 
-    def forward(
-        self, q: torch.Tensor, kv_cache: Optional[LayerKVCache]
-    ) -> torch.Tensor:
+    def forward(self, q: torch.Tensor, kv_cache: Optional[KVCache]) -> torch.Tensor:
         """
         Forward pass with paged KV cache
 
@@ -183,7 +181,13 @@ class PyFlashinferPrefillPagedAttnOp(object):
             q.dim() == 3
         ), f"Expected q to be 3D tensor [total_tokens, num_heads, head_dim], got {q.dim()}D"
 
-        result = self.prefill_wrapper.run(q, kv_cache.kv_cache_base)
+        kv_cache_base = kv_cache.kv_cache_base
+        if kv_cache_base.dim() == 2:
+            kv_cache_base = common.reshape_paged_kv_cache(
+                kv_cache_base, self.local_kv_head_num, self.page_size, self.head_dim_qk
+            )
+
+        result = self.prefill_wrapper.run(q, kv_cache_base)
 
         return result
 
@@ -195,7 +199,7 @@ class PyFlashinferPrefillAttnOp(object):
         self.local_head_num = attn_configs.head_num
         self.local_kv_head_num = attn_configs.kv_head_num
         self.head_dim_qk = attn_configs.size_per_head
-        self.page_size = attn_configs.kernel_tokens_per_block
+        self.page_size = attn_configs.tokens_per_block
         # TODO: maybe use v_head_dim
         self.head_dim_vo = attn_configs.size_per_head
         self.prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
@@ -227,7 +231,7 @@ class PyFlashinferPrefillAttnOp(object):
             attn_inputs.prefix_lengths,
             attn_inputs.sequence_lengths,
             attn_inputs.input_lengths,
-            attn_inputs.kv_cache_kernel_block_id_host,
+            attn_inputs.kv_cache_block_id_host,
             self.page_size,
         )
 
@@ -252,9 +256,7 @@ class PyFlashinferPrefillAttnOp(object):
 
     ## 1. pure prefill attn: qkv contains q and k,v
     ## 2. paged attn: qkv is only q, and kv is in kv_cache
-    def forward(
-        self, qkv: torch.Tensor, kv_cache: Optional[LayerKVCache]
-    ) -> torch.Tensor:
+    def forward(self, qkv: torch.Tensor, kv_cache: Optional[KVCache]) -> torch.Tensor:
         qkv = qkv.reshape(qkv.shape[0], -1)
         q, k, v = torch.split(
             qkv,
@@ -297,7 +299,7 @@ class PyFlashinferPrefillImplBase(FMHAImplBase):
         self.kv_cache_write_op = KVCacheWriteOp(
             num_kv_heads=attn_configs.kv_head_num,
             head_size=attn_configs.size_per_head,
-            token_per_block=attn_configs.kernel_tokens_per_block,
+            token_per_block=attn_configs.tokens_per_block,
         )
         self.create_params(attn_inputs)
         self.fmha_impl.prepare(attn_inputs)
@@ -366,8 +368,7 @@ class PyFlashinferPrefillImplBase(FMHAImplBase):
     def forward(
         self,
         qkv: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
-        layer_idx: int = 0,
+        kv_cache: Optional[KVCache],
     ) -> torch.Tensor:
         """Common forward implementation for all prefill implementations."""
         # Apply RoPE and KV Cache processing
@@ -505,7 +506,7 @@ class PyFlashinferDecodeAttnOp(object):
         self.local_kv_head_num = attn_configs.kv_head_num
         self.head_dim_qk = attn_configs.size_per_head
         self.head_dim_vo = attn_configs.size_per_head
-        self.seq_size_per_block = attn_configs.kernel_tokens_per_block
+        self.seq_size_per_block = attn_configs.tokens_per_block
         self.use_tensor_core = determine_use_tensor_core_from_configs(attn_configs)
         self.decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             self.g_workspace_buffer,
@@ -532,7 +533,7 @@ class PyFlashinferDecodeAttnOp(object):
             attn_inputs.prefix_lengths,
             attn_inputs.sequence_lengths,
             attn_inputs.input_lengths,
-            attn_inputs.kv_cache_kernel_block_id_host,
+            attn_inputs.kv_cache_block_id_host,
             self.seq_size_per_block,
         )
         # Get torch.dtype from attention configs
@@ -553,7 +554,7 @@ class PyFlashinferDecodeAttnOp(object):
         return True
 
     def forward(
-        self, q: torch.Tensor, kv_cache: Optional[LayerKVCache], params: ParamsBase
+        self, q: torch.Tensor, kv_cache: Optional[KVCache], params: ParamsBase
     ) -> torch.Tensor:
         assert kv_cache is not None, "kv_cache is required"
         q = q.reshape(q.shape[0], self.local_head_num, self.head_dim_qk)
@@ -598,8 +599,7 @@ class PyFlashinferDecodeImpl(FMHAImplBase):
     def forward(
         self,
         qkv: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
-        layer_idx: int = 0,
+        kv_cache: Optional[KVCache],
     ) -> torch.Tensor:
         # Apply RoPE and KV Cache processing
         if self.need_rope_kv_cache:

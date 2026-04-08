@@ -8,7 +8,7 @@ from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.mla_kv_cache_writ
 )
 from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import MlaImplBase
 from rtp_llm.ops import AttentionConfigs, FMHAConfig, KvCacheDataType
-from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs, rtp_llm_ops
+from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs, rtp_llm_ops
 
 from .flashinfer_mla import (
     MlaFlashInferDecodeOp,
@@ -69,7 +69,7 @@ class MlaFlashInferImplBase(MlaImplBase):
             attn_inputs.prefix_lengths,
             attn_inputs.sequence_lengths,
             attn_inputs.input_lengths,
-            attn_inputs.kv_cache_kernel_block_id_host,
+            attn_inputs.kv_cache_block_id_host,
             self.seq_size_per_block,
             forbid_realloc,
         )
@@ -80,7 +80,7 @@ class MlaFlashInferImplBase(MlaImplBase):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
+        kv_cache: Optional[KVCache],
         layer_id: int,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -134,7 +134,7 @@ class MlaFlashInferPrefillImpl(MlaFlashInferImplBase):
                 attn_configs.rope_head_dim,
                 attn_configs.nope_head_dim,
                 attn_configs.v_head_dim,
-                attn_configs.kernel_tokens_per_block,
+                attn_configs.tokens_per_block,
                 attn_configs.softmax_extra_scale,
                 attn_configs.use_mla,
                 weights,
@@ -149,7 +149,7 @@ class MlaFlashInferPrefillImpl(MlaFlashInferImplBase):
                 kv_cache_dtype=attn_configs.kv_cache_dtype,
             ),
             attn_inputs,
-            attn_configs.kernel_tokens_per_block,
+            attn_configs.tokens_per_block,
             is_cuda_graph,
         )
         self.has_reuse_cache = False
@@ -173,7 +173,7 @@ class MlaFlashInferPrefillImpl(MlaFlashInferImplBase):
                 attn_configs.kv_lora_rank,
                 attn_configs.rope_head_dim,
                 attn_configs.nope_head_dim,
-                attn_configs.kernel_tokens_per_block,
+                attn_configs.tokens_per_block,
                 attn_configs.softmax_extra_scale,
                 attn_configs.use_mla,
                 attn_configs.is_sparse,
@@ -192,7 +192,7 @@ class MlaFlashInferPrefillImpl(MlaFlashInferImplBase):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
+        kv_cache: Optional[KVCache],
         layer_id: int,
     ):
         """Handle long sequences using cache reuse operation."""
@@ -200,7 +200,7 @@ class MlaFlashInferPrefillImpl(MlaFlashInferImplBase):
         return self.fmha_impl.forward(q, compressed_kv, k_pe, kv_cache, layer_id)
 
     def _handle_short_sequence(
-        self, q: torch.Tensor, kv_cache: Optional[LayerKVCache], layer_id: int
+        self, q: torch.Tensor, kv_cache: Optional[KVCache], layer_id: int
     ) -> torch.Tensor:
         """Handle short sequences using absorb operation."""
         # Split query into nope and pe components
@@ -218,7 +218,7 @@ class MlaFlashInferPrefillImpl(MlaFlashInferImplBase):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
+        kv_cache: Optional[KVCache],
         layer_id: int,
     ):
         """Compute prefill context with optimized cache reuse logic."""
@@ -235,7 +235,7 @@ class MlaFlashInferPrefillImpl(MlaFlashInferImplBase):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
-        kv_cache: Optional[LayerKVCache],
+        kv_cache: Optional[KVCache],
         layer_id: int,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -280,7 +280,7 @@ class MlaFlashInferDecodeImpl(MlaFlashInferImplBase):
                 attn_configs.kv_lora_rank,
                 attn_configs.rope_head_dim,
                 attn_configs.nope_head_dim,
-                attn_configs.kernel_tokens_per_block,
+                attn_configs.tokens_per_block,
                 attn_configs.softmax_extra_scale,
                 attn_configs.use_mla,
                 attn_configs.is_sparse,
@@ -298,7 +298,7 @@ class MlaFlashInferDecodeImpl(MlaFlashInferImplBase):
                 kv_cache_dtype=attn_configs.kv_cache_dtype,
             ),
             attn_inputs,
-            attn_configs.kernel_tokens_per_block,
+            attn_configs.tokens_per_block,
             is_cuda_graph,
         )
 
