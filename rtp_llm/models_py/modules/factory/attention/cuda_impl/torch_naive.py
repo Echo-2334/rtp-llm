@@ -520,6 +520,7 @@ class TorchNaivePrefillImpl(FMHAImplBase):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         """Forward pass for prefill attention.
 
@@ -793,6 +794,7 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         """Forward pass for decode attention.
 
@@ -1112,6 +1114,7 @@ class TorchNaiveClusteredPrefillImpl(TorchNaivePrefillImpl):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         """Forward pass: 先做聚类，再执行 attention."""
 
@@ -1376,6 +1379,7 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         """Forward pass: 使用聚类加速 attention."""
         # logging.info(
@@ -1826,6 +1830,7 @@ class TorchNaiveResidualFP4PrefillImpl(TorchNaivePrefillImpl):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         # 1. RoPE
         if self.need_rope_kv_cache:
@@ -1888,6 +1893,7 @@ class TorchNaiveResidualFP4DecodeImpl(TorchNaiveDecodeImpl):
         self,
         qkv: torch.Tensor,
         kv_cache: Optional[KVCache],
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         # 1. RoPE
         if self.need_rope_kv_cache:
