@@ -169,6 +169,7 @@ def _fp4_simulate_quant(x: torch.Tensor) -> torch.Tensor:
 
     # 反量化：还原 scale
     dequantized = quantized / output_scale
+    logging.info(f"Quant For KV Cache")
 
     return dequantized.reshape(orig_shape).to(orig_dtype)
 
