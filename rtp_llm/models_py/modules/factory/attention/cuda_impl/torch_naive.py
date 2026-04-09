@@ -813,8 +813,10 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
             if q.ndim == 2:
                 # 2D: [batch, num_heads * head_dim] -> reshape to 3D
                 q = q.reshape(q.shape[0], self.num_heads, self.head_dim)
-            elif q.ndim == 4:
+            elif q.ndim == 3:
                 # Already 3D [batch, num_heads, head_dim] - no change needed
+                pass
+            elif q.ndim == 4:
                 pass
             else:
                 raise ValueError(f"Unexpected Q shape from RoPE: {q.shape}")
@@ -1038,7 +1040,8 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
         # Reshape for SDPA
         # q: [batch_size, num_heads, head_dim] -> [batch_size, num_heads, 1, head_dim]
         # k, v: [batch_size, seq_len, num_heads, head_dim] -> [batch_size, num_heads, seq_len, head_dim]
-        # q = q.unsqueeze(2)  # Add seq_len dimension
+        if q.ndim == 3:
+            q = q.unsqueeze(2)  # Add seq_len dimension
         k = k.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
         v = v.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
 
