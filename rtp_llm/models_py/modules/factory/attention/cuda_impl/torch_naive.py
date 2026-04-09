@@ -203,43 +203,49 @@ def _apply_residual_fp4_decode(
     v_full: torch.Tensor,
     kv_cache: Optional[KVCache],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Decode 阶段复用 prefill 聚类结果。
+    """Decode 阶段复用 prefill 聚类结果（支持多 bs + 多 kv head）。
 
     历史 token: centroid[label] + fp4_quant(diff)
     新增 token: fp8 伪量化
     """
     layer_id = kv_cache.layer_id if kv_cache is not None else 0
-    k_info = _CLUSTER_CACHE.get(f"residual_k_{layer_id}")
-    v_info = _CLUSTER_CACHE.get(f"residual_v_{layer_id}")
-
-    if k_info is None:
-        return k_full, v_full
-
     orig_dtype = k_full.dtype
-    prefill_len = k_info["labels"].shape[0]
+    batch_size = k_full.shape[0]
+    num_kv_heads = k_full.shape[2]
 
-    for b in range(k_full.shape[0]):
-        # --- K ---
-        k_hist = k_full[b, :prefill_len, 0, :]
-        centroids = k_info["centroids"]
-        labels = k_info["labels"]
-        diff = k_hist - centroids[labels]
-        k_full[b, :prefill_len, 0, :] = centroids[labels] + _fp4_simulate_quant(diff)
+    for b in range(batch_size):
+        for h in range(num_kv_heads):
+            k_info = _CLUSTER_CACHE.get(f"residual_k_{layer_id}_seq_{b}_head_{h}")
+            v_info = _CLUSTER_CACHE.get(f"residual_v_{layer_id}_seq_{b}_head_{h}")
 
-        k_new = k_full[b, prefill_len:, 0, :]
-        k_full[b, prefill_len:, 0, :] = k_new.to(torch.float8_e4m3fn).to(orig_dtype)
+            if k_info is None:
+                continue
 
-        # --- V ---
-        v_hist = v_full[b, :prefill_len, 0, :]
-        v_centroids = v_info["centroids"]
-        v_labels = v_info["labels"]
-        v_diff = v_hist - v_centroids[v_labels]
-        v_full[b, :prefill_len, 0, :] = v_centroids[v_labels] + _fp4_simulate_quant(
-            v_diff
-        )
+            prefill_len = k_info["labels"].shape[0]
 
-        v_new = v_full[b, prefill_len:, 0, :]
-        v_full[b, prefill_len:, 0, :] = v_new.to(torch.float8_e4m3fn).to(orig_dtype)
+            # --- K ---
+            k_hist = k_full[b, :prefill_len, h, :]
+            centroids = k_info["centroids"]
+            labels = k_info["labels"]
+            diff = k_hist - centroids[labels]
+            k_full[b, :prefill_len, h, :] = centroids[labels] + _fp4_simulate_quant(
+                diff
+            )
+
+            k_new = k_full[b, prefill_len:, h, :]
+            k_full[b, prefill_len:, h, :] = k_new.to(torch.float8_e4m3fn).to(orig_dtype)
+
+            # --- V ---
+            v_hist = v_full[b, :prefill_len, h, :]
+            v_centroids = v_info["centroids"]
+            v_labels = v_info["labels"]
+            v_diff = v_hist - v_centroids[v_labels]
+            v_full[b, :prefill_len, h, :] = v_centroids[v_labels] + _fp4_simulate_quant(
+                v_diff
+            )
+
+            v_new = v_full[b, prefill_len:, h, :]
+            v_full[b, prefill_len:, h, :] = v_new.to(torch.float8_e4m3fn).to(orig_dtype)
 
     return k_full, v_full
 
@@ -443,6 +449,9 @@ def _merge_local_window_to_global(
         f"added {num_clusters_local} clusters from {count} tokens, "
         f"total clusters: {len(cluster_info['cluster_indices'])}"
     )
+
+
+ll = 0
 
 
 class TorchNaivePrefillImpl(FMHAImplBase):
@@ -680,13 +689,6 @@ class TorchNaivePrefillImpl(FMHAImplBase):
             per_seq_k = k[start_idx:end_idx, :, :]  # [seq_len, num_kv_heads, head_dim]
             per_seq_v = v[start_idx:end_idx, :, :]  # [seq_len, num_kv_heads, head_dim]
 
-            # Handle GQA: expand K, V heads to match Q heads
-            if self.enable_gqa:
-                # Repeat K, V heads: [seq_len, num_kv_heads, head_dim] -> [seq_len, num_heads, head_dim]
-                num_groups = self.num_heads // self.num_kv_heads
-                per_seq_k = per_seq_k.repeat_interleave(num_groups, dim=1)
-                per_seq_v = per_seq_v.repeat_interleave(num_groups, dim=1)
-
             # Transpose for SDPA: [num_heads, seq_len, head_dim]
             per_seq_q = per_seq_q.movedim(0, 1)
             per_seq_k = per_seq_k.movedim(0, 1)
@@ -707,6 +709,7 @@ class TorchNaivePrefillImpl(FMHAImplBase):
                 dropout_p=0.0,
                 is_causal=True,
                 scale=self.scaling,
+                enable_gqa=True,
             ).squeeze(0)
 
             # Transpose back: [seq_len, num_heads, head_dim]
@@ -1848,35 +1851,46 @@ class TorchNaiveResidualFP4PrefillImpl(TorchNaivePrefillImpl):
             self.write_cache_store_impl, self.attn_inputs, kv_cache
         )
 
-        # 4. 聚类残差 FP4 伪量化
+        # 4. 聚类残差 FP4 伪量化（按序列 + KV head 独立处理）
         cluster_ratio = int(os.getenv("CLUSTER_RATIO", "64"))
         kmeans_iters = int(os.getenv("KMEANS_ITERS", "20"))
-        seq_len = k.shape[0]
-
-        k_res, k_centroids, k_labels = _clustered_residual_fp4_quant(
-            k.squeeze(1), cluster_ratio, max_iters=kmeans_iters
-        )
-        k = k_res.unsqueeze(1)
-
-        v_res, v_centroids, v_labels = _clustered_residual_fp4_quant(
-            v.squeeze(1), cluster_ratio, max_iters=kmeans_iters
-        )
-        v = v_res.unsqueeze(1)
-
-        # 5. 存聚类结果供 decode 复用
         layer_id = kv_cache.layer_id if kv_cache is not None else 0
-        _CLUSTER_CACHE[f"residual_k_{layer_id}"] = {
-            "centroids": k_centroids,
-            "labels": k_labels,
-        }
-        _CLUSTER_CACHE[f"residual_v_{layer_id}"] = {
-            "centroids": v_centroids,
-            "labels": v_labels,
-        }
+
+        batch_size = self.attn_inputs.input_lengths.size(0)
+        cu_seqlens = self.attn_inputs.cu_seqlens[: batch_size + 1]
+        num_kv_heads = k.shape[1]
+
+        for seq_idx in range(batch_size):
+            start_idx = cu_seqlens[seq_idx].item()
+            end_idx = cu_seqlens[seq_idx + 1].item()
+
+            for h in range(num_kv_heads):
+                k_head = k[start_idx:end_idx, h, :]  # [seq_len, head_dim]
+                v_head = v[start_idx:end_idx, h, :]
+
+                k_res, k_centroids, k_labels = _clustered_residual_fp4_quant(
+                    k_head, cluster_ratio, max_iters=kmeans_iters
+                )
+                v_res, v_centroids, v_labels = _clustered_residual_fp4_quant(
+                    v_head, cluster_ratio, max_iters=kmeans_iters
+                )
+
+                k[start_idx:end_idx, h, :] = k_res
+                v[start_idx:end_idx, h, :] = v_res
+
+                # 5. 存聚类结果供 decode 复用
+                _CLUSTER_CACHE[f"residual_k_{layer_id}_seq_{seq_idx}_head_{h}"] = {
+                    "centroids": k_centroids,
+                    "labels": k_labels,
+                }
+                _CLUSTER_CACHE[f"residual_v_{layer_id}_seq_{seq_idx}_head_{h}"] = {
+                    "centroids": v_centroids,
+                    "labels": v_labels,
+                }
 
         logging.info(
-            f"[ResidualFP4 Prefill] seq_len={seq_len}, "
-            f"num_clusters={k_centroids.shape[0]}"
+            f"[ResidualFP4 Prefill] batch_size={batch_size}, "
+            f"num_kv_heads={num_kv_heads}, cluster_ratio={cluster_ratio}"
         )
 
         # 6. Attention

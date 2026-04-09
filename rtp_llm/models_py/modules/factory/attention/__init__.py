@@ -37,8 +37,8 @@ from rtp_llm.models_py.modules.factory.attention.cuda_impl.torch_naive import (
     TorchNaiveResidualFP4PrefillImpl,
 )
 
-PREFILL_MHA_IMPS.extend([TorchNaivePrefillImpl])
-DECODE_MHA_IMPS.extend([TorchNaiveDecodeImpl])
+PREFILL_MHA_IMPS.extend([TorchNaiveResidualFP4PrefillImpl, TorchNaivePrefillImpl])
+DECODE_MHA_IMPS.extend([TorchNaiveResidualFP4DecodeImpl, TorchNaiveDecodeImpl])
 # if device_type == DeviceType.ROCm:
 #     # Import to register ROCm FMHA implementations
 #     from rtp_llm.models_py.modules.factory.attention.rocm_impl.aiter import (
