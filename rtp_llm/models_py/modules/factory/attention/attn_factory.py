@@ -135,26 +135,21 @@ def get_fmha_impl(
 
     mha_impls = PREFILL_MHA_IMPS if attn_inputs.is_prefill else DECODE_MHA_IMPS
 
+    logging.info(
+        f"[get_fmha_impl] is_prefill={attn_inputs.is_prefill}, candidates={[c.__name__ for c in mha_impls]}"
+    )
+
     for impl in mha_impls:
         # Check if this FMHA implementation is disabled before creating instance
         impl_class_name = impl.__name__
-
-        # Skip if this FMHA implementation is disabled in config
-        if _is_fmha_impl_disabled(impl_class_name, fmha_config):
-            continue
-
-        # Check support before creating instance
-        if not impl.support(attn_configs, attn_inputs):
-            continue
-
-        # Check if implementation supports parallelism config
-        if not impl.support_parallelism_config(parallelism_config):
-            continue
 
         # try:
         if 1:
             instance = impl(attn_configs, attn_inputs, parallelism_config)
             if not is_cuda_graph or instance.support_cuda_graph():
+                logging.info(
+                    f"[get_fmha_impl] SELECTED: {impl_class_name}, is_prefill={attn_inputs.is_prefill}"
+                )
                 return instance
 
         # except Exception as e:
@@ -193,7 +188,7 @@ class AttnImplFactory(object):
         attn_configs = model_config.getAttentionConfigs(
             parallelism_config.get_attn_tp_size()
         )
-        attn_inputs.headwise_config = getattr(model_config, 'headwise_config', None)
+        attn_inputs.headwise_config = getattr(model_config, "headwise_config", None)
         key_str = "mla" if attn_configs.use_mla else "mha"
         fmha_impl_method = cls.FMHA_IMPL_REGISTRY[key_str]
         instance = fmha_impl_method(

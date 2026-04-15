@@ -13,6 +13,7 @@ import time
 from typing import Optional
 
 import torch
+from flash_attn import flash_attn_func, flash_attn_varlen_func
 from torch.nn.functional import scaled_dot_product_attention
 
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.local_kmeans import (
@@ -128,7 +129,7 @@ def _round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
 
 
 def _fp4_simulate_quant(x: torch.Tensor) -> torch.Tensor:
-    """FP4 E2M1 模拟量化：quantize → dequantize，返回 float tensor。
+    """FP4 E2M1 模拟量化：quantize → dequantize，保持原始 dtype 计算以节省显存。
 
     基于 NVFP4 block-wise 量化：
     1. 按 block_size=16 分组，计算 per-block scale
@@ -139,12 +140,12 @@ def _fp4_simulate_quant(x: torch.Tensor) -> torch.Tensor:
     Args:
         x: 输入 tensor，最后一维需要能被 16 整除
     Returns:
-        模拟量化后的 float tensor，shape 与输入相同
+        模拟量化后的 tensor，shape 和 dtype 与输入相同
     """
     orig_shape = x.shape
     orig_dtype = x.dtype
     # 展平为 2D: [*, head_dim]
-    x_2d = x.reshape(-1, orig_shape[-1]).float()
+    x_2d = x.reshape(-1, orig_shape[-1])
     m, n = x_2d.shape
 
     # 计算 global_scale
@@ -153,15 +154,15 @@ def _fp4_simulate_quant(x: torch.Tensor) -> torch.Tensor:
 
     # Block-wise 量化
     x_blocked = x_2d.reshape(m, n // FP4_BLOCK_SIZE, FP4_BLOCK_SIZE)
-    vec_max = torch.max(torch.abs(x_blocked), dim=-1, keepdim=True)[0].float()
+    vec_max = x_blocked.abs().amax(dim=-1, keepdim=True)
 
     # per-block scale (模拟 FP8 精度)
     scale = global_scale * (vec_max / FLOAT4_E2M1_MAX)
-    scale = scale.to(torch.float8_e4m3fn).float()
+    scale = scale.to(torch.float8_e4m3fn).to(orig_dtype)
 
     # 缩放 + clamp
     output_scale = 1.0 / (scale / global_scale).clamp(min=1e-12)
-    scaled_x = x_blocked.float() * output_scale
+    scaled_x = x_blocked * output_scale
     clipped_x = torch.clamp(scaled_x, -6.0, 6.0)
 
     # 就近舍入到 E2M1 离散值
@@ -170,7 +171,7 @@ def _fp4_simulate_quant(x: torch.Tensor) -> torch.Tensor:
     # 反量化：还原 scale
     dequantized = quantized / output_scale
 
-    return dequantized.reshape(orig_shape).to(orig_dtype)
+    return dequantized.reshape(orig_shape)
 
 
 def _clustered_residual_fp4_quant(
@@ -444,7 +445,7 @@ def _merge_local_window_to_global(
     local_window["start_idx"] = cluster_info["seq_len"]
     local_window["count"] = 0
 
-    logging.info(
+    logging.debug(
         f"Merged Local Window to global: layer_{layer_idx}_head_{head_idx}, "
         f"added {num_clusters_local} clusters from {count} tokens, "
         f"total clusters: {len(cluster_info['cluster_indices'])}"
@@ -499,6 +500,18 @@ class TorchNaivePrefillImpl(FMHAImplBase):
             f"TorchNaivePrefillImpl initialized: heads={self.num_heads}, "
             f"kv_heads={self.num_kv_heads}, head_dim={self.head_dim}, gqa={self.enable_gqa}"
         )
+
+    def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
+        """Update parameters for CUDA graph replay."""
+        self.attn_inputs = attn_inputs
+        # Precompute max_seqlen to avoid .item() during graph replay
+        batch_size = attn_inputs.input_lengths.size(0)
+        cu_seqlens = attn_inputs.cu_seqlens[: batch_size + 1]
+        self._max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        new_rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
+        new_offset = new_rope_params.kv_cache_offset
+        old_offset = self.rope_params.kv_cache_offset
+        common.copy_kv_cache_offset(old_offset, new_offset)
 
     @classmethod
     def support(
@@ -658,10 +671,7 @@ class TorchNaivePrefillImpl(FMHAImplBase):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
-        """Execute prefill attention with causal masking.
-
-        Processes each sequence separately due to varying sequence lengths.
-        This is inefficient but works as a fallback.
+        """Execute prefill attention with causal masking using flash_attn.
 
         Args:
             q: Query tensor [total_tokens, num_heads, head_dim]
@@ -671,52 +681,30 @@ class TorchNaivePrefillImpl(FMHAImplBase):
         Returns:
             Attention output [total_tokens, num_heads, head_dim]
         """
-        # Get sequence information
         batch_size = self.attn_inputs.input_lengths.size(0)
-        cu_seqlens = self.attn_inputs.cu_seqlens[: batch_size + 1]
+        cu_seqlens = self.attn_inputs.cu_seqlens[: batch_size + 1].to(torch.int32)
+        # Use precomputed max_seqlen from prepare_cuda_graph if available
+        max_seqlen = getattr(self, "_max_seqlen", None)
+        if max_seqlen is None:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
-        # Prepare output tensor
-        output = torch.empty_like(q)
+        # Handle dtype mismatch
+        if not (q.dtype == k.dtype == v.dtype):
+            k = k.to(q.dtype)
+            v = v.to(q.dtype)
 
-        # Process each sequence separately
-        for seq_idx in range(batch_size):
-            start_idx = cu_seqlens[seq_idx].item()
-            end_idx = cu_seqlens[seq_idx + 1].item()
-            seq_len = end_idx - start_idx
-
-            # Extract per-sequence tensors
-            per_seq_q = q[start_idx:end_idx, :, :]  # [seq_len, num_heads, head_dim]
-            per_seq_k = k[start_idx:end_idx, :, :]  # [seq_len, num_kv_heads, head_dim]
-            per_seq_v = v[start_idx:end_idx, :, :]  # [seq_len, num_kv_heads, head_dim]
-
-            # Transpose for SDPA: [num_heads, seq_len, head_dim]
-            per_seq_q = per_seq_q.movedim(0, 1)
-            per_seq_k = per_seq_k.movedim(0, 1)
-            per_seq_v = per_seq_v.movedim(0, 1)
-
-            # Handle dtype mismatch (SDPA requires same dtype)
-            if not (per_seq_q.dtype == per_seq_k.dtype == per_seq_v.dtype):
-                per_seq_k = per_seq_k.to(per_seq_q.dtype)
-                per_seq_v = per_seq_v.to(per_seq_q.dtype)
-
-            # Execute scaled_dot_product_attention
-            # Add batch dimension: [1, num_heads, seq_len, head_dim]
-            per_seq_out = scaled_dot_product_attention(
-                per_seq_q.unsqueeze(0),
-                per_seq_k.unsqueeze(0),
-                per_seq_v.unsqueeze(0),
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=True,
-                scale=self.scaling,
-                enable_gqa=True,
-            ).squeeze(0)
-
-            # Transpose back: [seq_len, num_heads, head_dim]
-            per_seq_out = per_seq_out.movedim(1, 0)
-
-            # Store result
-            output[start_idx:end_idx, :, :] = per_seq_out
+        # flash_attn_varlen_func natively supports packed varlen sequences + GQA
+        output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=True,
+            softmax_scale=self.scaling,
+        )
 
         return output
 
@@ -767,6 +755,34 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
             f"TorchNaiveDecodeImpl initialized: heads={self.num_heads}, "
             f"kv_heads={self.num_kv_heads}, head_dim={self.head_dim}, gqa={self.enable_gqa}"
         )
+
+    def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
+        """Update parameters for CUDA graph replay."""
+        self.attn_inputs = attn_inputs
+        # Precompute max_seq_len for _read_kv_from_cache to avoid .item() during replay
+        from rtp_llm.ops.compute_ops import fill_mla_params
+
+        batch_size = attn_inputs.input_lengths.size(0)
+        params = fill_mla_params(
+            (
+                attn_inputs.prefix_lengths
+                if getattr(attn_inputs, "prefix_lengths", None) is not None
+                else torch.tensor([], dtype=torch.int32)
+            ),
+            attn_inputs.sequence_lengths,
+            attn_inputs.input_lengths,
+            (
+                attn_inputs.kv_cache_block_id_host
+                if attn_inputs.kv_cache_block_id_host is not None
+                else torch.tensor([], dtype=torch.int32)
+            ),
+            self.tokens_per_block,
+        )
+        self._max_seq_len_decode = params.kvlen_h[:batch_size].max().item()
+        new_rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
+        new_offset = new_rope_params.kv_cache_offset
+        old_offset = self.rope_params.kv_cache_offset
+        common.copy_kv_cache_offset(old_offset, new_offset)
 
     @classmethod
     def support(
@@ -840,7 +856,6 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
 
         # 6. Execute decode attention (no causal mask needed - single query token)
         output = self._run_attention_decode(q, k_full, v_full)
-        logging.info(f"[Decode] output shape: {output.shape}")
 
         # 7. Reshape output to [batch_size, num_heads * head_dim]
         output = output.reshape(output.shape[0], -1)
@@ -900,7 +915,7 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
     def _read_kv_from_cache(
         self, kv_cache: KVCache
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Read complete K, V from paged KV cache (including history).
+        """Read complete K, V from paged KV cache (vectorized, CUDA graph compatible).
 
         Args:
             kv_cache: KV cache object containing paged cache data
@@ -910,103 +925,111 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
             - k_full: [batch_size, total_seq_len, num_kv_heads, head_dim]
             - v_full: [batch_size, total_seq_len, num_kv_heads, head_dim]
         """
-        # Get batch size
         batch_size = self.attn_inputs.input_lengths.size(0)
 
-        # Get real sequence lengths using FlashInferMlaAttnParams
-        # This correctly computes kvlen from sequence_lengths + 1 in decode mode
         from rtp_llm.ops.compute_ops import fill_mla_params
 
         params = fill_mla_params(
             (
                 self.attn_inputs.prefix_lengths
-                if hasattr(self.attn_inputs, "prefix_lengths")
+                if getattr(self.attn_inputs, "prefix_lengths", None) is not None
                 else torch.tensor([], dtype=torch.int32)
             ),
             self.attn_inputs.sequence_lengths,
             self.attn_inputs.input_lengths,
-            self.attn_inputs.kv_cache_block_id_host,
+            (
+                self.attn_inputs.kv_cache_block_id_host
+                if self.attn_inputs.kv_cache_block_id_host is not None
+                else torch.tensor([], dtype=torch.int32)
+            ),
             self.tokens_per_block,
         )
 
-        # kvlen contains the REAL sequence lengths (including current token in decode mode)
-        sequence_lengths = params.kvlen_h[:batch_size]
-        max_seq_len = sequence_lengths.max().item()
+        sequence_lengths = params.kvlen_h[:batch_size]  # CPU tensor
+        max_seq_len = getattr(self, "_max_seq_len_decode", None)
+        if max_seq_len is None:
+            max_seq_len = sequence_lengths.max().item()
 
-        # logging.info(
-        #     f"[_read_kv_from_cache] batch_size={batch_size}, real_seq_lengths={sequence_lengths.tolist()}, max_seq_len={max_seq_len}"
-        # )
-
-        # Get KV cache tensor and reshape if needed
-        # kv_cache_base may be 2D [num_blocks, kv_block_stride_elems] and needs reshaping to 5D
         kv_cache_base = kv_cache.kv_cache_base
-        layer_id = kv_cache.layer_id
 
-        # Reshape to 5D: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim]
+        tpb = self.tokens_per_block
         if kv_cache_base.ndim == 2:
             block_num = kv_cache_base.shape[0]
-            expected_elems = (
-                2 * self.num_kv_heads * self.tokens_per_block * self.head_dim
-            )
+            expected_elems = 2 * self.num_kv_heads * tpb * self.head_dim
             kv_cache_tensor = kv_cache_base[:, :expected_elems].reshape(
                 block_num,
                 2,
                 self.num_kv_heads,
-                self.tokens_per_block,
+                tpb,
                 self.head_dim,
             )
         else:
             kv_cache_tensor = kv_cache_base
 
-        # Get block indices for each sequence
-        # Shape: [batch_size, max_blocks_per_seq] or [batch_size, max_blocks_per_seq, N]
+        # kv_cache_block_id_host may be None during CUDA graph capture
+        if self.attn_inputs.kv_cache_block_id_host is None:
+            k_full = torch.zeros(
+                batch_size,
+                max_seq_len,
+                self.num_kv_heads,
+                self.head_dim,
+                dtype=kv_cache_tensor.dtype,
+                device=kv_cache_tensor.device,
+            )
+            return k_full, torch.zeros_like(k_full)
+
         block_indices = self.attn_inputs.kv_cache_block_id_host[0][:batch_size, :]
+        max_blocks_per_seq = block_indices.shape[1]
 
-        # Prepare output tensors
-        k_full = torch.zeros(
+        # Vectorized: compute valid block mask on CPU
+        num_blocks_per_seq = (sequence_lengths + tpb - 1) // tpb  # [batch_size]
+        block_range = torch.arange(max_blocks_per_seq, device=block_indices.device)
+        valid_mask = block_range.unsqueeze(0) < num_blocks_per_seq.unsqueeze(
+            1
+        )  # [batch, max_blocks]
+
+        # Gather all valid block IDs
+        flat_block_ids = block_indices[valid_mask]  # [total_valid_blocks]
+
+        # Single gather from GPU cache
+        gathered = kv_cache_tensor[flat_block_ids.to(kv_cache_tensor.device)]
+        # gathered: [total_valid_blocks, 2, num_kv_heads, tpb, head_dim]
+
+        # Build batch/block indices for scatter
+        batch_idx_per_block = (
+            torch.arange(batch_size, device=block_indices.device)
+            .unsqueeze(1)
+            .expand_as(valid_mask)[valid_mask]
+        )
+        block_idx_per_block = block_range.unsqueeze(0).expand_as(valid_mask)[valid_mask]
+
+        # Scatter into padded buffer: [batch, max_blocks, tpb, kv_heads, head_dim]
+        # Transpose gathered from [N, 2, kv_heads, tpb, head_dim] -> [N, 2, tpb, kv_heads, head_dim]
+        gathered = gathered.permute(0, 1, 3, 2, 4)
+
+        k_padded = torch.zeros(
             batch_size,
-            max_seq_len,
+            max_blocks_per_seq,
+            tpb,
             self.num_kv_heads,
             self.head_dim,
             dtype=kv_cache_tensor.dtype,
             device=kv_cache_tensor.device,
         )
-        v_full = torch.zeros(
-            batch_size,
-            max_seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-            dtype=kv_cache_tensor.dtype,
-            device=kv_cache_tensor.device,
-        )
+        v_padded = torch.zeros_like(k_padded)
 
-        # Read K, V for each sequence
-        for batch_idx in range(batch_size):
-            seq_len = sequence_lengths[batch_idx].item()
-            num_blocks = (seq_len + self.tokens_per_block - 1) // self.tokens_per_block
+        batch_idx_gpu = batch_idx_per_block.to(kv_cache_tensor.device)
+        block_idx_gpu = block_idx_per_block.to(kv_cache_tensor.device)
+        k_padded[batch_idx_gpu, block_idx_gpu] = gathered[:, 0]
+        v_padded[batch_idx_gpu, block_idx_gpu] = gathered[:, 1]
 
-            # Collect K, V from blocks
-            for block_idx in range(num_blocks):
-                block_id = block_indices[batch_idx, block_idx].item()
-
-                # Calculate token range for this block
-                start_token = block_idx * self.tokens_per_block
-                end_token = min(start_token + self.tokens_per_block, seq_len)
-                block_token_count = end_token - start_token
-
-                # Read K, V from cache
-                # kv_cache_tensor shape: [num_blocks, 2, num_kv_heads, tokens_per_block, head_dim]
-                k_block = kv_cache_tensor[
-                    block_id, 0, :, :block_token_count, :
-                ]  # [kv_heads, block_tokens, head_dim]
-                v_block = kv_cache_tensor[
-                    block_id, 1, :, :block_token_count, :
-                ]  # [kv_heads, block_tokens, head_dim]
-
-                # Store in output tensors
-                # Transpose to [block_tokens, kv_heads, head_dim]
-                k_full[batch_idx, start_token:end_token, :, :] = k_block.transpose(0, 1)
-                v_full[batch_idx, start_token:end_token, :, :] = v_block.transpose(0, 1)
+        # Reshape: [batch, max_blocks * tpb, kv_heads, head_dim] and slice
+        k_full = k_padded.reshape(
+            batch_size, max_blocks_per_seq * tpb, self.num_kv_heads, self.head_dim
+        )[:, :max_seq_len]
+        v_full = v_padded.reshape(
+            batch_size, max_blocks_per_seq * tpb, self.num_kv_heads, self.head_dim
+        )[:, :max_seq_len]
 
         return k_full, v_full
 
@@ -1028,46 +1051,27 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
         Returns:
             Attention output [batch_size, num_heads, head_dim]
         """
-        batch_size = q.shape[0]
-
-        # Handle GQA: expand K, V heads to match Q heads
-        if self.enable_gqa:
-            # k, v: [batch_size, seq_len, num_kv_heads, head_dim]
-            # Need to expand to [batch_size, seq_len, num_heads, head_dim]
-            num_groups = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(num_groups, dim=2)
-            v = v.repeat_interleave(num_groups, dim=2)
-
-        # Reshape for SDPA
-        # q: [batch_size, num_heads, head_dim] -> [batch_size, num_heads, 1, head_dim]
-        # k, v: [batch_size, seq_len, num_heads, head_dim] -> [batch_size, num_heads, seq_len, head_dim]
+        # q: [batch_size, num_heads, head_dim] -> [batch_size, 1, num_heads, head_dim]
+        # k, v: [batch_size, total_seq_len, num_kv_heads, head_dim] (already correct)
         if q.ndim == 3:
-            q = q.unsqueeze(2)  # Add seq_len dimension
-        k = k.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
-        v = v.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
+            q = q.unsqueeze(1)
 
-        # Handle dtype mismatch (SDPA requires same dtype)
+        # Handle dtype mismatch
         if not (q.dtype == k.dtype == v.dtype):
             k = k.to(q.dtype)
             v = v.to(q.dtype)
 
-        # Execute scaled_dot_product_attention
-        # No causal mask needed - single query attends to all past tokens
-        output = scaled_dot_product_attention(
+        # flash_attn_func natively supports GQA (num_heads != num_kv_heads)
+        output = flash_attn_func(
             q,
             k,
             v,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,  # No causal mask for decode
-            scale=self.scaling,
+            causal=False,
+            softmax_scale=self.scaling,
         )
 
-        # output shape: [batch_size, num_heads, 1, head_dim]
-        # Squeeze to remove seq_len dimension: [batch_size, num_heads, head_dim]
-        output = output.squeeze(2)
-
-        return output
+        # output: [batch_size, 1, num_heads, head_dim] -> [batch_size, num_heads, head_dim]
+        return output.squeeze(1)
 
 
 # ============================================================================
@@ -1216,6 +1220,10 @@ class TorchNaiveClusteredPrefillImpl(TorchNaivePrefillImpl):
                     f"seq_len={seq_len}, num_clusters={num_clusters}"
                 )
 
+        logging.debug(
+            f"[Prefill Serial] _CLUSTER_CACHE keys: {sorted(_CLUSTER_CACHE.keys())}"
+        )
+
     def _perform_k_clustering_batched(
         self,
         k: torch.Tensor,  # [total_tokens, num_kv_heads, head_dim]
@@ -1334,6 +1342,10 @@ class TorchNaiveClusteredPrefillImpl(TorchNaivePrefillImpl):
                 f"seq_len={seq_len}, num_clusters={num_clusters}"
             )
 
+        logging.debug(
+            f"[Prefill Batched] _CLUSTER_CACHE keys: {sorted(_CLUSTER_CACHE.keys())}"
+        )
+
 
 class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
     """带 K 聚类加速的 Decode Attention 实现.
@@ -1395,6 +1407,7 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
         # NOTE: Decode RoPE may write K,V to cache directly and only return Q
         if self.need_rope_kv_cache:
             q = self.rope_kvcache_impl.forward(qkv, kv_cache, self.rope_params)
+            q = q.reshape(q.shape[0], self.num_heads, self.head_dim)
 
         # 4. Apply write cache store
         common.apply_write_cache_store(
@@ -1403,6 +1416,7 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
 
         # 5. Update clustering: 将新 K 分配到簇并更新质心
         k_full, v_full = self._read_kv_from_cache(kv_cache)
+
         k = k_full[:, -1:, :, :]  # Get only the last token (new K)
         k = k.squeeze(1)  # Remove seq dimension: [batch, kv_heads, head_dim]
 
@@ -1455,7 +1469,7 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
 
                 # 检查是否需要触发批量聚类合并
                 if need_merge:
-                    logging.info(f"Local Window full for {key}, triggering merge")
+                    logging.debug(f"Local Window full for {key}, triggering merge")
                     _merge_local_window_to_global(
                         cluster_info, kv_cache, self, layer_id, head_idx
                     )
@@ -1618,6 +1632,11 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
         layer_id = kv_cache.layer_id if kv_cache is not None else 0
         total_tokens = k_full.shape[1]
 
+        logging.debug(
+            f"[Decode] layer_id={layer_id}, looking for keys like 'layer_{layer_id}_seq_*_head_*', "
+            f"existing keys: {sorted(_CLUSTER_CACHE.keys())}"
+        )
+
         # GQA handling
         if self.enable_gqa:
             num_groups = self.num_heads // self.num_kv_heads
@@ -1642,8 +1661,17 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
                 key = f"layer_{layer_id}_seq_{batch_idx}_head_{kv_head_idx}"
 
                 if key not in _CLUSTER_CACHE:
-                    logging.error(f"Missing cluster info for {key}")
-                    raise RuntimeError(f"Cluster info not found: {key}")
+                    # Cluster info not populated (prefill may not have used clustered impl),
+                    # fallback to full attention for this batch item
+                    logging.debug(
+                        f"No cluster info for {key}, falling back to full attention"
+                    )
+                    q_batch = q[batch_idx : batch_idx + 1]
+                    k_batch = k_full[batch_idx : batch_idx + 1]
+                    v_batch = v_full[batch_idx : batch_idx + 1]
+                    out = self._run_attention_decode(q_batch, k_batch, v_batch)
+                    output[batch_idx] = out.squeeze(0)
+                    break  # skip remaining kv_heads for this batch item
 
                 cluster_info = _CLUSTER_CACHE[key]
 
@@ -1809,7 +1837,7 @@ class TorchNaiveClusteredDecodeImpl(TorchNaiveDecodeImpl):
                 else 0
             )
 
-            logging.info(
+            logging.debug(
                 f"[Clustering Optimized] layer={layer_id}, batch={batch_idx}: "
                 f"avg_tokens_per_head={avg_tokens_per_head:.1f}/{total_tokens} ({avg_tokens_per_head/total_tokens*100:.1f}%), "
                 f"num_kv_heads={num_kv_heads_to_process}, "
@@ -1886,7 +1914,7 @@ class TorchNaiveResidualFP4PrefillImpl(TorchNaivePrefillImpl):
                     "labels": v_labels,
                 }
 
-        logging.info(
+        logging.debug(
             f"[ResidualFP4 Prefill] batch_size={batch_size}, "
             f"num_kv_heads={num_kv_heads}, cluster_ratio={cluster_ratio}"
         )
