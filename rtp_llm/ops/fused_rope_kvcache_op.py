@@ -113,7 +113,7 @@ class FusedRopeKVCachePrefillOpBase:
                 rope_cache.data if check_rope_cache(rope_config, rope_cache) else None
             ),
             padding_offset=params.padding_offset,
-            cp_position_ids=params.cp_position_ids,
+            # cp_position_ids=params.cp_position_ids,
             use_logn_attn=self.attn_configs.use_logn_attn,
             rope_style=rope_config.style,
             rope_dim=rope_config.dim,
