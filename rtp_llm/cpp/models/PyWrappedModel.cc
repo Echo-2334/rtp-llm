@@ -332,6 +332,14 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
         if (!inputs.warmup && inputs.pd_separation) {
             py_attn_inputs.cache_store_inputs = prepareWriteCacheParams(inputs);
         }
+
+        if (inputs.per_layer_cids.has_value()) {
+            py_attn_inputs.per_layer_cids = inputs.per_layer_cids;
+        }
+        if (inputs.per_layer_cents.has_value()) {
+            py_attn_inputs.per_layer_cents = inputs.per_layer_cents;
+        }
+
         setupKVCacheForAttentionInputs(py_attn_inputs, micro_inputs);
 
         calculatePaddingOffset(py_attn_inputs);
@@ -438,6 +446,14 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             attention_inputs.cache_store_inputs = prepareWriteCacheParams(inputs);
             cache_store_async_writer_->init();
         }
+
+        if (inputs.per_layer_cids.has_value()) {
+            attention_inputs.per_layer_cids = inputs.per_layer_cids;
+        }
+        if (inputs.per_layer_cents.has_value()) {
+            attention_inputs.per_layer_cents = inputs.per_layer_cents;
+        }
+
         setupKVCacheForAttentionInputs(attention_inputs, inputs);
 
         calculatePaddingOffset(attention_inputs);
@@ -449,6 +465,8 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         auto py_model_inputs = PyModelInputs({token_ids, input_hiddens, attention_inputs, bert_embedding_inputs});
         PyModelOutputs py_model_outputs;
         torch::Tensor  hidden_states;
+        std::optional<std::vector<torch::Tensor>> pq_cids;
+        std::optional<std::vector<torch::Tensor>> pq_cents;
 
         // Cast the Python object to PyModelOutputs and extract hidden states
         CudaGraphState graph_state;
@@ -472,11 +490,25 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] using normal forward, is_target_verify=%d, is_prefill=%d",
                               py_model_inputs.attention_inputs.is_target_verify,
                               py_model_inputs.attention_inputs.is_prefill);
-            held_attn_pyobj_      = py_model_.attr("prepare_fmha_impl")(py_model_inputs, false);
-            auto py_model_forward = py_model_.attr("forward");
-            auto outputs          = py_model_forward(py_model_inputs, held_attn_pyobj_);
-            py_model_outputs      = outputs.cast<PyModelOutputs>();
-            hidden_states         = py_model_outputs.hidden_states.clone();
+            py::object py_inputs_obj = py::cast(py_model_inputs);
+            held_attn_pyobj_         = py_model_.attr("prepare_fmha_impl")(py_inputs_obj, false);
+            auto py_model_forward    = py_model_.attr("forward");
+            auto outputs             = py_model_forward(py_inputs_obj, held_attn_pyobj_);
+            py_model_outputs         = outputs.cast<PyModelOutputs>();
+            hidden_states            = py_model_outputs.hidden_states.clone();
+
+            if (inputs.pd_separation) {
+                try {
+                    auto py_attn = py_inputs_obj.attr("attention_inputs");
+                    auto py_cids = py_attn.attr("per_layer_cids");
+                    if (!py_cids.is_none()) {
+                        pq_cids  = py_cids.cast<std::vector<torch::Tensor>>();
+                        pq_cents = py_attn.attr("per_layer_cents").cast<std::vector<torch::Tensor>>();
+                    }
+                } catch (const std::exception& e) {
+                    RTP_LLM_LOG_DEBUG("PQ readback skipped: %s", e.what());
+                }
+            }
         }
 
         if (!inputs.warmup && inputs.pd_separation) {
@@ -484,11 +516,19 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         }
 
         RTP_LLM_LOG_DEBUG("Python object instance forward method called successfully.");
+        GptModelOutputs result;
         if (device_props_.enable_prefill_cp) {
             size_t num_valid_tokens = context_parallel_processor_->handleOutputs(hidden_states, inputs, cp_params);
-            return callForwardPostLayers(hidden_states, inputs, true, num_valid_tokens);
+            result = callForwardPostLayers(hidden_states, inputs, true, num_valid_tokens);
+        } else {
+            result = callForwardPostLayers(hidden_states, inputs, true);
         }
-        return callForwardPostLayers(hidden_states, inputs, true);
+
+        if (pq_cids.has_value()) {
+            result.per_layer_cids  = std::move(pq_cids);
+            result.per_layer_cents = std::move(pq_cents);
+        }
+        return result;
 
     } catch (const py::error_already_set& e) {
         RTP_LLM_LOG_ERROR("Python error during forward call on Python instance: %s", e.what());
@@ -916,6 +956,17 @@ void PyWrappedModel::holdInputsHostBuffers(const GptModelInputs& inputs) {
     if (inputs.multimodal_features.has_value()) {
         for (auto& mm_feature : inputs.multimodal_features.value()) {
             buffer_holder_.hold_host(mm_feature);
+        }
+    }
+
+    if (inputs.per_layer_cids.has_value()) {
+        for (auto& t : inputs.per_layer_cids.value()) {
+            buffer_holder_.hold_host(t);
+        }
+    }
+    if (inputs.per_layer_cents.has_value()) {
+        for (auto& t : inputs.per_layer_cents.value()) {
+            buffer_holder_.hold_host(t);
         }
     }
 
