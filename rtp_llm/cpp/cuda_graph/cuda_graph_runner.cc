@@ -213,6 +213,11 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
     optimizedCopyAsync(inputs.attention_inputs.kv_cache_layer_to_group,
                        py_model_inputs_.attention_inputs.kv_cache_layer_to_group,
                        inputs.attention_inputs.kv_cache_layer_to_group.numel() * sizeof(int32_t));
+
+    // Per-layer PD buffers: pass through by reference (not captured in graph).
+    // These tensors are read by the Python model but not involved in captured kernels.
+    py_model_inputs_.attention_inputs.per_layer_cids  = inputs.attention_inputs.per_layer_cids;
+    py_model_inputs_.attention_inputs.per_layer_cents = inputs.attention_inputs.per_layer_cents;
 }
 
 PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphState& state) {
