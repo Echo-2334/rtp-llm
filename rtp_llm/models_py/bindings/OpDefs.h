@@ -122,11 +122,31 @@ struct KVCache {
                         }
                     } else {
                         // MHA layout: [kernel_block_num, 2, num_kv_heads, kernel_seq_size_per_block, head_dim]
-                        layer_cache.kv_cache_base = base.reshape({kernel_block_num,
-                                                                  2,
-                                                                  (int64_t)num_kv_heads,
-                                                                  (int64_t)kernel_seq_size_per_block,
-                                                                  (int64_t)head_dim});
+                        const int64_t expected_elems = kernel_block_num * 2 * (int64_t)num_kv_heads
+                                                       * (int64_t)kernel_seq_size_per_block * (int64_t)head_dim;
+
+                        if (base.numel() == expected_elems) {
+                            layer_cache.kv_cache_base = base.reshape({kernel_block_num,
+                                                                      2,
+                                                                      (int64_t)num_kv_heads,
+                                                                      (int64_t)kernel_seq_size_per_block,
+                                                                      (int64_t)head_dim});
+                        } else {
+                            const int64_t stride_per_kb = base.size(1) / kernel_blocks_per_kv_block;
+                            const int64_t kv_stride =
+                                (int64_t)num_kv_heads * (int64_t)kernel_seq_size_per_block * (int64_t)head_dim;
+                            layer_cache.kv_cache_base =
+                                base.as_strided({kernel_block_num,
+                                                 2,
+                                                 (int64_t)num_kv_heads,
+                                                 (int64_t)kernel_seq_size_per_block,
+                                                 (int64_t)head_dim},
+                                                {stride_per_kb,
+                                                 kv_stride,
+                                                 (int64_t)kernel_seq_size_per_block * (int64_t)head_dim,
+                                                 (int64_t)head_dim,
+                                                 1});
+                        }
                     }
                 } else {
                     layer_cache.kv_cache_base = base;
