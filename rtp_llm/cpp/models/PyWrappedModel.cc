@@ -463,8 +463,8 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         fusedCopy(d2d_copies_);
 
         auto py_model_inputs = PyModelInputs({token_ids, input_hiddens, attention_inputs, bert_embedding_inputs});
-        PyModelOutputs py_model_outputs;
-        torch::Tensor  hidden_states;
+        PyModelOutputs                            py_model_outputs;
+        torch::Tensor                             hidden_states;
         std::optional<std::vector<torch::Tensor>> pq_cids;
         std::optional<std::vector<torch::Tensor>> pq_cents;
 
@@ -497,17 +497,17 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             py_model_outputs         = outputs.cast<PyModelOutputs>();
             hidden_states            = py_model_outputs.hidden_states.clone();
 
-            if (inputs.pd_separation) {
-                try {
-                    auto py_attn = py_inputs_obj.attr("attention_inputs");
-                    auto py_cids = py_attn.attr("per_layer_cids");
-                    if (!py_cids.is_none()) {
-                        pq_cids  = py_cids.cast<std::vector<torch::Tensor>>();
-                        pq_cents = py_attn.attr("per_layer_cents").cast<std::vector<torch::Tensor>>();
-                    }
-                } catch (const std::exception& e) {
-                    RTP_LLM_LOG_DEBUG("PQ readback skipped: %s", e.what());
+            // Read back PQ cids/cents from Python forward regardless of pd_separation mode,
+            // so single-worker decode can also reuse prefill-computed PQ data via GenerateStream.
+            try {
+                auto py_attn = py_inputs_obj.attr("attention_inputs");
+                auto py_cids = py_attn.attr("per_layer_cids");
+                if (!py_cids.is_none()) {
+                    pq_cids  = py_cids.cast<std::vector<torch::Tensor>>();
+                    pq_cents = py_attn.attr("per_layer_cents").cast<std::vector<torch::Tensor>>();
                 }
+            } catch (const std::exception& e) {
+                RTP_LLM_LOG_DEBUG("PQ readback skipped: %s", e.what());
             }
         }
 
@@ -519,7 +519,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         GptModelOutputs result;
         if (device_props_.enable_prefill_cp) {
             size_t num_valid_tokens = context_parallel_processor_->handleOutputs(hidden_states, inputs, cp_params);
-            result = callForwardPostLayers(hidden_states, inputs, true, num_valid_tokens);
+            result                  = callForwardPostLayers(hidden_states, inputs, true, num_valid_tokens);
         } else {
             result = callForwardPostLayers(hidden_states, inputs, true);
         }

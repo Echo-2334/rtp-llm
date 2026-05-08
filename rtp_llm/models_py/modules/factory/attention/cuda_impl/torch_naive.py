@@ -426,6 +426,34 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
 
         gathered = kv_cache_tensor[flat_block_ids.to(kv_cache_tensor.device)]
 
+        is_fp8_cache = kv_cache_tensor.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        )
+        if is_fp8_cache:
+            target_dtype = torch.bfloat16
+            scale_base = getattr(kv_cache, "kv_scale_base", None)
+            if scale_base is not None and scale_base.numel() > 0:
+                if scale_base.ndim == 2:
+                    scale_tensor = scale_base[:, :].reshape(
+                        scale_base.shape[0],
+                        2,
+                        self.num_kv_heads,
+                        tpb,
+                        -1,
+                    )
+                else:
+                    scale_tensor = scale_base
+                scale_gathered = scale_tensor[
+                    flat_block_ids.to(scale_tensor.device)
+                ].to(target_dtype)
+                gathered_f = gathered.to(target_dtype)
+                while scale_gathered.dim() < gathered_f.dim():
+                    scale_gathered = scale_gathered.unsqueeze(-1)
+                gathered = gathered_f * scale_gathered
+            else:
+                gathered = gathered.to(target_dtype)
+
         batch_idx_per_block = (
             torch.arange(batch_size, device=block_indices.device)
             .unsqueeze(1)
@@ -435,13 +463,15 @@ class TorchNaiveDecodeImpl(FMHAImplBase):
 
         gathered = gathered.permute(0, 1, 3, 2, 4)
 
+        padded_dtype = gathered.dtype  # bf16 if FP8 path, else original cache dtype
+
         k_padded = torch.zeros(
             batch_size,
             max_blocks_per_seq,
             tpb,
             self.num_kv_heads,
             self.head_dim,
-            dtype=kv_cache_tensor.dtype,
+            dtype=padded_dtype,
             device=kv_cache_tensor.device,
         )
         v_padded = torch.zeros_like(k_padded)

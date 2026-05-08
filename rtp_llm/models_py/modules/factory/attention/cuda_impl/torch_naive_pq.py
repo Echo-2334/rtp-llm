@@ -17,7 +17,6 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
 from flashinfer import xqa as flashinfer_xqa
 from flashinfer import xqa_continuous
 
@@ -32,16 +31,16 @@ from rtp_llm.models_py.modules.factory.attention.cuda_impl.torch_naive import (
 from rtp_llm.ops import AttentionConfigs, ParallelismConfig
 from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs
 
-
 # ============================================================================
 # PD separation helpers: store / load PQ buffers via PyAttentionInputs
 # ============================================================================
 
+
 def store_pq_to_attn_inputs(
     attn_inputs,
     layer_id: int,
-    cids: torch.Tensor,      # [num_kv_heads, S, seq_len]
-    cents: torch.Tensor,     # [num_kv_heads, S, K, sub_dim]
+    cids: torch.Tensor,  # [num_kv_heads, S, seq_len]
+    cents: torch.Tensor,  # [num_kv_heads, S, K, sub_dim]
 ) -> None:
     """Store PQ buffers for *layer_id* onto attn_inputs for C++ PD transfer.
 
@@ -64,7 +63,11 @@ def store_pq_to_attn_inputs(
         current_cents.append(torch.empty(0))
 
     current_cids[layer_id] = cids.to(torch.int32) if cids.dtype == torch.int64 else cids
-    current_cents[layer_id] = cents.float() if cents.dtype not in (torch.float32, torch.float16, torch.bfloat16) else cents
+    current_cents[layer_id] = (
+        cents.float()
+        if cents.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+        else cents
+    )
 
     try:
         attn_inputs.per_layer_cids = current_cids
@@ -108,7 +111,7 @@ def load_pq_batch_from_attn_inputs(
         # 4D: [batch, H, S, prefill_len] from merged decode streams
         if layer_cids.shape[0] < batch_size:
             return None
-        cids = layer_cids[:batch_size, kv_head_idx]   # [batch, S, prefill_len]
+        cids = layer_cids[:batch_size, kv_head_idx]  # [batch, S, prefill_len]
         cents = layer_cents[:batch_size, kv_head_idx]  # [batch, S, K, sub_dim]
     elif layer_cids.dim() == 3:
         # 3D: [H, S, prefill_len] single stream — expand to batch
@@ -140,8 +143,8 @@ def load_pq_batch_from_attn_inputs(
 @triton.jit
 def _pq_aggregate_kernel(
     cluster_scores_ptr,  # [bs, S, K, num_groups]
-    cids_ptr,            # [bs, S, prefill_len] int64
-    token_scores_ptr,    # [bs, num_groups, prefill_len]
+    cids_ptr,  # [bs, S, prefill_len] int64
+    token_scores_ptr,  # [bs, num_groups, prefill_len]
     cs_stride_b,
     cs_stride_s,
     cs_stride_k,
@@ -201,7 +204,7 @@ def _next_po2(n: int) -> int:
 
 def _pq_aggregate_triton(
     cluster_scores: torch.Tensor,  # [bs, S, K, num_groups]
-    cids: torch.Tensor,            # [bs, S, prefill_len] int64
+    cids: torch.Tensor,  # [bs, S, prefill_len] int64
     num_groups: int,
 ) -> torch.Tensor:
     bs, S, K, _ = cluster_scores.shape
@@ -217,20 +220,31 @@ def _pq_aggregate_triton(
         ).contiguous()
 
     token_scores = torch.empty(
-        bs, NUM_GROUPS_PO2, prefill_len,
-        dtype=cluster_scores.dtype, device=cluster_scores.device,
+        bs,
+        NUM_GROUPS_PO2,
+        prefill_len,
+        dtype=cluster_scores.dtype,
+        device=cluster_scores.device,
     )
 
     BLOCK_T = 128
     grid = (bs, triton.cdiv(prefill_len, BLOCK_T))
 
     _pq_aggregate_kernel[grid](
-        cluster_scores, cids, token_scores,
-        cluster_scores.stride(0), cluster_scores.stride(1), cluster_scores.stride(2),
-        cids.stride(0), cids.stride(1),
-        token_scores.stride(0), token_scores.stride(1),
+        cluster_scores,
+        cids,
+        token_scores,
+        cluster_scores.stride(0),
+        cluster_scores.stride(1),
+        cluster_scores.stride(2),
+        cids.stride(0),
+        cids.stride(1),
+        token_scores.stride(0),
+        token_scores.stride(1),
         prefill_len,
-        NUM_GROUPS=NUM_GROUPS_PO2, S=S, BLOCK_T=BLOCK_T,
+        NUM_GROUPS=NUM_GROUPS_PO2,
+        S=S,
+        BLOCK_T=BLOCK_T,
     )
     return token_scores[:, :num_groups, :]
 
@@ -311,7 +325,7 @@ class TorchNaivePQPrefillImpl(TorchNaivePrefillImpl):
             k_seq = k[start_idx:end_idx]  # [seq_len, H, head_dim]
             k_subs = (
                 k_seq.reshape(seq_len, num_kv_heads, S, sub_dim)
-                .permute(1, 2, 0, 3)        # [H, S, seq_len, sub_dim]
+                .permute(1, 2, 0, 3)  # [H, S, seq_len, sub_dim]
                 .reshape(num_kv_heads * S, seq_len, sub_dim)
                 .contiguous()
             )
@@ -330,12 +344,25 @@ class TorchNaivePQPrefillImpl(TorchNaivePrefillImpl):
 
         # Store for PD transfer (only seq_idx=0 in current C++ path)
         store_pq_to_attn_inputs(
-            self.attn_inputs, layer_id, all_cids[0], all_cents[0],
+            self.attn_inputs,
+            layer_id,
+            all_cids[0],
+            all_cents[0],
         )
-
-        logging.debug(
-            f"PQ clustering done: layer={layer_id} batch={batch_size} "
-            f"H={num_kv_heads} S={S} K={self.num_clusters}"
+        _stored_cids = getattr(self.attn_inputs, "per_layer_cids", None)
+        _stored_len = len(_stored_cids) if _stored_cids is not None else -1
+        _this_shape = tuple(all_cids[0].shape)
+        logging.info(
+            "[PQ-PREFILL] store done layer=%d bs=%d H=%d S=%d K=%d "
+            "cids_shape=%s per_layer_cids_len=%d is_set_on_attn_inputs=%s",
+            layer_id,
+            batch_size,
+            num_kv_heads,
+            S,
+            self.num_clusters,
+            _this_shape,
+            _stored_len,
+            _stored_cids is not None,
         )
 
 
@@ -373,18 +400,37 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         self._xqa_semaphores: Optional[torch.Tensor] = None
 
         logging.info(
-            f"TorchNaivePQDecodeImpl: S={self.num_subspaces}, top_k={self.top_k_tokens}"
+            f"TorchNaivePQDecodeImpl.__init__: S={self.num_subspaces}, top_k={self.top_k_tokens}"
         )
 
+    @classmethod
+    def support(cls, attn_configs, attn_inputs) -> bool:
+        _ok = super().support(attn_configs, attn_inputs)
+        logging.info(
+            "[PQ-DECODE] support() classmethod: result=%s use_mla=%s is_prefill=%s",
+            _ok,
+            attn_configs.use_mla,
+            attn_inputs.is_prefill,
+        )
+        return _ok
+
+    def support_cuda_graph(self) -> bool:
+        _ok = (
+            super().support_cuda_graph()
+            if hasattr(super(), "support_cuda_graph")
+            else True
+        )
+        logging.info("[PQ-DECODE] support_cuda_graph() -> %s", _ok)
+        return _ok
+
     def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
+        logging.info("[PQ-DECODE] prepare_cuda_graph() called")
         super().prepare_cuda_graph(attn_inputs)
         self._cuda_graph_mode = True
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         batch_size = attn_inputs.input_lengths.size(0)
         if self._xqa_scratch is None:
-            self._xqa_scratch = torch.zeros(
-                256 << 20, dtype=torch.uint8, device=device
-            )
+            self._xqa_scratch = torch.zeros(256 << 20, dtype=torch.uint8, device=device)
         nb_seq = self.num_kv_heads * batch_size
         nb_sem = ((nb_seq + 1) // 2 * 2) + 2 + nb_seq + 2
         if self._xqa_semaphores is None or self._xqa_semaphores.shape[0] < nb_sem:
@@ -398,6 +444,15 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         kv_cache: Optional[KVCache],
         layer_idx: int = 0,
     ) -> torch.Tensor:
+        _layer_id_entry = kv_cache.layer_id if kv_cache is not None else layer_idx
+        logging.info(
+            "[PQ-DECODE] forward() entry: layer=%d qkv.shape=%s qkv.dtype=%s cuda_graph=%s",
+            _layer_id_entry,
+            tuple(qkv.shape),
+            qkv.dtype,
+            getattr(self, "_cuda_graph_mode", False),
+        )
+
         if self.need_rope_kv_cache:
             q = self.rope_kvcache_impl.forward(qkv, kv_cache, self.rope_params)
             q = q.reshape(q.shape[0], self.num_heads, self.head_dim)
@@ -412,26 +467,72 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         layer_id = kv_cache.layer_id if kv_cache is not None else 0
 
         has_pq = any(
-            load_pq_batch_from_attn_inputs(
-                self.attn_inputs, layer_id, h, batch_size
-            ) is not None
+            load_pq_batch_from_attn_inputs(self.attn_inputs, layer_id, h, batch_size)
+            is not None
             for h in range(self.num_kv_heads)
         )
 
         if not has_pq:
+            _plc = getattr(self.attn_inputs, "per_layer_cids", None)
+            if _plc is None:
+                _reason = (
+                    "per_layer_cids=None (prefill PQ data not propagated to decode)"
+                )
+            elif layer_id >= len(_plc):
+                _reason = f"layer_id={layer_id} >= len(per_layer_cids)={len(_plc)}"
+            else:
+                _t = _plc[layer_id]
+                if isinstance(_t, torch.Tensor):
+                    _reason = f"layer_cids[{layer_id}] empty: numel={_t.numel()} dim={_t.dim()} shape={tuple(_t.shape)}"
+                else:
+                    _reason = (
+                        f"layer_cids[{layer_id}] not a Tensor: type={type(_t).__name__}"
+                    )
+            logging.info(
+                "[PQ-DECODE] branch=FULL_XQA layer=%d bs=%d num_kv_heads=%d reason=%s",
+                layer_id,
+                batch_size,
+                self.num_kv_heads,
+                _reason,
+            )
             output = self._xqa_paged_attention(q, kv_cache)
         else:
+            _plc = getattr(self.attn_inputs, "per_layer_cids", None)
+            _pq_heads = sum(
+                1
+                for h in range(self.num_kv_heads)
+                if load_pq_batch_from_attn_inputs(
+                    self.attn_inputs, layer_id, h, batch_size
+                )
+                is not None
+            )
+            _layer_cids_shape = (
+                tuple(_plc[layer_id].shape)
+                if _plc is not None
+                and layer_id < len(_plc)
+                and isinstance(_plc[layer_id], torch.Tensor)
+                else None
+            )
+            logging.info(
+                "[PQ-DECODE] branch=PQ_SPARSE layer=%d bs=%d pq_heads=%d/%d layer_cids_shape=%s",
+                layer_id,
+                batch_size,
+                _pq_heads,
+                self.num_kv_heads,
+                _layer_cids_shape,
+            )
             k_full, v_full = self._read_kv_from_cache(kv_cache)
             output = self._run_pq_attention_decode(q, k_full, v_full, kv_cache)
         return output.reshape(output.shape[0], -1)
 
     def _xqa_paged_attention(
         self,
-        q: torch.Tensor,       # [bs, num_q_heads, head_dim]
+        q: torch.Tensor,  # [bs, num_q_heads, head_dim]
         kv_cache: KVCache,
     ) -> torch.Tensor:
         batch_size = q.shape[0]
         device = q.device
+        layer_id = kv_cache.layer_id if kv_cache is not None else 0
 
         kv_base = kv_cache.kv_cache_base
         tpb = self.tokens_per_block
@@ -450,34 +551,93 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
 
         if hasattr(self, "_block_indices_gpu"):
             page_table = self._block_indices_gpu.to(torch.int32)
+        elif (
+            getattr(self.attn_inputs, "kv_cache_kernel_block_id_device", None)
+            is not None
+        ):
+            page_table = self.attn_inputs.kv_cache_kernel_block_id_device[
+                :batch_size, :
+            ].to(torch.int32)
         elif self.attn_inputs.kv_cache_block_id_host is not None:
-            page_table = self.attn_inputs.kv_cache_block_id_host[0][
+            page_table = self.attn_inputs.kv_cache_block_id_host[layer_id][
                 :batch_size, :
             ].to(device=device, dtype=torch.int32)
         else:
             return torch.zeros(
-                batch_size, self.num_heads, self.head_dim,
-                dtype=q.dtype, device=device,
+                batch_size,
+                self.num_heads,
+                self.head_dim,
+                dtype=q.dtype,
+                device=device,
             )
 
-        seq_lens = self._compute_kv_seq_lens(batch_size).to(device=device, dtype=torch.int32)
+        # CUDA-graph safe path: reuse device-resident seq_lens (sequence_lengths+1 in decode mode).
+        # Fallback to fill_mla_params for the rare case where sequence_lengths_plus_1_d is absent.
+        _seq_lens_d = getattr(self.attn_inputs, "sequence_lengths_plus_1_d", None)
+        if _seq_lens_d is not None:
+            seq_lens = _seq_lens_d[:batch_size].to(torch.int32)
+        else:
+            seq_lens = self._compute_kv_seq_lens(batch_size).to(
+                device=device, dtype=torch.int32
+            )
 
-        q_xqa = q.unsqueeze(1).to(k_cache.dtype)
+        # XQA: q must be fp16/bf16 even when kv cache is FP8. Keep q in its original (hi-prec) dtype.
+        q_xqa = q.unsqueeze(1)
+        if q_xqa.dtype not in (torch.float16, torch.bfloat16):
+            q_xqa = q_xqa.to(torch.bfloat16)
         output = torch.empty_like(q_xqa)
 
         self._ensure_xqa_buffers(device, batch_size)
         self._xqa_semaphores.zero_()
 
         xqa_kwargs = dict(
-            num_kv_heads=self.num_kv_heads, page_size=tpb,
-            kv_layout="HND", sm_count=self._sm_count,
+            num_kv_heads=self.num_kv_heads,
+            page_size=tpb,
+            kv_layout="HND",
+            sm_count=self._sm_count,
         )
         if getattr(self, "_cuda_graph_mode", False):
             xqa_kwargs["nb_sub_seq_per_seq"] = 16
 
+        # When KV cache is FP8, XQA needs kv_scale to dequantize internally.
+        _is_fp8_cache = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        _kv_scale_src = "none"
+        if _is_fp8_cache:
+            scale_base = getattr(kv_cache, "kv_scale_base", None)
+            if scale_base is not None and scale_base.numel() > 0:
+                xqa_kwargs["kv_scale"] = scale_base
+                _kv_scale_src = f"kv_scale_base(shape={tuple(scale_base.shape)})"
+            else:
+                xqa_kwargs["kv_scale"] = torch.tensor(1.0, device=device)
+                _kv_scale_src = "unit(1.0)"
+
+        logging.info(
+            "[XQA-CALL] layer=%d bs=%d q.dtype=%s kv.dtype=%s fp8=%s cuda_graph=%s "
+            "page_table.shape=%s seq_lens_src=%s kv_scale=%s",
+            layer_id,
+            batch_size,
+            q_xqa.dtype,
+            k_cache.dtype,
+            _is_fp8_cache,
+            getattr(self, "_cuda_graph_mode", False),
+            tuple(page_table.shape),
+            (
+                "sequence_lengths_plus_1_d"
+                if _seq_lens_d is not None
+                else "fill_mla_params"
+            ),
+            _kv_scale_src,
+        )
+
         flashinfer_xqa(
-            q_xqa, k_cache, v_cache, page_table, seq_lens, output,
-            self._xqa_scratch, self._xqa_semaphores,
+            q_xqa,
+            k_cache,
+            v_cache,
+            page_table,
+            seq_lens,
+            output,
+            self._xqa_scratch,
+            self._xqa_semaphores,
             **xqa_kwargs,
         )
         return output.squeeze(1).to(q.dtype)
@@ -514,7 +674,7 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
 
     def _xqa_full_attention(
         self,
-        q: torch.Tensor,       # [bs, num_q_heads, head_dim]
+        q: torch.Tensor,  # [bs, num_q_heads, head_dim]
         k_full: torch.Tensor,  # [bs, max_seq_len, num_kv_heads, head_dim]
         v_full: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -532,22 +692,27 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
 
         self._xqa_semaphores.zero_()
         cont_kwargs = dict(
-            num_kv_heads=self.num_kv_heads, max_seq_len=max_seq_len,
+            num_kv_heads=self.num_kv_heads,
+            max_seq_len=max_seq_len,
             sm_count=self._sm_count,
         )
         if getattr(self, "_cuda_graph_mode", False):
             cont_kwargs["nb_sub_seq_per_seq"] = 16
         xqa_continuous(
-            q_xqa, kv_cache_xqa, seq_lens_u32, output,
-            self._xqa_scratch, self._xqa_semaphores,
+            q_xqa,
+            kv_cache_xqa,
+            seq_lens_u32,
+            output,
+            self._xqa_scratch,
+            self._xqa_semaphores,
             **cont_kwargs,
         )
         return output.squeeze(1)
 
     def _run_pq_attention_decode(
         self,
-        q: torch.Tensor,        # [batch, num_heads, head_dim]
-        k_full: torch.Tensor,   # [batch, max_seq_len, num_kv_heads, head_dim]
+        q: torch.Tensor,  # [batch, num_heads, head_dim]
+        k_full: torch.Tensor,  # [batch, max_seq_len, num_kv_heads, head_dim]
         v_full: torch.Tensor,
         kv_cache: Optional[KVCache],
     ) -> torch.Tensor:
@@ -562,45 +727,82 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
 
         has_pq = False
         for kv_head_idx in range(self.num_kv_heads):
-            if load_pq_batch_from_attn_inputs(
-                self.attn_inputs, layer_id, kv_head_idx, batch_size,
-            ) is not None:
+            if (
+                load_pq_batch_from_attn_inputs(
+                    self.attn_inputs,
+                    layer_id,
+                    kv_head_idx,
+                    batch_size,
+                )
+                is not None
+            ):
                 has_pq = True
                 break
 
         if not has_pq:
+            logging.info(
+                "[PQ-DECODE] inner=XQA_FULL layer=%d bs=%d (no PQ for any kv_head; running XQA over dequanted k_full/v_full)",
+                layer_id,
+                batch_size,
+            )
             return self._xqa_full_attention(q, k_full, v_full, seq_lens, max_seq_len)
 
         output = torch.empty_like(q)
+        _pq_count = 0
+        _fb_count = 0
         for kv_head_idx in range(self.num_kv_heads):
             start_h = kv_head_idx * num_groups
             end_h = start_h + num_groups
             q_kv = q[:, start_h:end_h, :].contiguous()
 
             pq = load_pq_batch_from_attn_inputs(
-                self.attn_inputs, layer_id, kv_head_idx, batch_size,
+                self.attn_inputs,
+                layer_id,
+                kv_head_idx,
+                batch_size,
             )
             if pq is not None:
+                _pq_count += 1
                 output[:, start_h:end_h, :] = self._batched_pq_decode_one_kv(
                     q_kv,
-                    pq["cids"],      # [batch, S, prefill_len]
-                    pq["cents"],     # [batch, S, K, sub_dim]
+                    pq["cids"],  # [batch, S, prefill_len]
+                    pq["cents"],  # [batch, S, K, sub_dim]
                     pq["prefill_len"],
-                    k_full, v_full,
-                    kv_head_idx, seq_lens, max_seq_len,
+                    k_full,
+                    v_full,
+                    kv_head_idx,
+                    seq_lens,
+                    max_seq_len,
                 )
             else:
-                output[:, start_h:end_h, :] = self._fallback_full_attn(
-                    q_kv, k_full, v_full, kv_head_idx, seq_lens, max_seq_len,
+                _fb_count += 1
+                logging.info(
+                    "[PQ-DECODE] inner=FALLBACK_FULL layer=%d kv_head=%d (this head has no PQ data, using full attention)",
+                    layer_id,
+                    kv_head_idx,
                 )
-
+                output[:, start_h:end_h, :] = self._fallback_full_attn(
+                    q_kv,
+                    k_full,
+                    v_full,
+                    kv_head_idx,
+                    seq_lens,
+                    max_seq_len,
+                )
+        logging.info(
+            "[PQ-DECODE] layer=%d bs=%d summary: %d heads used PQ, %d heads used fallback",
+            layer_id,
+            batch_size,
+            _pq_count,
+            _fb_count,
+        )
         return output
 
     def _batched_pq_decode_one_kv(
         self,
-        q_kv: torch.Tensor,       # [bs, num_groups, head_dim]
-        cids: torch.Tensor,        # [bs, S, max_prefill_len] (padded)
-        cents: torch.Tensor,       # [bs, S, K, sub_dim]
+        q_kv: torch.Tensor,  # [bs, num_groups, head_dim]
+        cids: torch.Tensor,  # [bs, S, max_prefill_len] (padded)
+        cents: torch.Tensor,  # [bs, S, K, sub_dim]
         max_prefill_len: int,
         k_full: torch.Tensor,
         v_full: torch.Tensor,
@@ -628,7 +830,7 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         # Mask padded positions to -inf so topk never selects them.
         # For batch b, positions >= input_lens[b] are padding.
         pq_pos = torch.arange(max_prefill_len, device=device, dtype=torch.int32)
-        valid_pq = pq_pos[None, :] < input_lens[:, None]      # [bs, max_prefill_len]
+        valid_pq = pq_pos[None, :] < input_lens[:, None]  # [bs, max_prefill_len]
         token_scores.masked_fill_(~valid_pq.unsqueeze(1), float("-inf"))
 
         per_q_k = min(self.top_k_tokens, max_prefill_len)
@@ -648,8 +850,29 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         new_decode_mask = (pos[None, :] >= prefill_boundary) & within_seq
         mask = (mask | new_decode_mask) & within_seq
 
+        _sel = mask.sum(dim=1).tolist()
+        _tot = seq_lens_gpu.tolist()
+        _ratio = [
+            f"{s}/{t}({s * 100.0 / t:.1f}%)" if t > 0 else f"{s}/0"
+            for s, t in zip(_sel, _tot)
+        ]
+        logging.info(
+            "[PQ-SPARSE] kv_head=%d per_q_k=%d max_prefill_len=%d bs=%d selected/total=%s",
+            kv_head_idx,
+            per_q_k,
+            max_prefill_len,
+            len(_sel),
+            _ratio,
+        )
+
         return self._packed_attention(
-            q_kv, mask, k_full, v_full, kv_head_idx, max_seq_len, max_seq_len,
+            q_kv,
+            mask,
+            k_full,
+            v_full,
+            kv_head_idx,
+            max_seq_len,
+            max_seq_len,
         )
 
     def _fallback_full_attn(
@@ -668,13 +891,19 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         seq_lens_gpu = seq_lens.to(device=device, dtype=torch.int32)
         mask = pos[None, :] < seq_lens_gpu[:, None]
         return self._packed_attention(
-            q_kv, mask, k_full, v_full, kv_head_idx, max_seq_len, max_seq_len,
+            q_kv,
+            mask,
+            k_full,
+            v_full,
+            kv_head_idx,
+            max_seq_len,
+            max_seq_len,
         )
 
     def _packed_attention(
         self,
         q_kv: torch.Tensor,
-        mask: torch.Tensor,     # [bs, max_seq_len]
+        mask: torch.Tensor,  # [bs, max_seq_len]
         k_full: torch.Tensor,
         v_full: torch.Tensor,
         kv_head_idx: int,
@@ -692,8 +921,14 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
 
         cache_dtype = k_full.dtype
         kv_cache = torch.empty(
-            bs, 1, 2, 1, max_kv_len, head_dim,
-            dtype=cache_dtype, device=device,
+            bs,
+            1,
+            2,
+            1,
+            max_kv_len,
+            head_dim,
+            dtype=cache_dtype,
+            device=device,
         ).contiguous()
 
         for b in range(bs):
@@ -703,12 +938,14 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
                 kv_cache[b, 0, 0, 0, :n] = k_full[b, sel, kv_head_idx]
                 kv_cache[b, 0, 1, 0, :n] = v_full[b, sel, kv_head_idx]
 
-        q_4d = q_kv.unsqueeze(1)                            # [bs, 1, num_groups, head_dim]
+        q_4d = q_kv.unsqueeze(1)  # [bs, 1, num_groups, head_dim]
         seq_lens_2d = kv_lens.to(torch.uint32).unsqueeze(1)  # [bs, 1]
         output = torch.empty_like(q_4d)
 
         if not hasattr(self, "_xqa_workspace") or self._xqa_workspace.device != device:
-            self._xqa_workspace = torch.empty(64 << 20, dtype=torch.uint8, device=device)
+            self._xqa_workspace = torch.empty(
+                64 << 20, dtype=torch.uint8, device=device
+            )
 
         nb_seq = 1 * bs
         nb_semaphores = ((nb_seq + 1) // 2) * 2 + 2 + nb_seq + 2
@@ -727,8 +964,12 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         if getattr(self, "_cuda_graph_mode", False):
             xqa_kwargs["nb_sub_seq_per_seq"] = 16
         xqa_continuous(
-            q_4d, kv_cache, seq_lens_2d, output,
-            self._xqa_workspace, semaphores,
+            q_4d,
+            kv_cache,
+            seq_lens_2d,
+            output,
+            self._xqa_workspace,
+            semaphores,
             **xqa_kwargs,
         )
 
