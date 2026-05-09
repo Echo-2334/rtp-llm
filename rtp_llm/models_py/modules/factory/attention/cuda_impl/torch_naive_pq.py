@@ -18,7 +18,13 @@ import torch
 import triton
 import triton.language as tl
 from flashinfer import xqa as flashinfer_xqa
-from flashinfer import xqa_continuous
+
+try:
+    from flashinfer import xqa_continuous
+except ImportError:
+    xqa_continuous = (
+        None  # falls back to SDPA in _xqa_full_attention / _packed_attention
+    )
 
 from rtp_llm.models_py.modules.factory.attention import common
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.pq_kmeans_triton import (
@@ -680,34 +686,33 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         seq_lens: torch.Tensor,
         max_seq_len: int,
     ) -> torch.Tensor:
-        bs = q.shape[0]
-        q_xqa = q.unsqueeze(1)  # [bs, 1, num_q_heads, head_dim]
+        # SDPA-based fallback (replaces flashinfer xqa_continuous)
+        bs, num_q, head_dim = q.shape
+        device = q.device
 
-        k_t = k_full.permute(0, 2, 1, 3)  # [bs, num_kv_heads, max_seq_len, head_dim]
-        v_t = v_full.permute(0, 2, 1, 3)
-        kv_cache_xqa = torch.stack([k_t, v_t], dim=2).unsqueeze(1).to(q.dtype)
+        q_sdpa = q.unsqueeze(2).to(q.dtype)  # [bs, num_q_heads, 1, head_dim]
+        k_sdpa = k_full.permute(0, 2, 1, 3).to(
+            q.dtype
+        )  # [bs, num_kv, max_seq_len, head_dim]
+        v_sdpa = v_full.permute(0, 2, 1, 3).to(q.dtype)
 
-        output = torch.empty_like(q_xqa)
-        seq_lens_u32 = seq_lens.to(torch.uint32).unsqueeze(1)
+        if num_q != self.num_kv_heads:
+            num_groups = num_q // self.num_kv_heads
+            k_sdpa = k_sdpa.repeat_interleave(num_groups, dim=1)
+            v_sdpa = v_sdpa.repeat_interleave(num_groups, dim=1)
 
-        self._xqa_semaphores.zero_()
-        cont_kwargs = dict(
-            num_kv_heads=self.num_kv_heads,
-            max_seq_len=max_seq_len,
-            sm_count=self._sm_count,
+        pos = torch.arange(max_seq_len, device=device)
+        valid = pos[None, :] < seq_lens.to(device=device, dtype=torch.int32)[:, None]
+        attn_mask = valid[:, None, None, :]  # [bs, 1, 1, max_seq_len]
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=attn_mask,
+            scale=self.scaling,
         )
-        if getattr(self, "_cuda_graph_mode", False):
-            cont_kwargs["nb_sub_seq_per_seq"] = 16
-        xqa_continuous(
-            q_xqa,
-            kv_cache_xqa,
-            seq_lens_u32,
-            output,
-            self._xqa_scratch,
-            self._xqa_semaphores,
-            **cont_kwargs,
-        )
-        return output.squeeze(1)
+        return out.squeeze(2)  # [bs, num_q_heads, head_dim]
 
     def _run_pq_attention_decode(
         self,
@@ -919,58 +924,34 @@ class TorchNaivePQDecodeImpl(TorchNaiveDecodeImpl):
         if max_kv_len == 0:
             return torch.zeros_like(q_kv)
 
-        cache_dtype = k_full.dtype
-        kv_cache = torch.empty(
-            bs,
-            1,
-            2,
-            1,
-            max_kv_len,
-            head_dim,
-            dtype=cache_dtype,
-            device=device,
-        ).contiguous()
-
+        # SDPA-based fallback (replaces flashinfer xqa_continuous):
+        # gather selected KV per batch into a packed [bs, max_kv_len, head_dim] then run SDPA.
+        target_dtype = q_kv.dtype
+        k_packed = torch.zeros(
+            bs, max_kv_len, head_dim, dtype=target_dtype, device=device
+        )
+        v_packed = torch.zeros_like(k_packed)
         for b in range(bs):
             sel = mask[b].nonzero(as_tuple=True)[0]
             n = sel.shape[0]
             if n > 0:
-                kv_cache[b, 0, 0, 0, :n] = k_full[b, sel, kv_head_idx]
-                kv_cache[b, 0, 1, 0, :n] = v_full[b, sel, kv_head_idx]
+                k_packed[b, :n] = k_full[b, sel, kv_head_idx].to(target_dtype)
+                v_packed[b, :n] = v_full[b, sel, kv_head_idx].to(target_dtype)
 
-        q_4d = q_kv.unsqueeze(1)  # [bs, 1, num_groups, head_dim]
-        seq_lens_2d = kv_lens.to(torch.uint32).unsqueeze(1)  # [bs, 1]
-        output = torch.empty_like(q_4d)
+        q_sdpa = q_kv.unsqueeze(2)  # [bs, num_groups, 1, head_dim]
+        # k/v: [bs, 1, max_kv_len, head_dim] → expand to num_groups for SDPA (GQA)
+        k_sdpa = k_packed.unsqueeze(1).expand(-1, num_groups, -1, -1).contiguous()
+        v_sdpa = v_packed.unsqueeze(1).expand(-1, num_groups, -1, -1).contiguous()
 
-        if not hasattr(self, "_xqa_workspace") or self._xqa_workspace.device != device:
-            self._xqa_workspace = torch.empty(
-                64 << 20, dtype=torch.uint8, device=device
-            )
+        pos = torch.arange(max_kv_len, device=device)
+        valid = pos[None, :] < kv_lens[:, None]
+        attn_mask = valid[:, None, None, :]  # [bs, 1, 1, max_kv_len]
 
-        nb_seq = 1 * bs
-        nb_semaphores = ((nb_seq + 1) // 2) * 2 + 2 + nb_seq + 2
-        semaphores = torch.zeros(nb_semaphores, dtype=torch.uint32, device=device)
-
-        q_scale = self.scaling * math.sqrt(head_dim)
-
-        xqa_kwargs: dict = dict(
-            num_kv_heads=1,
-            max_seq_len=max_kv_len,
-            q_scale=q_scale,
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=attn_mask,
+            scale=self.scaling,
         )
-        if cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            xqa_kwargs["kv_scale"] = torch.tensor(1.0, device=device)
-
-        if getattr(self, "_cuda_graph_mode", False):
-            xqa_kwargs["nb_sub_seq_per_seq"] = 16
-        xqa_continuous(
-            q_4d,
-            kv_cache,
-            seq_lens_2d,
-            output,
-            self._xqa_workspace,
-            semaphores,
-            **xqa_kwargs,
-        )
-
-        return output.squeeze(1)
+        return out.squeeze(2)  # [bs, num_groups, head_dim]
