@@ -189,6 +189,10 @@ class MlaAttention(nn.Module):
             return prev_topk_indices
 
         if self.indexer is None:
+            if self.reuse_topk_indices or force_reuse_topk_indices:
+                if not fmha_impl.is_sparse():
+                    return None
+                return prev_topk_indices
             return None
         q_for_indexer = q_c if self.q_lora_rank > 0 else q_view
         return self.indexer(
