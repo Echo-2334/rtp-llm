@@ -30,6 +30,65 @@ _PD_DEBUG_INDEXER_LOG_COUNTS: Dict[str, int] = {}
 _persistent_topk_workspace: Dict[torch.device, torch.Tensor] = {}
 
 
+# ---------------------------------------------------------------------------
+# Indexer score-logits dump (env-gated, decode-only). Dumps the pre-TopK
+# ``fp8_paged_mqa_logits`` output for offline analysis.
+#   RTP_DUMP_INDEXER=1   enable
+#   RTP_DUMP_DIR         output dir (default /tmp/indexer_layers)
+#   RTP_DUMP_STEPS       per-layer decode steps to capture; <=0 = unlimited
+#   RTP_DUMP_LAYERS      optional comma list of layer ids; empty = all
+# One .pt per (layer, step, rank): score [num_tokens, max_seq_len] + per-row
+# valid length. Run with ENABLE_CUDA_GRAPH=0 (captured replay skips python).
+# ---------------------------------------------------------------------------
+_INDEXER_OP_DUMP_COUNTER = 0
+_indexer_op_dump_dir_ready = False
+
+
+def _indexer_dump_rank() -> int:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+    except Exception:
+        pass
+    for k in ("RANK", "LOCAL_RANK", "WORLD_RANK"):
+        v = os.environ.get(k)
+        if v is not None:
+            try:
+                return int(v)
+            except ValueError:
+                pass
+    return 0
+
+
+def _indexer_dump_probe(tag: str) -> None:
+    try:
+        os.makedirs("/tmp/indexer_probe", exist_ok=True)
+        with open(f"/tmp/indexer_probe/{tag}.txt", "a") as f:
+            f.write(f"{tag} pid={os.getpid()} rtp_dump={os.environ.get('RTP_DUMP_INDEXER')}\n")
+    except Exception:
+        pass
+
+
+_indexer_dump_probe("import_indexer_op")
+
+
+# --- Step-axis closed-loop reuse (reference impl, env-gated) -----------------
+# work = top-(L/WORK_DIV), boundary = next L/BND_DIV, M=1. Reuse selects top-2k
+# within the locked work set; refresh (recompute from full logits) when any
+# boundary token crosses the current 2048th score. NOTE: still computes the full
+# logits, so this measures ACCURACY + refresh-rate, not wall-clock speedup.
+_CASADE_DUMMY = None
+_CASCADE = os.environ.get("RTP_CASCADE", "0") == "1"
+_CASC_WORK_DIV = int(os.environ.get("RTP_CASCADE_WORK_DIV", "4"))
+_CASC_BND_DIV = int(os.environ.get("RTP_CASCADE_BND_DIV", "16"))
+# Block-level reuse (real speedup): score only selected blocks via a reduced
+# block_table fed to the existing paged kernel. Eager (host branch) for now.
+_CASCADE_BLOCK = os.environ.get("RTP_CASCADE_BLOCK", "0") == "1"
+_CASC_PERIOD = int(os.environ.get("RTP_CASCADE_PERIOD", "0"))  # 0 = lock once (no periodic refresh); >0 = also refresh every N steps
+
+
 def _get_topk_workspace(device: torch.device) -> torch.Tensor:
     ws = _persistent_topk_workspace.get(device)
     if ws is None:
@@ -274,6 +333,192 @@ class IndexerOp(nn.Module):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.is_neox_style = is_neox_style
+
+        # Score-logits dump bookkeeping (env-gated; construction order = layer id).
+        global _INDEXER_OP_DUMP_COUNTER
+        self._dump_layer_id = _INDEXER_OP_DUMP_COUNTER
+        _INDEXER_OP_DUMP_COUNTER += 1
+        self._dump_step = 0
+        # Cascade reuse state (per layer; CUDA-graph-safe device buffers,
+        # lazily allocated at first decode call with fixed shape).
+        self._casc_work = None        # [Wc] long, locked work indices
+        self._casc_boundary = None    # [Bc] long, boundary indices
+        self._casc_force = None       # [1] bool device flag: force refresh
+        self._casc_arange = None      # [T_max] long, cached positions
+        self._casc_refreshes = None   # [1] long device counter (no host sync)
+        # Block-level reuse state (eager, B-general, fixed-period).
+        self._blk_sel = None          # [B, N] long, locked work block columns
+        self._blk_force = True        # host bool: force refresh (new request)
+        self._blk_step = 0            # host step counter (no D2H)
+
+    def _maybe_dump_logits(
+        self, logits: torch.Tensor, lengths: torch.Tensor
+    ) -> None:
+        """Env-gated dump of pre-TopK paged indexer score logits (decode)."""
+        if not getattr(IndexerOp, "_dump_probe_done", False):
+            _indexer_dump_probe("decode_paged")
+            IndexerOp._dump_probe_done = True
+        if os.environ.get("RTP_DUMP_INDEXER", "0") != "1":
+            return
+        if _cuda_graph_capturing():
+            return
+        # Min context-length gate: skip short-context steps (e.g. startup warmup
+        # decode) so the per-layer step budget is spent on the real long-context
+        # request. Set RTP_DUMP_MIN_LEN to ~half the target context.
+        try:
+            min_len = int(os.environ.get("RTP_DUMP_MIN_LEN", "0"))
+        except ValueError:
+            min_len = 0
+        if min_len > 0 and int(lengths.max().item()) < min_len:
+            return
+        try:
+            dump_steps = int(os.environ.get("RTP_DUMP_STEPS", "0"))
+        except ValueError:
+            dump_steps = 0
+        if dump_steps > 0 and self._dump_step >= dump_steps:
+            return
+        dump_layers = {
+            int(x)
+            for x in os.environ.get("RTP_DUMP_LAYERS", "").replace(" ", "").split(",")
+            if x
+        }
+        if dump_layers and self._dump_layer_id not in dump_layers:
+            return
+        dump_dir = os.environ.get("RTP_DUMP_DIR", "/tmp/indexer_layers")
+        global _indexer_op_dump_dir_ready
+        if not _indexer_op_dump_dir_ready:
+            os.makedirs(dump_dir, exist_ok=True)
+            _indexer_op_dump_dir_ready = True
+        step = self._dump_step
+        self._dump_step += 1
+        rank = _indexer_dump_rank()
+        # Full score dump (fp16) of row 0 over its valid length — keeps the
+        # entire ranking so any budget / boundary / threshold can be studied
+        # offline (not limited to a top-N window).
+        L = int(lengths.max().item())
+        payload = {
+            "score": logits[0, :L].to(torch.float16).cpu(),  # [L] full row
+            "length": L,
+            "layer_id": self._dump_layer_id,
+            "step": step,
+            "rank": rank,
+            "index_topk": self.index_topk,
+        }
+        fname = f"score_L{self._dump_layer_id:03d}_step{step:04d}_rank{rank}.pt"
+        torch.save(payload, os.path.join(dump_dir, fname))
+
+    def _cascade_select(self, logits, lengths, topk_result):
+        """CUDA-graph-safe step-axis reuse (B==1).
+
+        Branch-free + fixed-shape + no host sync, so it can be captured:
+          * refresh decision is a DEVICE bool used via ``torch.where`` (no .item)
+          * work/boundary live in fixed-size persistent buffers, updated in-place
+          * invalid positions (>= length) masked to -inf on device
+        Selection: reuse = top-K within locked work; on refresh use the full
+        top-K (``topk_result`` already holds it) and re-lock work/boundary.
+
+        NOTE: this still consumes the full ``logits`` (computed upstream), so it
+        validates accuracy/graph-compat but does NOT save compute. Real speedup
+        needs a gather-MQA kernel that scores only work+boundary.
+        """
+        K = self.index_topk
+        Tm = logits.shape[1]
+        dev = logits.device
+        Wc = max(K, Tm // _CASC_WORK_DIV)
+        Wc = min(Wc, Tm)
+        Bc = max(1, min(Tm // _CASC_BND_DIV, Tm - Wc))
+        # lazy fixed-shape buffers (allocated during warmup, before capture)
+        if (self._casc_work is None or self._casc_work.numel() != Wc
+                or self._casc_boundary.numel() != Bc):
+            self._casc_work = torch.zeros(Wc, dtype=torch.long, device=dev)
+            self._casc_boundary = torch.zeros(Bc, dtype=torch.long, device=dev)
+            self._casc_force = torch.ones(1, dtype=torch.bool, device=dev)
+            self._casc_arange = torch.arange(Tm, device=dev)
+            self._casc_refreshes = torch.zeros(1, dtype=torch.long, device=dev)
+        row = logits[0]
+        length = lengths.reshape(-1)[0]
+        neg = torch.finfo(row.dtype).min
+        masked = torch.where(self._casc_arange < length, row, row.new_full((), neg))
+        # candidate sets if refreshing (fixed shape Wc+Bc)
+        big = torch.topk(masked, Wc + Bc).indices
+        new_work = big[:Wc]
+        new_bound = big[Wc:Wc + Bc]
+        # reuse: top-K within locked work
+        wlog = masked[self._casc_work]
+        rsel = torch.topk(wlog, K)
+        reuse_pos = self._casc_work[rsel.indices]
+        tau = rsel.values[-1]
+        # device-side refresh flag (scalar bool) — NO host sync
+        refresh = (masked[self._casc_boundary] > tau).any() | self._casc_force[0]
+        # in-place buffer updates (graph-safe), device select
+        self._casc_work.copy_(torch.where(refresh, new_work, self._casc_work))
+        self._casc_boundary.copy_(torch.where(refresh, new_bound, self._casc_boundary))
+        self._casc_refreshes.add_(refresh.long())
+        self._casc_force.fill_(False)
+        # output: refresh -> full top-K (already in topk_result), else reuse
+        base = topk_result[0].to(torch.long)
+        topk_result[0].copy_(torch.where(refresh, base, reuse_pos).to(torch.int32))
+        return topk_result
+
+    def _block_refresh(self, logits, kvlen_2d, max_seq_len):
+        """Full-score step (B-general): lock top-N work BLOCKS per row by
+        per-block max score. logits: [B, max_seq_len]."""
+        bsz = logits.shape[0]
+        Bk = self.blocksize
+        K = self.index_topk
+        nblk = max_seq_len // Bk
+        neg = torch.finfo(logits.dtype).min
+        ctx = kvlen_2d.reshape(bsz, -1)[:, 0].to(torch.long)  # [B]
+        pos = torch.arange(nblk * Bk, device=logits.device)   # [nblk*Bk]
+        masked = torch.where(
+            pos.unsqueeze(0) < ctx.unsqueeze(1), logits[:, : nblk * Bk],
+            logits.new_full((), neg),
+        )
+        blk_max = masked.view(bsz, nblk, Bk).amax(dim=2)       # [B, nblk]
+        Nw = max((K // Bk) + 1, nblk // _CASC_WORK_DIV)
+        Nw = min(Nw, nblk)
+        self._blk_sel = torch.topk(blk_max, Nw, dim=1).indices.long()  # [B, Nw]
+        self._blk_force = False
+
+    def _block_reuse_topk(self, q_fp8, weights, kv_cache_fp8, block_table, kvlen_2d):
+        """Reuse step (B-general): score ONLY locked work blocks via a reduced
+        per-row block_table; per-row top-K; remap to global positions."""
+        bsz = block_table.shape[0]
+        Bk = self.blocksize
+        K = self.index_topk
+        neg = torch.finfo(torch.float32).min
+        sel = self._blk_sel                                    # [B, Nw]
+        Nw = sel.shape[1]
+        red_bt = block_table.gather(1, sel).to(torch.int32).contiguous()  # [B, Nw]
+        red_seq = Nw * Bk
+        red_kvlen = torch.full((bsz, 1), red_seq, dtype=torch.int32, device=q_fp8.device)
+        red_sched = deep_gemm.get_paged_mqa_logits_metadata(
+            red_kvlen, Bk, deep_gemm.get_num_sms()
+        )
+        red_logits = deep_gemm.fp8_paged_mqa_logits(
+            q_fp8.unsqueeze(1),
+            kv_cache_fp8.view(dtype=torch.uint8),
+            weights,
+            red_kvlen,
+            red_bt,
+            red_sched,
+            red_seq,
+            clean_logits=False,
+        )                                                       # [B, red_seq]
+        ctx = kvlen_2d.reshape(bsz, -1)[:, 0].to(torch.long)    # [B]
+        rpos = torch.arange(red_seq, device=red_logits.device)
+        blk_of = rpos // Bk                                     # [red_seq]
+        off = rpos % Bk
+        gpos = sel[:, blk_of] * Bk + off.unsqueeze(0)          # [B, red_seq]
+        red_logits = torch.where(gpos < ctx.unsqueeze(1), red_logits,
+                                 red_logits.new_full((), neg))
+        kk = min(K, red_seq)
+        vals, idx = torch.topk(red_logits, kk, dim=1)          # [B, kk]
+        glob = sel.gather(1, idx // Bk) * Bk + (idx % Bk)       # [B, kk]
+        glob = torch.where(vals > neg, glob, torch.full_like(glob, -1))
+        out = red_logits.new_full((bsz, K), -1, dtype=torch.int32)
+        out[:, :kk] = glob.to(torch.int32)
+        return out
 
     def _head_dim_with_sf(self) -> int:
         return self.index_head_dim + self.index_head_dim // self.block_size * 4
@@ -701,6 +946,31 @@ class IndexerOp(nn.Module):
             kvlen_2d = fmha_params.kvlen_d.unsqueeze(1)
 
         max_seq_len = block_table.shape[1] * self.blocksize
+
+        # Block-level reuse (B-general, fixed-period refresh): on non-refresh
+        # decode steps score ONLY the locked work blocks via a reduced
+        # block_table (real saving at serving batch). Refresh every _CASC_PERIOD
+        # steps (host counter -> no D2H sync) or when batch shape changes.
+        _blk_active = (
+            _CASCADE_BLOCK and not is_target_verify
+            and (max_seq_len // self.blocksize) >= 256  # only long context
+        )
+        if _blk_active:
+            Bsz = block_table.shape[0]
+            need_refresh = (
+                self._blk_force
+                or self._blk_sel is None
+                or self._blk_sel.shape[0] != Bsz
+                or (_CASC_PERIOD > 0 and (self._blk_step % _CASC_PERIOD) == 0)
+            )
+            self._blk_step += 1
+            if not need_refresh:
+                out = self._block_reuse_topk(
+                    q_fp8, weights, kv_cache_fp8, block_table, kvlen_2d
+                )
+                if out is not None:
+                    return out
+
         schedule_metadata = getattr(fmha_params, "schedule_metadata", None)
         has_schedule_metadata = False
         if isinstance(schedule_metadata, torch.Tensor):
@@ -730,6 +1000,9 @@ class IndexerOp(nn.Module):
             fmha_params.expanded_seq_lens.device == logits.device
         ), "expanded_seq_lens must be on the same device as logits"
 
+        # Env-gated dump of the pre-TopK indexer score logits (decode).
+        self._maybe_dump_logits(logits, lengths)
+
         topk_result = logits.new_empty(
             (logits.shape[0], self.index_topk), dtype=torch.int32
         )
@@ -741,6 +1014,16 @@ class IndexerOp(nn.Module):
             self.index_topk,
             max_seq_len,
         )
+
+        # Step-axis closed-loop reuse (reference; overwrites top-k with the
+        # scheme's selection so end-to-end accuracy can be measured).
+        if _CASCADE and not is_target_verify and logits.shape[0] == 1:
+            topk_result = self._cascade_select(logits, lengths, topk_result)
+
+        # Block-level refresh: this was a full-score step -> (re)lock the work +
+        # boundary blocks from the per-block max score for subsequent reuse.
+        if _blk_active:
+            self._block_refresh(logits, kvlen_2d, max_seq_len)
 
         if _pd_debug_enabled():
             if _pd_debug_take(f"paged:{self.index_topk}", 32):
@@ -795,6 +1078,11 @@ class IndexerOp(nn.Module):
             "target verify must use paged DSA topk; ragged fp8_mqa_logits is "
             "not CUDA-graph safe"
         )
+
+        # Prefill = new request -> force a refresh on the next decode step.
+        if self._casc_force is not None:
+            self._casc_force.fill_(True)
+        self._blk_force = True
 
         # Gather quantized key from cache for prefill.
         # total_kv_tokens = sum(input_lengths + prefix_lengths) across all

@@ -165,6 +165,7 @@ void registerPyOpDefs(pybind11::module& m) {
         .def_readwrite("is_s_padded", &PyAttentionInputs::is_s_padded)
         .def_readwrite("sequence_lengths_plus_1_d", &PyAttentionInputs::sequence_lengths_plus_1_d)
         .def_readwrite("decode_cu_seqlens_d", &PyAttentionInputs::decode_cu_seqlens_d)
+        .def_readwrite("prefix_lengths_d", &PyAttentionInputs::prefix_lengths_d)
         .def_readonly("decode_cu_seqlens_host", &PyAttentionInputs::decode_cu_seqlens_host)
         .def_readwrite("position_ids", &PyAttentionInputs::position_ids)
         .def_readwrite("cache_store_inputs", &PyAttentionInputs::cache_store_inputs)
@@ -172,6 +173,8 @@ void registerPyOpDefs(pybind11::module& m) {
         .def("__repr__", [](const PyAttentionInputs& self) { return "PyAttentionInputs"; })
         .def_readwrite("prefill_cuda_graph_copy_params", &PyAttentionInputs::prefill_cuda_graph_copy_params)
         .def_readwrite("headwise_config", &PyAttentionInputs::headwise_config)
+        .def_readwrite("per_layer_cids", &PyAttentionInputs::per_layer_cids)
+        .def_readwrite("per_layer_cents", &PyAttentionInputs::per_layer_cents)
         .def("__copy__", [](const PyAttentionInputs& self) { return PyAttentionInputs(self); });
 
     pybind11::class_<BertEmbeddingInputs>(m, "BertEmbeddingInputs")

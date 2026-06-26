@@ -324,6 +324,7 @@ struct PyAttentionInputs {
     bool                                       is_s_padded = false;
     torch::Tensor                              sequence_lengths_plus_1_d;
     torch::Tensor                              decode_cu_seqlens_d;
+    torch::Tensor                              prefix_lengths_d;  // device copy of prefix_lengths (qwen3-next linear-attn / decode-prefix)
 
     // CUDA Graph mode flags
     bool is_cuda_graph = false;  // True when running in CUDA graph mode (capture or replay)
@@ -332,6 +333,10 @@ struct PyAttentionInputs {
 
     // Headwise attention config (Python dict or None).
     py::object headwise_config{py::none()};
+
+    // PQ (Product Quantization) sparse attention: per-full-attn-layer codebook ids/centroids.
+    std::optional<std::vector<torch::Tensor>> per_layer_cids;
+    std::optional<std::vector<torch::Tensor>> per_layer_cents;
 };
 
 struct BertEmbeddingInputs {

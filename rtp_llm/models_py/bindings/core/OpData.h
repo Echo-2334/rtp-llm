@@ -106,6 +106,10 @@ struct GptModelInputs {
 
 public:
     std::string debugString(bool force = false) const;
+
+    // PQ sparse attention: per-full-attn-layer codebook ids/centroids (gathered across batch in decode).
+    std::optional<std::vector<torch::Tensor>> per_layer_cids;
+    std::optional<std::vector<torch::Tensor>> per_layer_cents;
 };
 
 struct GptModelOutputs {
@@ -116,6 +120,10 @@ struct GptModelOutputs {
     torch::Tensor softmax_result;
 
     std::vector<torch::Tensor> moe_gating;
+
+    // PQ sparse attention: per-full-attn-layer codebook ids/centroids produced in prefill.
+    std::optional<std::vector<torch::Tensor>> per_layer_cids;
+    std::optional<std::vector<torch::Tensor>> per_layer_cents;
 };
 
 struct CopyParams {

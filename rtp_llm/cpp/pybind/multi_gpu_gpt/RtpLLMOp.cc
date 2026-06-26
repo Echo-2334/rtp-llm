@@ -334,6 +334,12 @@ void RtpLLMOp::initRPCServer(const EngineInitParams                        maga_
         RTP_LLM_LOG_INFO("grpc server add channel argument %s: %d", it->first.c_str(), it->second);
         builder.AddChannelArgument(it->first, it->second);
     }
+    // PD-separation RemoteGenerate messages (cache keys / block tables / PQ
+    // codebooks) routinely exceed the 4MB gRPC default. The client side already
+    // sets MAX_{SEND,RECEIVE}_MESSAGE_LENGTH=-1 in RPCPool.h; mirror that on the
+    // server or decode rejects the request with "Received message larger than max".
+    builder.SetMaxReceiveMessageSize(-1);
+    builder.SetMaxSendMessageSize(-1);
     if (grpc_config.max_server_pollers > 0) {
         builder.SetSyncServerOption(grpc::ServerBuilder::MAX_POLLERS, grpc_config.max_server_pollers);
         RTP_LLM_LOG_INFO("grpc sync server MAX_POLLERS: %d", grpc_config.max_server_pollers);

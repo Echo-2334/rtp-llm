@@ -61,6 +61,74 @@ def _use_varlen_prefill() -> bool:
     return os.environ.get("DSV4_VARLEN_PREFILL", "1") != "0"
 
 
+# ---------------------------------------------------------------------------
+# Indexer score-logits dump (env-gated).
+#
+# Dumps the per-step indexer score — i.e. the logits handed to TopK, BEFORE
+# any top-k selection — for offline analysis. Decode path only: the prefill
+# score is dense ``[M, T]`` and far too large to dump per layer at long
+# context (64k → GB/layer), so it is intentionally left untouched.
+#
+# Enable:  RTP_DUMP_INDEXER=1
+#   RTP_DUMP_DIR        output dir (default /tmp/indexer_layers)
+#   RTP_DUMP_STEPS      per-layer decode steps to capture; <=0 = unlimited
+#   RTP_DUMP_LAYERS     optional comma list of layer ids; empty = all layers
+#
+# One ``.pt`` per (layer, step, rank): a dict carrying the ``[B, q_len, T_max]``
+# score plus the per-row valid compressed-K length so columns past each row's
+# context can be masked offline.
+#
+# IMPORTANT: decode normally runs under CUDA graph. A captured graph replays
+# only GPU kernels, so this Python dump will NOT run on replay and the
+# ``.cpu()`` sync would break capture. Run the dump with ENABLE_CUDA_GRAPH=0.
+# ---------------------------------------------------------------------------
+_DUMP_LOGITS = os.environ.get("RTP_DUMP_INDEXER", "0") == "1"
+_DUMP_LOGITS_DIR = os.environ.get("RTP_DUMP_DIR", "/tmp/indexer_layers")
+_DUMP_LOGITS_STEPS = int(os.environ.get("RTP_DUMP_STEPS", "0"))  # <=0 = unlimited
+_DUMP_LOGITS_LAYERS = {
+    int(x)
+    for x in os.environ.get("RTP_DUMP_LAYERS", "").replace(" ", "").split(",")
+    if x
+}
+# Each IndexerFP8 takes the next id at construction time; blocks are built in
+# layer order so this equals the layer index within a process (each DP rank
+# constructs the full stack independently, so ids are consistent across ranks).
+_INDEXER_DUMP_COUNTER = 0
+_dump_dir_ready = False
+
+
+def _dump_rank() -> int:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+    except Exception:
+        pass
+    for k in ("RANK", "LOCAL_RANK", "WORLD_RANK"):
+        v = os.environ.get(k)
+        if v is not None:
+            try:
+                return int(v)
+            except ValueError:
+                pass
+    return 0
+
+
+def _dump_probe(tag: str) -> None:
+    """Logging-independent diagnostic: drop a sentinel file so we can tell which
+    indexer code paths actually execute at runtime. Best-effort, never raises."""
+    try:
+        os.makedirs("/tmp/indexer_probe", exist_ok=True)
+        with open(f"/tmp/indexer_probe/{tag}.txt", "a") as f:
+            f.write(f"{tag} pid={os.getpid()} rtp_dump={os.environ.get('RTP_DUMP_INDEXER')}\n")
+    except Exception:
+        pass
+
+
+_dump_probe("import")
+
+
 from rtp_llm.models_py.modules.dsv4.qlinear import QuantizedLinear
 from rtp_llm.ops.compute_ops import rtp_llm_ops
 
@@ -367,6 +435,12 @@ class IndexerFP8(PoolBackedModule):
         # (CompressorFP8.forward handles that internally).
         self._cp_ctx: Optional[CPContext] = None
 
+        # Score-logits dump bookkeeping (env-gated; see _maybe_dump_indexer_logits).
+        global _INDEXER_DUMP_COUNTER
+        self._dump_layer_id = _INDEXER_DUMP_COUNTER
+        _INDEXER_DUMP_COUNTER += 1
+        self._dump_step = 0
+
     # --------------------------------------------------------------
     # Pool propagation to nested compressor
     # --------------------------------------------------------------
@@ -606,6 +680,25 @@ class IndexerFP8(PoolBackedModule):
             )  # [B*q_len, T_max] fp32
             score = logits.view(bsz, q_len, T_max)
 
+            # Env-gated dump of the pre-TopK indexer score logits. Read the
+            # env at runtime (not import time) so worker-process env timing /
+            # setproctitle clobbering can't silently disable it.
+            if not getattr(IndexerFP8, "_dump_path_logged", False):
+                _dump_probe("decode")
+                import logging as _lg
+                _lg.warning(
+                    "[INDEXER-DUMP] forward_decode_vectorized entered; "
+                    "RTP_DUMP_INDEXER=%s dir=%s steps=%s",
+                    os.environ.get("RTP_DUMP_INDEXER"),
+                    os.environ.get("RTP_DUMP_DIR"),
+                    os.environ.get("RTP_DUMP_STEPS"),
+                )
+                IndexerFP8._dump_path_logged = True
+            if os.environ.get("RTP_DUMP_INDEXER", "0") == "1":
+                self._maybe_dump_indexer_logits(
+                    score, compressed_len.view(bsz, q_len), start_pos, position_ids
+                )
+
             # TopK (with optional persistent radix-select)
             K_eff = min(K, T_max)
             score_2d = score.view(bsz * q_len, T_max)
@@ -636,6 +729,67 @@ class IndexerFP8(PoolBackedModule):
             return out_topk_buffer
         finally:
             self._clear_nested_pool()
+
+    # --------------------------------------------------------------
+    # Score-logits dump (env-gated, decode-only) — see module header.
+    # --------------------------------------------------------------
+    def _maybe_dump_indexer_logits(
+        self,
+        score: torch.Tensor,
+        lengths: torch.Tensor,
+        start_pos: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+    ) -> None:
+        """Write one decode step's pre-TopK indexer score to disk.
+
+        ``score``   : ``[bsz, q_len, T_max]`` fp32 — the exact tensor handed to
+                      TopK (raw indexer logits, no masking applied yet).
+        ``lengths`` : ``[bsz, q_len]`` int — per-row valid compressed-K count;
+                      columns ``>= length`` are not real K and should be
+                      ignored / masked when consuming the dump offline.
+        """
+        # Runtime env reads (robust to import-time timing / worker env).
+        dump_dir = os.environ.get("RTP_DUMP_DIR", "/tmp/indexer_layers")
+        try:
+            dump_steps = int(os.environ.get("RTP_DUMP_STEPS", "0"))
+        except ValueError:
+            dump_steps = 0
+        dump_layers = {
+            int(x)
+            for x in os.environ.get("RTP_DUMP_LAYERS", "").replace(" ", "").split(",")
+            if x
+        }
+        if dump_steps > 0 and self._dump_step >= dump_steps:
+            return
+        if dump_layers and self._dump_layer_id not in dump_layers:
+            return
+        global _dump_dir_ready
+        if not _dump_dir_ready:
+            os.makedirs(dump_dir, exist_ok=True)
+            _dump_dir_ready = True
+            import logging as _lg
+            _lg.warning("[INDEXER-DUMP] writing indexer score dumps to %s", dump_dir)
+        step = self._dump_step
+        self._dump_step += 1
+        rank = _dump_rank()
+        payload: Dict[str, Any] = {
+            "score": score.detach().to(torch.float32).cpu(),  # [B, q_len, T_max]
+            "lengths": lengths.detach().to(torch.int32).cpu(),  # [B, q_len]
+            "layer_id": self._dump_layer_id,
+            "step": step,
+            "rank": rank,
+            "index_topk": self.index_topk,
+            "compress_ratio": self.compress_ratio,
+        }
+        if start_pos is not None and torch.is_tensor(start_pos):
+            payload["start_pos"] = start_pos.detach().to(torch.int64).cpu()
+        if position_ids is not None and torch.is_tensor(position_ids):
+            payload["position_ids"] = position_ids.detach().to(torch.int64).cpu()
+        fname = (
+            f"indexer_score_L{self._dump_layer_id:03d}"
+            f"_step{step:04d}_rank{rank}.pt"
+        )
+        torch.save(payload, os.path.join(dump_dir, fname))
 
     # --------------------------------------------------------------
     # Prefill prepare — caller invokes once per layer-call, before forward
@@ -994,6 +1148,9 @@ class IndexerFP8(PoolBackedModule):
         # contract and no hidden ``None``/fallback-allocate. Do NOT make Optional.
         workspace: "PrefillWorkspace",
     ) -> torch.Tensor:
+        if not getattr(IndexerFP8, "_probe_prefill_done", False):
+            _dump_probe("prefill_forward")
+            IndexerFP8._probe_prefill_done = True
         M = attention_inputs.M
         T = attention_inputs.T
         sp = attention_inputs.sp_int
@@ -1197,6 +1354,9 @@ class IndexerFP8(PoolBackedModule):
         ``finish_prefill(None)`` is a no-op so the pairing is safe to
         chain unconditionally.
         """
+        if not getattr(IndexerFP8, "_probe_pending_done", False):
+            _dump_probe("prefill_pending")
+            IndexerFP8._probe_pending_done = True
         M = attention_inputs.M
         T = attention_inputs.T
         K = self.index_topk

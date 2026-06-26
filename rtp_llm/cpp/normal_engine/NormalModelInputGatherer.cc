@@ -543,6 +543,68 @@ absl::Status NormalModelInputGatherer::processDecodeStreams(GptModelInputs&     
                              tensorSummary(model_input.kv_cache_block_id).c_str());
         }
     }
+
+    // PQ sparse attention: merge per-stream codebook (carried from prefill via gRPC) into
+    // model_input. Each stream holds per_layer_cids[layer]=[H,S,prefill_len_i]; stack across
+    // the batch dim -> [batch,H,S,max_plen] (cents -> [batch,H,S,K,sub_dim]).
+    {
+        std::vector<const std::vector<torch::Tensor>*> all_cids, all_cents;
+        for (const auto& stream : stream_groups.decodeStreams()) {
+            if (stream->getPerLayerCids().has_value()) {
+                // cids/cents land on host (pageable) via PD gRPC and are constant across decode
+                // steps. Upload to device once and cache back on the stream; later steps reuse the
+                // device copy, avoiding a per-step pageable H2D resync (once ~72% of decode GPU).
+                const auto& cur_cids = stream->getPerLayerCids().value();
+                if (!cur_cids.empty() && cur_cids[0].defined() && !cur_cids[0].is_cuda()) {
+                    std::vector<torch::Tensor> dev_cids;
+                    dev_cids.reserve(cur_cids.size());
+                    for (const auto& t : cur_cids) {
+                        dev_cids.push_back(t.defined() ? t.cuda() : t);
+                    }
+                    if (stream->getPerLayerCents().has_value()) {
+                        const auto&                cur_cents = stream->getPerLayerCents().value();
+                        std::vector<torch::Tensor> dev_cents;
+                        dev_cents.reserve(cur_cents.size());
+                        for (const auto& t : cur_cents) {
+                            dev_cents.push_back(t.defined() ? t.cuda() : t);
+                        }
+                        stream->setPerLayerCents(std::move(dev_cents));
+                    }
+                    stream->setPerLayerCids(std::move(dev_cids));
+                }
+                all_cids.push_back(&stream->getPerLayerCids().value());
+                all_cents.push_back(&stream->getPerLayerCents().value());
+            }
+        }
+        if (!all_cids.empty()) {
+            size_t                     num_layers  = all_cids[0]->size();
+            size_t                     num_streams = all_cids.size();
+            std::vector<torch::Tensor> merged_cids(num_layers);
+            std::vector<torch::Tensor> merged_cents(num_layers);
+
+            for (size_t l = 0; l < num_layers; ++l) {
+                int64_t max_plen = 0;
+                for (size_t b = 0; b < num_streams; ++b) {
+                    max_plen = std::max(max_plen, (*all_cids[b])[l].size(-1));
+                }
+                std::vector<torch::Tensor> cids_vec, cents_vec;
+                for (size_t b = 0; b < num_streams; ++b) {
+                    auto    t   = (*all_cids[b])[l];
+                    int64_t pad = max_plen - t.size(-1);
+                    if (pad > 0) {
+                        t = torch::constant_pad_nd(t, {0, pad}, 0);
+                    }
+                    cids_vec.push_back(t);
+                    cents_vec.push_back((*all_cents[b])[l]);
+                }
+                merged_cids[l]  = torch::stack(cids_vec, 0);
+                merged_cents[l] = torch::stack(cents_vec, 0);
+            }
+            model_input.per_layer_cids  = std::move(merged_cids);
+            model_input.per_layer_cents = std::move(merged_cents);
+        }
+    }
+
     return absl::OkStatus();
 }
 

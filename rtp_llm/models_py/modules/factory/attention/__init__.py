@@ -48,6 +48,18 @@ if device_type == DeviceType.ROCm:
 else:
     # currently append early means impl has higher priority
     if device_type == DeviceType.Cuda:
+        # PQ (Product Quantization) sparse attention —— 用 ENABLE_PQ_ATTN=1 启用。
+        # extend 在最前 = 最高优先级，其 support() 命中即接管 attention。
+        import os as _os
+
+        if _os.getenv("ENABLE_PQ_ATTN", "0") == "1":
+            from rtp_llm.models_py.modules.factory.attention.cuda_impl.torch_naive_pq import (
+                TorchNaivePQDecodeImpl,
+                TorchNaivePQPrefillImpl,
+            )
+
+            PREFILL_MHA_IMPS.extend([TorchNaivePQPrefillImpl])
+            DECODE_MHA_IMPS.extend([TorchNaivePQDecodeImpl])
         prefill_mha_impls = []
         try:
             from rtp_llm.models_py.modules.factory.attention.cuda_headwise_impl.headwise import (

@@ -409,6 +409,24 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
         });
     }
 
+    // PQ sparse attention: deserialize per-layer codebook from prefill onto the decode stream.
+    if (generate_request.pq_cids_size() > 0) {
+        std::vector<torch::Tensor> cids;
+        cids.reserve(generate_request.pq_cids_size());
+        for (int i = 0; i < generate_request.pq_cids_size(); i++) {
+            cids.push_back(QueryConverter::transTensor(generate_request.pq_cids(i)));
+        }
+        generate_stream->setPerLayerCids(std::move(cids));
+    }
+    if (generate_request.pq_cents_size() > 0) {
+        std::vector<torch::Tensor> cents;
+        cents.reserve(generate_request.pq_cents_size());
+        for (int i = 0; i < generate_request.pq_cents_size(); i++) {
+            cents.push_back(QueryConverter::transTensor(generate_request.pq_cents(i)));
+        }
+        generate_stream->setPerLayerCents(std::move(cents));
+    }
+
     generate_stream->resetBeginTime(currentTimeUs());
     RTP_LLM_LOG_DEBUG(
         "decode init stream[%s]: %s", generate_stream->streamLogTag().c_str(), generate_stream->debugString().c_str());
@@ -1181,7 +1199,7 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                             key, addr, static_cast<uint32_t>(block.size_bytes), block.is_cuda, true);
                     };
 
-                    if (use_mla || use_opaque_kv_store) {
+                    if (use_mla || use_opaque_kv_store || use_hybrid) {
                         RTP_LLM_CHECK_WITH_INFO(parts.size() == 1 || parts.size() == 2,
                                                 "unexpected mla convertIndexToBuffer parts size=%zu",
                                                 parts.size());
@@ -1382,7 +1400,7 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                                         key, addr, static_cast<uint32_t>(block.size_bytes), block.is_cuda, true);
                                 };
 
-                                if (mtp_use_mla || mtp_use_opaque_kv_store) {
+                                if (mtp_use_mla || mtp_use_opaque_kv_store || mtp_use_hybrid) {
                                     RTP_LLM_CHECK_WITH_INFO(parts.size() == 1 || parts.size() == 2,
                                                             "unexpected mtp mla convertIndexToBuffer parts size=%zu",
                                                             parts.size());

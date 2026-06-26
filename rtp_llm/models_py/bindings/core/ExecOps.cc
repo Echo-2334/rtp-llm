@@ -375,7 +375,10 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
                 std::shared_ptr<void> scale_block_addr(kv_cache_owner, scale_addr);
                 request_blocks->addBlock("kv_" + cache_key, kv_block_addr, data_bytes, kv_gpu_mem, true);
                 request_blocks->addBlock("kv_scale_" + cache_key, scale_block_addr, scale_bytes, kv_gpu_mem, true);
-            } else if (param.use_opaque_kv_cache_store || mla_kvcache) {
+            } else if (param.use_opaque_kv_cache_store || mla_kvcache || use_group_cache_transfer_policy) {
+                // Hybrid-attention (e.g. qwen3.5-next) full-attn blocks are one combined KV chunk
+                // (read side: convertIndexToBuffer -> createBasicBlockInfo, 1 part). Store as a
+                // single "kv_" block to match; only legacy pure-MHA splits into k_/v_.
                 request_blocks->addBlock(
                     "kv_" + cache_key, kv_block_addr, param.kv_block_stride_bytes, kv_gpu_mem, true);
             } else {
@@ -391,7 +394,10 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
             if (kv_scale_data) {
                 void* kv_scale_addr = (void*)((int8_t*)kv_scale_data + block_id * param.kv_scale_stride_bytes);
                 std::shared_ptr<void> kv_scale_block_addr(kv_scale_owner, kv_scale_addr);
-                if (param.use_opaque_kv_cache_store || mla_kvcache) {
+                if (param.use_opaque_kv_cache_store || mla_kvcache || use_group_cache_transfer_policy) {
+                    // Mirror the data block above: hybrid full-attn stores one combined
+                    // "kv_scale_" chunk to match the read side (1 part). qwen3.5-next BF16
+                    // has no scale buffer so this branch is inert there, kept for symmetry.
                     request_blocks->addBlock("kv_scale_" + cache_key,
                                              kv_scale_block_addr,
                                              param.kv_scale_stride_bytes,

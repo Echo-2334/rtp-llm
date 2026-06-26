@@ -7,7 +7,6 @@ from torch import nn
 
 import rtp_llm.ops.compute_ops as compute_ops
 from rtp_llm.config.model_config import ModelConfig
-from rtp_llm.device.device_type import DeviceType, get_device_type
 from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, all_reduce
 from rtp_llm.models_py.model_desc.block_map import select_block_map_for_layer
@@ -19,26 +18,12 @@ from rtp_llm.models_py.modules import (
     Embedding,
     FMHAImplBase,
     LinearFactory,
+    RMSNorm,
     RMSResNorm,
 )
-
-_DEVICE_TYPE = get_device_type()
-if _DEVICE_TYPE == DeviceType.Cuda:
-    from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_gemm_linear import (
-        CudaFp8GEMMLinear,
-    )
-    from rtp_llm.models_py.triton_kernels.common.fused_add_rmsnorm_fp8_quant import (
-        fused_add_rmsnorm_fp8_quant,
-        fused_add_rmsnorm_fp8_quant_with_bf16_output,
-    )
-    from rtp_llm.models_py.triton_kernels.common.fused_rmsnorm_gated_fp8_quant import (
-        fused_rmsnorm_gated_fp8_quant,
-    )
-else:
-    CudaFp8GEMMLinear = None  # type: ignore
-    fused_add_rmsnorm_fp8_quant = None  # type: ignore
-    fused_add_rmsnorm_fp8_quant_with_bf16_output = None  # type: ignore
-    fused_rmsnorm_gated_fp8_quant = None  # type: ignore
+from rtp_llm.models_py.modules.base.common.multimodal_embedding import (
+    MultimodalEmbeddingInjector,
+)
 from rtp_llm.models_py.modules.base.common.kvcache_store import WriteCacheStoreOp
 from rtp_llm.models_py.triton_kernels.causal_conv1d import (
     CausalConv1dMetadata,
@@ -47,11 +32,17 @@ from rtp_llm.models_py.triton_kernels.causal_conv1d import (
     prepare_causal_conv1d_metadata,
 )
 from rtp_llm.models_py.triton_kernels.common.layernorm_gated import RmsNormGated
+from rtp_llm.models_py.triton_kernels.common.scatter_qkv import scatter_qkv
 from rtp_llm.models_py.triton_kernels.fla.block import (
     load_initial_state_from_block_map,
     store_ssm_state_to_block_map,
 )
-from rtp_llm.models_py.triton_kernels.fla.chunk import chunk_gated_delta_rule
+from rtp_llm.models_py.triton_kernels.fla.chunk import (
+    chunk_gated_delta_rule,
+    chunk_gated_delta_rule_flydsl_with_cache_store,
+    is_flydsl_chunk_gdn_enabled,
+    is_flydsl_chunk_gdn_shape_supported,
+)
 from rtp_llm.models_py.triton_kernels.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
@@ -65,7 +56,6 @@ from rtp_llm.ops import (
     ParallelismConfig,
 )
 from rtp_llm.ops.compute_ops import (
-    CacheGroupType,
     LayerKVCache,
     PyAttentionInputs,
     PyModelInputs,
@@ -214,7 +204,7 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
             query_start_loc=cu_seqlen_without_padding,
             block_map=attn_inputs.kv_cache_kernel_block_id_device,
             seq_size_per_block=seq_size_per_block,
-            prefix_lengths=attn_inputs.prefix_lengths,
+            prefix_lengths=attn_inputs.prefix_lengths_d,
             metadata=metadata,
         ).transpose(0, 1)
         return out
@@ -249,40 +239,88 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
             )
 
             load_initial_state_from_block_map(
-                attn_inputs.prefix_lengths,
+                attn_inputs.prefix_lengths_d,
                 attn_inputs.kv_cache_kernel_block_id_device,
                 ssm_states,
                 initial_states,
                 seq_size_per_block,
             )
-        query, key, value = torch.split(
-            mixed_qkv,
-            [
-                self.local_num_k_heads * self.head_k_dim,
-                self.local_num_k_heads * self.head_k_dim,
-                self.local_num_v_heads * self.head_v_dim,
-            ],
-            dim=-1,
+        # M >= 2048: scatter_qkv (Triton, SGLang port) avoids the .view() ->
+        # .contiguous() copies that torch.split + view triggers. Below 2048,
+        # kernel launch overhead beats the savings (microbench measured).
+        if mixed_qkv.shape[0] >= 2048 and self.head_k_dim == self.head_v_dim:
+            query, key, value = scatter_qkv(
+                mixed_qkv,
+                self.local_num_k_heads,
+                self.local_num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+        else:
+            query, key, value = torch.split(
+                mixed_qkv,
+                [
+                    self.local_num_k_heads * self.head_k_dim,
+                    self.local_num_k_heads * self.head_k_dim,
+                    self.local_num_v_heads * self.head_v_dim,
+                ],
+                dim=-1,
+            )
+            query = query.view(
+                1, query.shape[0], self.local_num_k_heads, self.head_k_dim
+            )
+            key = key.view(1, key.shape[0], self.local_num_k_heads, self.head_k_dim)
+            value = value.view(
+                1, value.shape[0], self.local_num_v_heads, self.head_v_dim
+            )
+        use_flydsl_chunk_gdn = (
+            is_flydsl_chunk_gdn_enabled()
+            and is_flydsl_chunk_gdn_shape_supported(query, key, value, beta)
         )
-        query = query.view(1, query.shape[0], self.local_num_k_heads, self.head_k_dim)
-        key = key.view(1, key.shape[0], self.local_num_k_heads, self.head_k_dim)
-        value = value.view(1, value.shape[0], self.local_num_v_heads, self.head_v_dim)
-        attn_out, h, final_state = chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            initial_state=initial_states,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens_without_padding,
-            use_qk_l2norm_in_kernel=True,
-        )
-        if ssm_states is not None:
+        if use_flydsl_chunk_gdn:
+            # When ssm_states is provided the megakernel writes cache blocks
+            # directly, so final_state is not consumed — skip allocation.
+            need_final_state = ssm_states is None
+            attn_out, final_state = chunk_gated_delta_rule_flydsl_with_cache_store(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                prefix_lengths=(
+                    attn_inputs.prefix_lengths_d if ssm_states is not None else None
+                ),
+                block_map=(
+                    attn_inputs.kv_cache_kernel_block_id_device
+                    if ssm_states is not None
+                    else None
+                ),
+                ssm_states=ssm_states,
+                seq_size_per_block=(
+                    seq_size_per_block if ssm_states is not None else None
+                ),
+                initial_state=initial_states,
+                output_final_state=need_final_state,
+                cu_seqlens=cu_seqlens_without_padding,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            attn_out, h, final_state = chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                initial_state=initial_states,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens_without_padding,
+                use_qk_l2norm_in_kernel=True,
+            )
+        if ssm_states is not None and not use_flydsl_chunk_gdn:
             store_ssm_state_to_block_map(
                 h,
                 final_state,
-                attn_inputs.prefix_lengths,
+                attn_inputs.prefix_lengths_d,
                 cu_seqlens_without_padding,
                 attn_inputs.kv_cache_kernel_block_id_device,
                 ssm_states,
@@ -318,12 +356,43 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
             mixed_qkv, b, a, kv_cache_tensor, seq_size_per_block, attn_inputs
         )
         if kv_cache is not None:
-            # write kvcache to cache store
+            # write kvcache to cache store. Length tensors MUST be host here:
+            # sumu keeps attn_inputs.prefix_lengths/input_lengths device-resident
+            # ("lengths_to_device" in PyWrappedModel), but runtimeWriteCacheStore
+            # dereferences them on the CPU (ExecOps.cc reads .data_ptr<int>()[batch]).
+            # Prefer the pinned-host mirrors that prepareWriteCacheParams populated;
+            # fall back to an explicit D2H copy so we never pass a device pointer.
+            cs = attn_inputs.cache_store_inputs
+            input_lengths_host = (
+                cs.input_lengths_host
+                if cs is not None
+                and cs.input_lengths_host is not None
+                and cs.input_lengths_host.numel()
+                else attn_inputs.input_lengths.cpu()
+            )
+            prefix_lengths_host = (
+                cs.prefix_lengths_host
+                if cs is not None
+                and cs.prefix_lengths_host is not None
+                and cs.prefix_lengths_host.numel()
+                else attn_inputs.prefix_lengths.cpu()
+            )
+            # Use the KERNEL block table, not the store table: the GDN megakernel
+            # writes the recurrent ssm/conv state into kv_cache_kernel_block_id_device
+            # blocks. The store table (kv_cache_block_id_host) points at a DIFFERENT
+            # (empty) physical block, so transferring it ships zeros -> decode garbage.
+            _blk_tbl = attn_inputs.kv_cache_kernel_block_id_host
+            if _blk_tbl is None or not _blk_tbl.numel():
+                _kdev = attn_inputs.kv_cache_kernel_block_id_device
+                if _kdev is not None and _kdev.numel():
+                    _blk_tbl = _kdev.cpu()  # host mirror not populated; derive from device
+                else:
+                    _blk_tbl = attn_inputs.kv_cache_block_id_host
             compute_ops.write_cache_store(
-                attn_inputs.input_lengths,
-                attn_inputs.prefix_lengths,
-                attn_inputs.kv_cache_block_id_host,
-                attn_inputs.cache_store_inputs,
+                input_lengths_host,
+                prefix_lengths_host,
+                _blk_tbl,
+                cs,
                 kv_cache,
             )
         return attn_out
@@ -388,6 +457,7 @@ class Qwen3NextGatedDeltaNetDecode(Qwen3NextGatedDeltaNetBase):
             ],
             dim=2,
         )
+
         g, beta = fused_gdn_gating(self.alog, a, b, self.dt_bias)
 
         # contiguous will be applyed when call fused_recurrent_gated_delta_rule
@@ -478,13 +548,24 @@ class Qwen3NextAttention(CausalAttention):
         weights: Dict[str, torch.Tensor],
         layernorm_eps: float,
         quant_config: Optional[object] = None,
+        hw_kernel_config: Optional["HWKernelConfig"] = None,
     ):
         super().__init__(
-            attn_config, parallelism_config, weights, layernorm_eps, quant_config
+            attn_config,
+            parallelism_config,
+            weights,
+            layernorm_eps,
+            quant_config,
+            hw_kernel_config=hw_kernel_config,
         )
         # maybe fuse gate in qkv_proj later
         self.gate = LinearFactory.create_linear_from_weights(
-            weights, W.attn_gate_w, W.attn_gate_s, None, quant_config
+            weights,
+            W.attn_gate_w,
+            W.attn_gate_s,
+            None,
+            quant_config,
+            hw_kernel_config=hw_kernel_config,
         )
 
     def forward(
@@ -494,16 +575,9 @@ class Qwen3NextAttention(CausalAttention):
         kv_cache: Optional[LayerKVCache],
         attention_inputs: Optional[PyAttentionInputs],
         attn_meta: Qwen3NextMetadata = Qwen3NextMetadata(),
-        x_fp8: Optional[torch.Tensor] = None,
-        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if x_fp8 is not None and x_scale is not None:
-            gate = self.gate(x_fp8, input_scales=x_scale)
-        else:
-            gate = self.gate(hidden_states)
-        attn_out = super().forward(
-            hidden_states, fmha_impl, kv_cache, gate, x_fp8=x_fp8, x_scale=x_scale
-        )
+        gate = self.gate(hidden_states)
+        attn_out = super().forward(hidden_states, fmha_impl, kv_cache, gate)
         return attn_out
 
 
@@ -515,20 +589,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         weights: Dict[str, torch.Tensor],
         layernorm_eps: float,
         quant_config: Optional[object] = None,
+        hw_kernel_config: Optional["HWKernelConfig"] = None,
     ):
         super().__init__()
         self.linear_attn_config = linear_attn_config
         self.parallelism_config = parallelism_config
         self.weights = weights
         self.quant_config = quant_config
-        # in_proj_qkvz is bf16 / fp8
-        self.in_proj_qkvz = LinearFactory.create_linear_from_weights(
-            weights, W.linear_attn_qkvz_w, W.linear_attn_qkvz_s, None, quant_config
-        )
-        # in_proj_ba is bf16
-        self.in_proj_ba = LinearFactory.create_linear_from_weights(
-            weights, W.linear_attn_ba_w, None, None, quant_config
-        )
         self.head_k_dim = linear_attn_config.linear_key_head_dim
         self.head_v_dim = linear_attn_config.linear_value_head_dim
         attn_tp_size = parallelism_config.get_attn_tp_size()
@@ -537,6 +604,61 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             linear_attn_config.linear_num_value_heads // attn_tp_size
         )
         self.num_key_value_heads = self.local_num_v_heads // self.local_num_k_heads
+
+        # qkvz+ba fusion (BF16 only): combine two in-projection GEMMs into one.
+        # Saves a small kernel launch on each forward; on decode (M=1) HBM-access
+        # merging shaves a few us per layer (trace measurement: -0.094 ms/step
+        # on Qwen3.5-9B TP=2 in the original session).
+        # FP8/quantized: qkvz has scales but ba doesn't, dtypes mismatch -> fall
+        # back to the original 2-GEMM path.
+        self._qkvz_ba_fused = weights.get(W.linear_attn_qkvz_s) is None
+        if self._qkvz_ba_fused:
+            qkvz_w = weights[W.linear_attn_qkvz_w]
+            ba_w = weights[W.linear_attn_ba_w]
+            self._qkvz_size = qkvz_w.shape[1]
+            self._ba_size = ba_w.shape[1]
+            _is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+            if _is_rocm:
+                # ROCm: cat in [N, K] space then .t() to preserve column-major
+                # physical layout that hipb_mm / swizzle kernels expect.
+                fused_w = torch.cat([qkvz_w.t(), ba_w.t()], dim=0).t()
+            else:
+                # CUDA: row-major contiguous buffer (cuBLAS compatible).
+                K = qkvz_w.shape[0]
+                fused_w = torch.empty(
+                    K,
+                    self._qkvz_size + self._ba_size,
+                    dtype=qkvz_w.dtype,
+                    device=qkvz_w.device,
+                )
+                fused_w[:, : self._qkvz_size].copy_(qkvz_w)
+                fused_w[:, self._qkvz_size :].copy_(ba_w)
+            weights[W.linear_attn_qkvz_w] = fused_w[:, : self._qkvz_size]
+            weights[W.linear_attn_ba_w] = fused_w[:, self._qkvz_size :]
+            del qkvz_w, ba_w
+            self.in_proj_fused = LinearFactory.create_linear(
+                fused_w, None, None, quant_config, hw_kernel_config=hw_kernel_config
+            )
+            self.in_proj_qkvz = None
+            self.in_proj_ba = None
+        else:
+            self.in_proj_qkvz = LinearFactory.create_linear_from_weights(
+                weights,
+                W.linear_attn_qkvz_w,
+                W.linear_attn_qkvz_s,
+                None,
+                quant_config,
+                hw_kernel_config=hw_kernel_config,
+            )
+            self.in_proj_ba = LinearFactory.create_linear_from_weights(
+                weights,
+                W.linear_attn_ba_w,
+                None,
+                None,
+                quant_config,
+                hw_kernel_config=hw_kernel_config,
+            )
+            self.in_proj_fused = None
 
         self.prefill_gdn = Qwen3NextGatedDeltaNetPrefill(
             linear_attn_config, parallelism_config, weights
@@ -550,21 +672,27 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             group_size=linear_attn_config.linear_value_head_dim,
         )
         self.out_proj = LinearFactory.create_linear_from_weights(
-            weights, W.linear_attn_out_w, W.linear_attn_out_s, None, quant_config
+            weights,
+            W.linear_attn_out_w,
+            W.linear_attn_out_s,
+            None,
+            quant_config,
+            hw_kernel_config=hw_kernel_config,
         )
 
-        from rtp_llm.models_py.utils.fuse_config import fuse_kernels_enabled
+    def _input_project(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the input projection and return (projected_qkvz, projected_ba).
 
-        self._fuse_norm_quant = (
-            fuse_kernels_enabled(hw_kernel_config)
-            and fused_rmsnorm_gated_fp8_quant is not None
-            and CudaFp8GEMMLinear is not None
-            and isinstance(self.out_proj, CudaFp8GEMMLinear)
-            and self.head_v_dim % 128 == 0
-        )
-        if self._fuse_norm_quant and self.out_proj.scale_ue8m0:
-            total_groups = self.local_num_v_heads * (self.head_v_dim // 128)
-            self._fuse_norm_quant = total_groups % 4 == 0
+        Hides the fusion vs 2-GEMM dispatch from callers (forward + tests).
+        Both branches produce tensors with identical shape/semantics; the
+        fused branch slices a single GEMM output, the fallback runs two.
+        """
+        if self._qkvz_ba_fused:
+            fused = self.in_proj_fused(hidden_states)
+            return fused[..., : self._qkvz_size], fused[..., self._qkvz_size :]
+        return self.in_proj_qkvz(hidden_states), self.in_proj_ba(hidden_states)
 
     # mixed_qkvz, mixed_ba -> q, k, v, z, b, a
     def fix_query_key_value_ordering(
@@ -645,7 +773,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             query_start_loc=full_cu,
             block_map=attention_inputs.kv_cache_kernel_block_id_device,
             seq_size_per_block=seq_size_per_block,
-            prefix_lengths=attention_inputs.prefix_lengths,
+            prefix_lengths=attention_inputs.prefix_lengths_d,
             metadata=full_conv_meta,
         ).transpose(0, 1)
 
@@ -667,43 +795,84 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 dtype=gdn.ssm_state_dtype,
             )
             load_initial_state_from_block_map(
-                attention_inputs.prefix_lengths,
+                attention_inputs.prefix_lengths_d,
                 attention_inputs.kv_cache_kernel_block_id_device,
                 ssm_states,
                 initial_states,
                 seq_size_per_block,
             )
 
-        query, key, value = torch.split(
-            full_mixed_qkv,
-            [
-                gdn.local_num_k_heads * gdn.head_k_dim,
-                gdn.local_num_k_heads * gdn.head_k_dim,
-                gdn.local_num_v_heads * gdn.head_v_dim,
-            ],
-            dim=-1,
-        )
-        query = query.view(1, -1, gdn.local_num_k_heads, gdn.head_k_dim)
-        key = key.view(1, -1, gdn.local_num_k_heads, gdn.head_k_dim)
-        value = value.view(1, -1, gdn.local_num_v_heads, gdn.head_v_dim)
+        if full_mixed_qkv.shape[0] >= 2048 and gdn.head_k_dim == gdn.head_v_dim:
+            query, key, value = scatter_qkv(
+                full_mixed_qkv,
+                gdn.local_num_k_heads,
+                gdn.local_num_v_heads,
+                gdn.head_k_dim,
+                gdn.head_v_dim,
+            )
+        else:
+            query, key, value = torch.split(
+                full_mixed_qkv,
+                [
+                    gdn.local_num_k_heads * gdn.head_k_dim,
+                    gdn.local_num_k_heads * gdn.head_k_dim,
+                    gdn.local_num_v_heads * gdn.head_v_dim,
+                ],
+                dim=-1,
+            )
+            query = query.view(1, -1, gdn.local_num_k_heads, gdn.head_k_dim)
+            key = key.view(1, -1, gdn.local_num_k_heads, gdn.head_k_dim)
+            value = value.view(1, -1, gdn.local_num_v_heads, gdn.head_v_dim)
 
-        attn_out, h, final_state = chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            initial_state=initial_states,
-            output_final_state=True,
-            cu_seqlens=full_cu,
-            use_qk_l2norm_in_kernel=True,
+        use_flydsl_chunk_gdn = (
+            is_flydsl_chunk_gdn_enabled()
+            and is_flydsl_chunk_gdn_shape_supported(query, key, value, beta)
         )
+        if use_flydsl_chunk_gdn:
+            need_final_state = ssm_states is None
+            attn_out, final_state = chunk_gated_delta_rule_flydsl_with_cache_store(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                prefix_lengths=(
+                    attention_inputs.prefix_lengths_d
+                    if ssm_states is not None
+                    else None
+                ),
+                block_map=(
+                    attention_inputs.kv_cache_kernel_block_id_device
+                    if ssm_states is not None
+                    else None
+                ),
+                ssm_states=ssm_states,
+                seq_size_per_block=(
+                    seq_size_per_block if ssm_states is not None else None
+                ),
+                initial_state=initial_states,
+                output_final_state=need_final_state,
+                cu_seqlens=full_cu,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            attn_out, h, final_state = chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                initial_state=initial_states,
+                output_final_state=True,
+                cu_seqlens=full_cu,
+                use_qk_l2norm_in_kernel=True,
+            )
 
-        if ssm_states is not None:
+        if ssm_states is not None and not use_flydsl_chunk_gdn:
             store_ssm_state_to_block_map(
                 h,
                 final_state,
-                attention_inputs.prefix_lengths,
+                attention_inputs.prefix_lengths_d,
                 full_cu,
                 attention_inputs.kv_cache_kernel_block_id_device,
                 ssm_states,
@@ -726,26 +895,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         valid_mask = attn_meta.cp_local_valid_mask
         local_attn_out[valid_mask] = full_attn_out[attn_meta.cp_local_extract_indices]
 
-        if self._fuse_norm_quant and local_attn_out.dim() >= 2:
-            fp8_out, scale = fused_rmsnorm_gated_fp8_quant(
-                local_attn_out.reshape(-1, self.head_v_dim),
-                z,
-                self.norm.weight,
-                self.norm.eps,
-                num_heads=self.local_num_v_heads,
-                quant_group_size=128,
-                scale_ue8m0=self.out_proj.scale_ue8m0,
-            )
-            local_attn_out = self.out_proj(fp8_out, input_scales=scale)
-        else:
-            local_attn_out = self.norm(
-                local_attn_out.reshape(-1, self.head_v_dim),
-                z.reshape(-1, self.head_v_dim),
-            )
-            local_attn_out = local_attn_out.reshape(
-                -1, self.local_num_v_heads * self.head_v_dim
-            )
-            local_attn_out = self.out_proj(local_attn_out)
+        local_attn_out = self.norm(
+            local_attn_out.reshape(-1, self.head_v_dim),
+            z.reshape(-1, self.head_v_dim),
+        )
+        local_attn_out = local_attn_out.reshape(
+            -1, self.local_num_v_heads * self.head_v_dim
+        )
+        local_attn_out = self.out_proj(local_attn_out)
         return local_attn_out
 
     def forward(
@@ -755,8 +912,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         kv_cache: Optional[LayerKVCache],
         attention_inputs: Optional[PyAttentionInputs],
         attn_meta: Qwen3NextMetadata,
-        x_fp8: Optional[torch.Tensor] = None,
-        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert attention_inputs is not None, "attention_inputs is required"
         assert (
@@ -765,13 +920,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             or attn_meta.get_prefill_conv1d_meta() is not None
             or attn_meta.is_cp_linear_attn
         ), "prefill_conv1d_meta is required for prefill"
-        if x_fp8 is not None and x_scale is not None:
-            projected_states_qkvz = self.in_proj_qkvz(x_fp8, input_scales=x_scale)
-        else:
-            projected_states_qkvz = self.in_proj_qkvz(hidden_states)
-        projected_states_ba = self.in_proj_ba(
-            hidden_states
-        )  # fuse kernel: nvjet_tst_64x8_64x16_1x4_h_bz_TNT (bf16 nn.Linear, LINEAR layer only)
+        projected_states_qkvz, projected_states_ba = self._input_project(hidden_states)
         mixed_qkv, z, b, a = self.fix_query_key_value_ordering(
             projected_states_qkvz, projected_states_ba
         )
@@ -787,26 +936,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             attn_output = self.decode_gdn(
                 mixed_qkv, b, a, attention_inputs, kv_cache, attn_meta
             )
-        if self._fuse_norm_quant and attn_output.dim() >= 2:
-            fp8_out, scale = fused_rmsnorm_gated_fp8_quant(
-                attn_output.reshape(-1, self.head_v_dim),
-                z,
-                self.norm.weight,
-                self.norm.eps,
-                num_heads=self.local_num_v_heads,
-                quant_group_size=128,
-                scale_ue8m0=self.out_proj.scale_ue8m0,
-            )
-            attn_output = self.out_proj(fp8_out, input_scales=scale)
-        else:
-            attn_output = self.norm(
-                attn_output.reshape(-1, self.head_v_dim),
-                z.reshape(-1, self.head_v_dim),
-            )
-            attn_output = attn_output.reshape(
-                -1, self.local_num_v_heads * self.head_v_dim
-            )
-            attn_output = self.out_proj(attn_output)
+        attn_output = self.norm(
+            attn_output.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
+        )
+        # from [token * head, dim] -> [token, head * dim]
+        attn_output = attn_output.reshape(-1, self.local_num_v_heads * self.head_v_dim)
+        attn_output = self.out_proj(attn_output)
         if self.parallelism_config.get_attn_tp_size() > 1:
             attn_output = all_reduce(attn_output, group=Group.TP)
         return attn_output
@@ -822,6 +957,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         moe_config,
         max_generate_batch_size: int = 0,
         enable_cuda_graph: bool = False,
+        hw_kernel_config: Optional["HWKernelConfig"] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -835,6 +971,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 weights,
                 config.layernorm_eps,
                 config.quant_config,
+                hw_kernel_config=hw_kernel_config,
             )
         else:
             attn_configs = config.getAttentionConfigs(
@@ -846,6 +983,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 weights,
                 config.layernorm_eps,
                 config.quant_config,
+                hw_kernel_config=hw_kernel_config,
             )
 
         if config.moe_style == 2:
@@ -856,10 +994,15 @@ class Qwen3NextDecoderLayer(nn.Module):
                 moe_config,
                 max_generate_batch_size,
                 enable_cuda_graph,
+                hw_kernel_config=hw_kernel_config,
             )
         elif config.moe_style == 0:
             self.mlp = DenseMLP(
-                config.activation_type, parallelism_config, weights, config.quant_config
+                config.activation_type,
+                parallelism_config,
+                weights,
+                config.quant_config,
+                hw_kernel_config=hw_kernel_config,
             )
 
         self.input_layernorm = RMSResNorm(
@@ -868,61 +1011,6 @@ class Qwen3NextDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSResNorm(
             weights[W.post_ln_gamma], eps=config.layernorm_eps
         )
-
-        from rtp_llm.models_py.utils.fuse_config import fuse_kernels_enabled
-
-        _fuse_on = fuse_kernels_enabled(hw_kernel_config)
-        self._fuse_post_norm_quant = (
-            _fuse_on
-            and fused_add_rmsnorm_fp8_quant is not None
-            and isinstance(self.mlp, DenseMLP)
-            and self.mlp.accepts_fp8_input
-        )
-        self._fuse_post_norm_quant_moe = (
-            _fuse_on
-            and fused_add_rmsnorm_fp8_quant_with_bf16_output is not None
-            and isinstance(self.mlp, GenericMoeLayer)
-            and self.mlp.shared_expert is not None
-            and self.mlp.shared_expert.accepts_fp8_input
-        )
-
-        # Fuse input_layernorm + fp8 quant for ATTENTION layers: both gate
-        # and qkv_proj consume the same hidden_states, so quantize once and
-        # share the fp8+scale between them.
-        self._fuse_input_norm_quant = False
-        if (
-            _fuse_on
-            and fused_add_rmsnorm_fp8_quant is not None
-            and CudaFp8GEMMLinear is not None
-            and self.layer_type != HybridAttentionType.LINEAR
-            and isinstance(self.self_attn, Qwen3NextAttention)
-        ):
-            _gate = getattr(self.self_attn, "gate", None)
-            _qkv = getattr(self.self_attn, "qkv_proj", None)
-            if isinstance(_gate, CudaFp8GEMMLinear) and isinstance(
-                _qkv, CudaFp8GEMMLinear
-            ):
-                assert _gate.scale_ue8m0 == _qkv.scale_ue8m0, (
-                    f"gate.scale_ue8m0={_gate.scale_ue8m0} != "
-                    f"qkv_proj.scale_ue8m0={_qkv.scale_ue8m0}: "
-                    "shared fp8 scale requires identical format"
-                )
-                self._fuse_input_norm_quant = True
-
-        # Fuse input_layernorm + fp8 quant for LINEAR layers: in_proj_qkvz is
-        # fp8 but in_proj_ba is bf16, so use dual-output kernel that produces
-        # both bf16 normed and fp8+scale.
-        self._fuse_input_norm_quant_linear = False
-        if (
-            _fuse_on
-            and fused_add_rmsnorm_fp8_quant_with_bf16_output is not None
-            and CudaFp8GEMMLinear is not None
-            and self.layer_type == HybridAttentionType.LINEAR
-            and isinstance(self.self_attn, Qwen3NextGatedDeltaNet)
-        ):
-            _qkvz = getattr(self.self_attn, "in_proj_qkvz", None)
-            if isinstance(_qkvz, CudaFp8GEMMLinear):
-                self._fuse_input_norm_quant_linear = True
 
     def forward(
         self,
@@ -933,82 +1021,20 @@ class Qwen3NextDecoderLayer(nn.Module):
         attention_inputs: Optional[PyAttentionInputs] = None,
         attn_meta: Qwen3NextMetadata = Qwen3NextMetadata(),
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._fuse_input_norm_quant and hidden_states.dim() == 2:
-            # Dual-output: fp8 feeds qkv_proj/gate (which take fp8+scale via
-            # ``x_fp8/x_scale``), AND bf16_hs replaces hidden_states for any
-            # downstream consumer that reads the NORMED activation in bf16
-            # (e.g., gate projection's bf16 path, residual chain). Passing
-            # the un-normed ``hidden_states`` here would feed a wrong feature
-            # vector to downstream bf16 readers and cascade across layers.
-            bf16_hs, fp8_hs, scale = fused_add_rmsnorm_fp8_quant_with_bf16_output(
-                hidden_states,
-                residual,
-                self.input_layernorm.weight.data,
-                self.input_layernorm.variance_epsilon,
-                group_size=128,
-                scale_ue8m0=self.self_attn.gate.scale_ue8m0,
-            )
-            hidden_states = self.self_attn(
-                hidden_states=bf16_hs,
-                fmha_impl=fmha_impl,
-                kv_cache=kv_cache,
-                attention_inputs=attention_inputs,
-                attn_meta=attn_meta,
-                x_fp8=fp8_hs,
-                x_scale=scale,
-            )
-        elif self._fuse_input_norm_quant_linear and hidden_states.dim() == 2:
-            bf16_hs, fp8_hs, scale = fused_add_rmsnorm_fp8_quant_with_bf16_output(
-                hidden_states,
-                residual,
-                self.input_layernorm.weight.data,
-                self.input_layernorm.variance_epsilon,
-                group_size=128,
-                scale_ue8m0=self.self_attn.in_proj_qkvz.scale_ue8m0,
-            )
-            hidden_states = self.self_attn(
-                hidden_states=bf16_hs,
-                fmha_impl=fmha_impl,
-                kv_cache=kv_cache,
-                attention_inputs=attention_inputs,
-                attn_meta=attn_meta,
-                x_fp8=fp8_hs,
-                x_scale=scale,
-            )
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-            hidden_states = self.self_attn(
-                hidden_states=hidden_states,
-                fmha_impl=fmha_impl,
-                kv_cache=kv_cache,
-                attention_inputs=attention_inputs,
-                attn_meta=attn_meta,
-            )
-        if self._fuse_post_norm_quant and hidden_states.dim() == 2:
-            fp8_hs, scale = fused_add_rmsnorm_fp8_quant(
-                hidden_states,
-                residual,
-                self.post_attention_layernorm.weight.data,
-                self.post_attention_layernorm.variance_epsilon,
-                group_size=128,
-                scale_ue8m0=self.mlp.up_proj.scale_ue8m0,
-            )
-            hidden_states = self.mlp(hidden_states, x_fp8=fp8_hs, x_scale=scale)
-        elif self._fuse_post_norm_quant_moe and hidden_states.dim() == 2:
-            bf16_hs, fp8_hs, scale = fused_add_rmsnorm_fp8_quant_with_bf16_output(
-                hidden_states,
-                residual,
-                self.post_attention_layernorm.weight.data,
-                self.post_attention_layernorm.variance_epsilon,
-                group_size=128,
-                scale_ue8m0=self.mlp.shared_expert.up_proj.scale_ue8m0,
-            )
-            hidden_states = self.mlp(bf16_hs, x_fp8=fp8_hs, x_scale=scale)
-        else:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
-            hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            fmha_impl=fmha_impl,
+            kv_cache=kv_cache,
+            attention_inputs=attention_inputs,
+            attn_meta=attn_meta,
+        )
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        hidden_states = self.mlp(hidden_states)
+
         return hidden_states, residual
 
 
@@ -1052,6 +1078,7 @@ class Qwen3NextModel(GptModelBase):
                     moe_config,
                     max_generate_batch_size,
                     enable_cuda_graph,
+                    hw_kernel_config=py_hw_kernel_config,
                 )
                 for idx in range(self.layer_num)
             ]
@@ -1059,44 +1086,6 @@ class Qwen3NextModel(GptModelBase):
         self.norm = RMSResNorm(
             weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
         )
-
-    def _is_hybrid_cache(self) -> bool:
-        if self.kv_cache is None:
-            return False
-        attn_types = self.kv_cache.layer_attn_types
-        has_full = any(t == CacheGroupType.FULL for t in attn_types)
-        has_linear = any(t == CacheGroupType.LINEAR for t in attn_types)
-        return has_full and has_linear
-
-    def _get_layer_cache(self, idx: int) -> Optional[LayerKVCache]:
-        if self.kv_cache is None:
-            return None
-        attn_types = self.kv_cache.layer_attn_types
-        is_full = attn_types[idx] == CacheGroupType.FULL
-        if not is_full or not self._is_hybrid_cache():
-            return self.kv_cache.get_layer_cache(idx)
-        from rtp_llm.models_py.modules.factory.attention.common import (
-            reshape_paged_kv_cache,
-        )
-
-        base_2d = self.kv_cache.kv_cache_base_by_layer[idx]
-        if base_2d is None:
-            return self.kv_cache.get_layer_cache(idx)
-        ksb = self.kv_cache.kernel_seq_size_per_block
-        seq_per_block = ksb if ksb > 0 else self.kv_cache.seq_size_per_block
-        base_5d = reshape_paged_kv_cache(
-            base_2d,
-            self.kv_cache.num_kv_heads,
-            seq_per_block,
-            self.kv_cache.head_dim,
-        )
-        lc = LayerKVCache()
-        lc.kv_cache_base = base_5d
-        if self.kv_cache.kv_scale_base_by_layer:
-            scale = self.kv_cache.kv_scale_base_by_layer[idx]
-            if scale is not None:
-                lc.kv_scale_base = scale
-        return lc
 
     def _build_cp_linear_attn_metadata(
         self,
@@ -1156,46 +1145,12 @@ class Qwen3NextModel(GptModelBase):
             cp_local_valid_mask,
         )
 
-    def _warmup_cublas(self, hidden_states: torch.Tensor) -> None:
-        """Run a small matmul to initialize cuBLAS handles before CUDA graph capture."""
-        dummy = torch.zeros(
-            1,
-            hidden_states.shape[-1],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        torch.mm(dummy, dummy.t())
-
-    @staticmethod
-    def _warmup_flashinfer_jit() -> None:
-        """Pre-trigger FlashInfer TRTLLM JIT module download and load."""
-        try:
-            from flashinfer.decode import get_trtllm_gen_fmha_module
-
-            get_trtllm_gen_fmha_module()
-        except Exception:
-            pass
+    def word_embedding(self, inputs: PyModelInputs) -> torch.Tensor:
+        input_ids: torch.Tensor = inputs.input_ids
+        return self.embed_tokens(input_ids)
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
-        input_ids: torch.Tensor = inputs.input_ids
-        inputs_embeds = self.embed_tokens(input_ids)
-        hidden_states = inputs_embeds
-
-        if fmha_impl is None:
-            fmha_impl = self.prepare_fmha_impl(inputs)
-
-        is_capturing = torch.cuda.is_current_stream_capturing()
-        if is_capturing:
-            self._cuda_graph_captured = True
-        if not getattr(self, "_cuda_graph_captured", False) and not is_capturing:
-            if not getattr(self, "_cublas_warmed", False):
-                self._cublas_warmed = True
-                self._warmup_cublas(hidden_states)
-                self._warmup_flashinfer_jit()
-            hidden_states = torch.zeros_like(hidden_states)
-            residual = torch.zeros_like(hidden_states)
-            hidden_states, _ = self.norm(hidden_states, residual)
-            return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
+        hidden_states = self.word_embedding(inputs)
 
         attention_inputs: PyAttentionInputs = inputs.attention_inputs
         prefill_conv1d_meta = None
@@ -1249,19 +1204,60 @@ class Qwen3NextModel(GptModelBase):
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
 
-        residual = torch.zeros_like(
-            hidden_states
-        )  # fuse kernel: at::native::vectorized_elementwise_kernel<8, FillFunctor<c10::BFloat16>> (1 per iter)
+        residual = torch.zeros_like(hidden_states)
+
         for i, decoder_layer in enumerate(self.layers):
             select_block_map_for_layer(attention_inputs, i)
             hidden_states, residual = decoder_layer(
                 hidden_states,
                 residual,
                 fmha_impl,
-                kv_cache=self._get_layer_cache(i) if self.kv_cache else None,
+                kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
                 attention_inputs=attention_inputs,
                 attn_meta=attn_meta,
             )
 
         hidden_states, residual = self.norm(hidden_states, residual)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
+
+
+class Qwen35Model(Qwen3NextModel):
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        parallelism_config: ParallelismConfig,
+        weights: ModelWeights,
+        moe_config,
+        max_generate_batch_size: int,
+        fmha_config=None,
+        py_hw_kernel_config=None,
+        device_resource_config=None,
+    ):
+        super().__init__(
+            model_config,
+            parallelism_config,
+            weights,
+            moe_config,
+            max_generate_batch_size,
+            fmha_config,
+            py_hw_kernel_config,
+            device_resource_config,
+        )
+        self.multimodal_embedding_injector = MultimodalEmbeddingInjector()
+
+    def word_embedding(self, inputs: PyModelInputs) -> torch.Tensor:
+        input_ids: torch.Tensor = inputs.input_ids
+
+        position_ids = inputs.combo_position_ids
+        token_type_ids = inputs.embedding_inputs.combo_tokens_type_ids
+        text_tokens_mask = inputs.embedding_inputs.text_tokens_mask
+        mm_features = inputs.multimodal_inputs.multimodal_features
+        mm_feature_locs = inputs.multimodal_inputs.mm_features_locs
+
+        inputs_embeds = self.embed_tokens(
+            input_ids, position_ids, token_type_ids, text_tokens_mask
+        )
+        hidden_states = self.multimodal_embedding_injector(
+            inputs_embeds, mm_features, mm_feature_locs
+        )
+        return hidden_states
