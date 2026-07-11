@@ -21,11 +21,14 @@ What this class does NOT do — by design:
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Any, Callable, Dict, NamedTuple, Optional
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+_reuse_logger = logging.getLogger(__name__)
 import torch.nn.functional as F
 
 from rtp_llm.models_py.modules.dsv4._profiler import record_function_range
@@ -115,6 +118,111 @@ def _fp8_prefill_topk_canonicalize() -> bool:
         "yes",
         "on",
     )
+
+
+def _indexer_reuse_cfg() -> Optional[Tuple[int, int, int]]:
+    """Decode indexer top-k reuse (Phase 1).
+
+    Returns ``(group, coarse, rope_offset)`` when ``DSV4_INDEXER_REUSE`` is on,
+    else ``None`` (baseline per-step full top-k). See
+    ``docs/dsv4/indexer_decode_topk_reuse_plan.md``.
+
+    - group ``G`` (``DSV4_INDEXER_REUSE_GROUP``, default 16): steps that share
+      one coarse candidate pool.
+    - coarse ``C`` (``DSV4_INDEXER_REUSE_COARSE``, default 8192): pool size; the
+      per-step fine top-k is selected within these C candidates.
+    - rope_offset (``DSV4_INDEXER_REUSE_ROPE_OFFSET``, default G//2): absolute
+      position offset (from the group start) used for the coarse query's RoPE
+      (the center of the served window). ``-1`` also maps to G//2.
+
+    Phase 1 note: coarse and fine both reuse ``fp8_paged_indexer_score`` so the
+    selected top-k is numerically identical to the eventual candidate-kernel
+    version — this validates recall/quality. It does NOT yet reduce compute
+    (that is Phase 1b: a gather+score-over-candidates kernel).
+    """
+    if os.environ.get("DSV4_INDEXER_REUSE", "0").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return None
+    g = int(os.environ.get("DSV4_INDEXER_REUSE_GROUP", "16"))
+    c = int(os.environ.get("DSV4_INDEXER_REUSE_COARSE", "8192"))
+    off = int(os.environ.get("DSV4_INDEXER_REUSE_ROPE_OFFSET", "-1"))
+    if off < 0:
+        off = g // 2
+    return (max(1, g), max(1, c), off)
+
+
+def _reuse_graph_enabled() -> bool:
+    """Phase 3a: cuda-graph-compatible reuse. The in-graph decode does only the
+    fixed-shape FINE path (candidate score + top-K, reads persistent
+    ``coarse_idx``); the periodic, data-dependent COARSE refresh is lifted OUT
+    of the captured region into ``prepare_cuda_graph`` (host, before replay) via
+    ``dsv4_indexer_coarse_refresh_all``. Implies the fine-kernel path. Off by
+    default (bring-up pending). See docs/dsv4/indexer_decode_topk_reuse_plan.md."""
+    return os.environ.get("DSV4_INDEXER_REUSE_GRAPH", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+# Registry of live decode IndexerFP8 instances (one per layer). Populated at
+# construction; iterated by ``dsv4_indexer_coarse_refresh_all`` from the
+# out-of-graph ``prepare_cuda_graph`` hook so every layer's coarse pool is
+# refreshed before the captured decode graph replays.
+_DSV4_DECODE_INDEXERS: "list" = []
+
+
+def dsv4_indexer_coarse_refresh_all(attn_inputs: Any) -> None:
+    """Out-of-graph coarse refresh for all registered indexers. Call from the
+    decode FMHA impl's ``prepare_cuda_graph`` (runs before each graph replay).
+    No-op unless ``DSV4_INDEXER_REUSE_GRAPH`` is on."""
+    if not _reuse_graph_enabled():
+        return
+    for idx in _DSV4_DECODE_INDEXERS:
+        try:
+            idx.coarse_refresh(attn_inputs)
+        except Exception as e:  # never break decode on a refresh hiccup
+            _reuse_logger.warning(f"indexer coarse_refresh skipped: {e}")
+
+
+def _reuse_fine_kernel_enabled() -> bool:
+    """Phase 1b: fine step scores ONLY the C candidates (gather raw 132B slots
+    into a compact paged pool, reuse ``fp8_paged_indexer_score`` with
+    ``max_ctx_len=C``) instead of reusing the full-context score. This is the
+    compute-saving + fixed-shape (graph-ready) hot path. Off by default so the
+    validated Phase 1 (full-score reuse) stays the fallback."""
+    return os.environ.get("DSV4_INDEXER_REUSE_FINE_KERNEL", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _reuse_compact_slot_index(
+    coarse_idx: torch.Tensor,  # [B, C] global compressed idx (-1 pad)
+    bt_i32: torch.Tensor,  # [B, max_blocks] physical block ids
+    eb: int,  # entries per block
+) -> torch.Tensor:
+    """Map per-row compressed candidate indices to absolute slots in the flat
+    pool ``[total_slots, 132]`` using the same paged formula the DeepGEMM
+    kernel uses: ``abs = bt[b, t // eb] * eb + (t % eb)``. Padding (-1) maps to
+    slot 0 (its logit is masked out later via coarse_len). Returns [B, C] int64.
+    """
+    B, C = coarse_idx.shape
+    t = coarse_idx.clamp(min=0).long()
+    blk_in_seq = t // eb
+    within = t % eb
+    max_blocks = bt_i32.shape[1]
+    blk_in_seq = blk_in_seq.clamp(max=max_blocks - 1)
+    phys = bt_i32.long().gather(1, blk_in_seq)  # [B, C]
+    abs_slot = phys * eb + within
+    return abs_slot
 
 
 def _run_prefill_topk_torch(
@@ -367,6 +475,19 @@ class IndexerFP8(PoolBackedModule):
         # (CompressorFP8.forward handles that internally).
         self._cp_ctx: Optional[CPContext] = None
 
+        # Phase 3a: graph-compatible reuse state (lazy). ``_reuse_*`` topk
+        # buffers + persisted fine-query/pool snapshots let the out-of-graph
+        # ``coarse_refresh`` rebuild the pool between replays.
+        self._reuse_q_fp8_persist: Optional[torch.Tensor] = None
+        self._reuse_w_fold_persist: Optional[torch.Tensor] = None
+        self._reuse_pool2d_ref: Optional[torch.Tensor] = None
+        self._reuse_bt_persist: Optional[torch.Tensor] = None
+        self._reuse_ctx_lens_persist: Optional[torch.Tensor] = None
+        self._reuse_T_max: int = 0
+        # Register for out-of-graph coarse refresh (idempotent per instance).
+        if self not in _DSV4_DECODE_INDEXERS:
+            _DSV4_DECODE_INDEXERS.append(self)
+
     # --------------------------------------------------------------
     # Pool propagation to nested compressor
     # --------------------------------------------------------------
@@ -595,6 +716,36 @@ class IndexerFP8(PoolBackedModule):
                 if self._kv_pool_view.dim() == 3
                 else self._kv_pool_view
             )
+
+            lengths_i32 = compressed_len.view(bsz * q_len)
+            out_topk_2d = out_topk_buffer.view(bsz * q_len, K)
+            reuse_cfg = _indexer_reuse_cfg()
+
+            # --- Phase 1b: candidate-only fine path (skips full-context score
+            # on non-refresh steps → the actual compute saving; fixed-shape /
+            # graph-ready). Gated by DSV4_INDEXER_REUSE_FINE_KERNEL.
+            if reuse_cfg is not None and q_len == 1 and (
+                _reuse_fine_kernel_enabled() or _reuse_graph_enabled()
+            ):
+                self._forward_decode_reuse_kernel(
+                    reuse_cfg=reuse_cfg,
+                    q_fp8=q_fp8,
+                    w_fold=w_fold,
+                    weights=weights,
+                    qr=qr,
+                    pool_2d=pool_2d,
+                    bt_i32=bt_i32,
+                    ctx_lens_2d=ctx_lens_2d,
+                    lengths_i32=lengths_i32,
+                    T_max=T_max,
+                    bsz=bsz,
+                    out_topk_2d=out_topk_2d,
+                    start_pos=start_pos,
+                    position_ids=position_ids,
+                    compressor_meta=compressor_meta,
+                )
+                return out_topk_buffer
+
             logits = fp8_paged_indexer_score(
                 q_fp8,
                 w_fold.view(bsz * q_len, self.n_heads),
@@ -609,8 +760,33 @@ class IndexerFP8(PoolBackedModule):
             # TopK (with optional persistent radix-select)
             K_eff = min(K, T_max)
             score_2d = score.view(bsz * q_len, T_max)
-            lengths_i32 = compressed_len.view(bsz * q_len)
-            out_topk_2d = out_topk_buffer.view(bsz * q_len, K)
+
+            # --- Phase 1: decode indexer top-k reuse ------------------------
+            # When enabled, replace the per-step full-context top-2048 with a
+            # 16-step-grouped two-tier scheme: refresh an 8192 coarse pool once
+            # per group (coarse query RoPE'd at the served window center), then
+            # pick the fine top-K within that pool every step. Fine scores here
+            # still come from the full ``score`` (Phase 1 validates recall; the
+            # candidate-only score kernel is Phase 1b). q_len==1 decode only.
+            if reuse_cfg is not None and q_len == 1:
+                self._topk_reuse_select(
+                    reuse_cfg=reuse_cfg,
+                    score_2d=score_2d,
+                    lengths_i32=lengths_i32,
+                    out_topk_2d=out_topk_2d,
+                    qr=qr,
+                    weights=weights,
+                    pool_2d=pool_2d,
+                    bt_i32=bt_i32,
+                    ctx_lens_2d=ctx_lens_2d,
+                    T_max=T_max,
+                    bsz=bsz,
+                    start_pos=start_pos,
+                    position_ids=position_ids,
+                    compressor_meta=compressor_meta,
+                )
+                return out_topk_buffer
+
             if K_eff > 0 and K in (512, 1024, 2048) and _persistent_topk_enabled():
                 rtp_llm_ops.dsv4_persistent_topk(
                     score_2d,
@@ -636,6 +812,387 @@ class IndexerFP8(PoolBackedModule):
             return out_topk_buffer
         finally:
             self._clear_nested_pool()
+
+    # --------------------------------------------------------------
+    # Phase 1: decode indexer top-k reuse (16-step grouped two-tier)
+    # --------------------------------------------------------------
+    def _ensure_reuse_state(self, bsz: int, C: int, device: torch.device) -> None:
+        need = (
+            getattr(self, "_reuse_coarse_idx", None) is None
+            or self._reuse_coarse_idx.size(0) < bsz
+            or self._reuse_coarse_idx.size(1) != C
+            or self._reuse_coarse_idx.device != device
+        )
+        if need:
+            n = max(bsz, int(self.max_batch_size))
+            self._reuse_coarse_idx = torch.full(
+                (n, C), -1, dtype=torch.int32, device=device
+            )
+            self._reuse_coarse_len = torch.zeros(n, dtype=torch.int32, device=device)
+            # group id the coarse pool was built for; -1 forces first-step refresh
+            # (also naturally refreshes when a batch slot is reused by a new req).
+            self._reuse_group = torch.full(
+                (n,), -1, dtype=torch.int64, device=device
+            )
+            # Persisted fine query/weights (written in-graph each step) so the
+            # out-of-graph coarse_refresh can rebuild the pool from a prior
+            # step's query (Phase 3a). Allocated on first persist (H/D known).
+            self._reuse_q_fp8_persist = None
+            self._reuse_w_fold_persist = None
+
+    def _persist_fine_query(
+        self, q_fp8: torch.Tensor, w_fold: torch.Tensor, bt_i32: torch.Tensor,
+        ctx_lens_2d: torch.Tensor, pool_2d: torch.Tensor, T_max: int, bsz: int,
+    ) -> None:
+        """In-graph, fixed-shape copy of this step's fine query + pool snapshot
+        into persistent buffers for the out-of-graph coarse_refresh."""
+        device = q_fp8.device
+        n = self._reuse_coarse_idx.size(0)
+        if self._reuse_q_fp8_persist is None:
+            self._reuse_q_fp8_persist = torch.zeros(
+                (n,) + tuple(q_fp8.shape[1:]), dtype=q_fp8.dtype, device=device
+            )
+            self._reuse_w_fold_persist = torch.zeros(
+                (n, self.n_heads), dtype=torch.float32, device=device
+            )
+            self._reuse_bt_persist = torch.zeros(
+                (n, bt_i32.size(1)), dtype=torch.int32, device=device
+            )
+            self._reuse_ctx_lens_persist = torch.zeros(
+                (n, 1), dtype=torch.int32, device=device
+            )
+        self._reuse_q_fp8_persist[:bsz].copy_(q_fp8.view(bsz, *q_fp8.shape[1:]))
+        self._reuse_w_fold_persist[:bsz].copy_(w_fold.view(bsz, self.n_heads))
+        self._reuse_bt_persist[:bsz, : bt_i32.size(1)].copy_(bt_i32)
+        self._reuse_ctx_lens_persist[:bsz].copy_(ctx_lens_2d.view(bsz, 1))
+        self._reuse_pool2d_ref = pool_2d  # persistent KV pool view (no copy)
+        self._reuse_T_max = T_max
+
+    def _topk_reuse_select(
+        self,
+        *,
+        reuse_cfg: Tuple[int, int, int],
+        score_2d: torch.Tensor,  # [bsz, T_max] fine logits (exact per-step query)
+        lengths_i32: torch.Tensor,  # [bsz] current compressed length
+        out_topk_2d: torch.Tensor,  # [bsz, K] output (compressed indices, -1 pad)
+        qr: torch.Tensor,
+        weights: torch.Tensor,
+        pool_2d: torch.Tensor,
+        bt_i32: torch.Tensor,
+        ctx_lens_2d: torch.Tensor,
+        T_max: int,
+        bsz: int,
+        start_pos: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        compressor_meta: Optional[CompressorMeta],
+    ) -> None:
+        G, C, offset = reuse_cfg
+        K = self.index_topk
+        device = score_2d.device
+        self._ensure_reuse_state(bsz, C, device)
+
+        # Per-row absolute token position (decode q_len==1).
+        if position_ids is None:
+            pos_row = start_pos.reshape(-1)[:bsz].long()
+        else:
+            assert compressor_meta is not None
+            pos_row = compressor_meta.positions.reshape(-1)[:bsz].long()
+
+        group_id = pos_row // G  # [bsz]
+        refresh_mask = self._reuse_group[:bsz] != group_id  # [bsz] bool
+
+        # ---- Coarse refresh: rebuild the 8192 pool for rows entering a new group.
+        if bool(refresh_mask.any()):
+            freq_len = int(self.freqs_cis.size(0))
+            mid_pos = (group_id * G + offset).clamp_(0, freq_len - 1)  # [bsz]
+            if position_ids is None:
+                freqs_mid = self.freqs_cis[mid_pos]
+                q_c = self._compute_indexer_q(qr, freqs_mid, batched_rope=True)
+            else:
+                freqs_mid = self.freqs_cis.index_select(0, mid_pos).contiguous()
+                q_c = self._compute_indexer_q(qr, freqs_mid, batched_rope=False)
+            q_fp8_c, w_fold_c = indexer_q_fp8_quant_fold(
+                _as_bf16_contig(q_c), _as_bf16_contig(weights)
+            )
+            logits_c = fp8_paged_indexer_score(
+                q_fp8_c,
+                w_fold_c.view(bsz, self.n_heads),
+                pool_2d,
+                bt_i32,
+                ctx_lens_2d,
+                block_size=self._kv_eb,
+                max_ctx_len=T_max,
+            ).view(bsz, T_max)
+
+            C_eff = min(C, T_max)
+            t_range = torch.arange(T_max, device=device).view(1, T_max)
+            valid = t_range < lengths_i32.view(-1, 1)
+            logits_c = torch.where(
+                valid, logits_c, torch.full_like(logits_c, float("-inf"))
+            )
+            coarse_idx = logits_c.topk(C_eff, dim=-1)[1].to(torch.int32)  # [bsz, C_eff]
+            # Pad coarse index beyond each row's valid length to -1.
+            coarse_len = torch.clamp(lengths_i32, max=C_eff).to(torch.int32)  # [bsz]
+            k_arange = torch.arange(C_eff, device=device).view(1, C_eff)
+            coarse_idx = torch.where(
+                k_arange < coarse_len.view(-1, 1),
+                coarse_idx,
+                torch.full_like(coarse_idx, -1),
+            )
+            # Masked write only for refreshing rows (others keep prior pool).
+            rows = refresh_mask.nonzero(as_tuple=True)[0]
+            self._reuse_coarse_idx[rows, :C_eff] = coarse_idx[rows]
+            if C_eff < C:
+                self._reuse_coarse_idx[rows, C_eff:] = -1
+            self._reuse_coarse_len[rows] = coarse_len[rows]
+            self._reuse_group[rows] = group_id[rows]
+
+        # ---- Fine select: top-K within the reused coarse pool, exact scores.
+        cand = self._reuse_coarse_idx[:bsz, :C]  # [bsz, C] global compressed idx / -1
+        cand_valid = (cand >= 0) & (cand < lengths_i32.view(-1, 1))
+        cand_scores = score_2d.gather(1, cand.clamp(min=0).long())
+        cand_scores = torch.where(
+            cand_valid, cand_scores, torch.full_like(cand_scores, float("-inf"))
+        )
+        K_eff = min(K, C)
+        top_scores, local_idx = cand_scores.topk(K_eff, dim=-1)  # [bsz, K_eff]
+        global_idx = cand.gather(1, local_idx.long()).to(torch.int32)
+        # Entries selected from -inf (fewer than K valid candidates) → -1.
+        global_idx = torch.where(
+            torch.isfinite(top_scores),
+            global_idx,
+            torch.full_like(global_idx, -1),
+        )
+        out_topk_2d.fill_(-1)
+        out_topk_2d[:, :K_eff] = global_idx
+
+    # --------------------------------------------------------------
+    # Phase 1b: candidate-only fine scoring (compute-saving, graph-shaped)
+    # --------------------------------------------------------------
+    def _reuse_candidate_logits(
+        self,
+        q_fp8: torch.Tensor,
+        w_fold: torch.Tensor,
+        coarse_idx: torch.Tensor,  # [B, C] global compressed idx (-1 pad)
+        coarse_len: torch.Tensor,  # [B] valid candidate count
+        bt_i32: torch.Tensor,  # [B, max_blocks]
+        pool_2d: torch.Tensor,  # [total_slots, 132]
+        eb: int,
+        C: int,
+    ) -> torch.Tensor:
+        """Score ONLY the C candidates by gathering their raw 132B slots into a
+        compact paged pool and reusing ``fp8_paged_indexer_score`` (byte-exact
+        with the full-context kernel). Returns fine logits ``[B, C]``.
+
+        NOTE: on-model validation pending — the compact-pool + trivial block
+        table must reproduce the paged kernel's per-block scale handling. Gated
+        by ``DSV4_INDEXER_REUSE_FINE_KERNEL`` (default off)."""
+        B = coarse_idx.size(0)
+        nb = (C + eb - 1) // eb
+        C_pad = nb * eb
+        abs_slot = _reuse_compact_slot_index(coarse_idx, bt_i32, eb)  # [B, C]
+        if C_pad != C:
+            pad = torch.zeros(
+                (B, C_pad - C), dtype=abs_slot.dtype, device=abs_slot.device
+            )
+            abs_slot = torch.cat([abs_slot, pad], dim=1)
+        cand_pool = pool_2d.index_select(0, abs_slot.reshape(-1)).view(
+            B * nb, eb, pool_2d.size(-1)
+        ).contiguous()
+        cand_bt = (
+            torch.arange(B * nb, device=coarse_idx.device, dtype=torch.int32)
+            .view(B, nb)
+        )
+        cand_lens = coarse_len.view(B, 1).to(torch.int32)
+        logits = fp8_paged_indexer_score(
+            q_fp8,
+            w_fold.view(B, self.n_heads),
+            cand_pool,
+            cand_bt,
+            cand_lens,
+            block_size=eb,
+            max_ctx_len=C_pad,
+        )  # [B, C_pad]
+        return logits[:, :C]
+
+    def _forward_decode_reuse_kernel(
+        self,
+        *,
+        reuse_cfg: Tuple[int, int, int],
+        q_fp8: torch.Tensor,
+        w_fold: torch.Tensor,
+        weights: torch.Tensor,
+        qr: torch.Tensor,
+        pool_2d: torch.Tensor,
+        bt_i32: torch.Tensor,
+        ctx_lens_2d: torch.Tensor,
+        lengths_i32: torch.Tensor,
+        T_max: int,
+        bsz: int,
+        out_topk_2d: torch.Tensor,
+        start_pos: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        compressor_meta: Optional[CompressorMeta],
+    ) -> None:
+        """Phase 1b hot path: periodic coarse (full score, on group refresh) +
+        per-step fine over only the C candidates. Skips the full-context fine
+        score on non-refresh steps — this is where the compute is saved."""
+        G, C, offset = reuse_cfg
+        K = self.index_topk
+        eb = self._kv_eb
+        device = q_fp8.device
+        self._ensure_reuse_state(bsz, C, device)
+
+        # Persist this step's fine query + pool snapshot for the out-of-graph
+        # coarse_refresh (Phase 3a). Fixed-shape copies → graph-safe.
+        self._persist_fine_query(
+            q_fp8, w_fold, bt_i32, ctx_lens_2d, pool_2d, T_max, bsz
+        )
+
+        graph_mode = _reuse_graph_enabled()
+
+        if position_ids is None:
+            pos_row = start_pos.reshape(-1)[:bsz].long()
+        else:
+            assert compressor_meta is not None
+            pos_row = compressor_meta.positions.reshape(-1)[:bsz].long()
+        group_id = pos_row // G
+        refresh_mask = self._reuse_group[:bsz] != group_id
+
+        # ---- Coarse refresh (full-context score, middle-window RoPE query).
+        # In graph mode this is done OUT of the captured region by
+        # ``coarse_refresh`` (called from prepare_cuda_graph); skip here to keep
+        # the captured forward branch-free / fixed-shape.
+        if not graph_mode and bool(refresh_mask.any()):
+            freq_len = int(self.freqs_cis.size(0))
+            mid_pos = (group_id * G + offset).clamp_(0, freq_len - 1)
+            if position_ids is None:
+                freqs_mid = self.freqs_cis[mid_pos]
+                q_c = self._compute_indexer_q(qr, freqs_mid, batched_rope=True)
+            else:
+                freqs_mid = self.freqs_cis.index_select(0, mid_pos).contiguous()
+                q_c = self._compute_indexer_q(qr, freqs_mid, batched_rope=False)
+            q_fp8_c, w_fold_c = indexer_q_fp8_quant_fold(
+                _as_bf16_contig(q_c), _as_bf16_contig(weights)
+            )
+            logits_c = fp8_paged_indexer_score(
+                q_fp8_c,
+                w_fold_c.view(bsz, self.n_heads),
+                pool_2d,
+                bt_i32,
+                ctx_lens_2d,
+                block_size=eb,
+                max_ctx_len=T_max,
+            ).view(bsz, T_max)
+            C_eff = min(C, T_max)
+            t_range = torch.arange(T_max, device=device).view(1, T_max)
+            logits_c = torch.where(
+                t_range < lengths_i32.view(-1, 1),
+                logits_c,
+                torch.full_like(logits_c, float("-inf")),
+            )
+            coarse_idx = logits_c.topk(C_eff, dim=-1)[1].to(torch.int32)
+            coarse_len = torch.clamp(lengths_i32, max=C_eff).to(torch.int32)
+            k_arange = torch.arange(C_eff, device=device).view(1, C_eff)
+            coarse_idx = torch.where(
+                k_arange < coarse_len.view(-1, 1),
+                coarse_idx,
+                torch.full_like(coarse_idx, -1),
+            )
+            rows = refresh_mask.nonzero(as_tuple=True)[0]
+            self._reuse_coarse_idx[rows, :C_eff] = coarse_idx[rows]
+            if C_eff < C:
+                self._reuse_coarse_idx[rows, C_eff:] = -1
+            self._reuse_coarse_len[rows] = coarse_len[rows]
+            self._reuse_group[rows] = group_id[rows]
+
+        # ---- Fine: exact per-step score over the C candidates only.
+        cand = self._reuse_coarse_idx[:bsz, :C]
+        cand_len = self._reuse_coarse_len[:bsz]
+        logits_fine = self._reuse_candidate_logits(
+            q_fp8, w_fold, cand, cand_len, bt_i32, pool_2d, eb, C
+        )  # [B, C]
+        c_range = torch.arange(C, device=device).view(1, C)
+        logits_fine = torch.where(
+            c_range < cand_len.view(-1, 1),
+            logits_fine,
+            torch.full_like(logits_fine, float("-inf")),
+        )
+        K_eff = min(K, C)
+        top_scores, local_idx = logits_fine.topk(K_eff, dim=-1)
+        global_idx = cand.gather(1, local_idx.long()).to(torch.int32)
+        global_idx = torch.where(
+            torch.isfinite(top_scores), global_idx, torch.full_like(global_idx, -1)
+        )
+        out_topk_2d.fill_(-1)
+        out_topk_2d[:, :K_eff] = global_idx
+
+    # --------------------------------------------------------------
+    # Phase 3a: out-of-graph coarse refresh (called from prepare_cuda_graph)
+    # --------------------------------------------------------------
+    @torch.no_grad()
+    def coarse_refresh(self, attn_inputs: Any) -> None:
+        """Rebuild the coarse pool for rows entering a new group, using the
+        query persisted by the in-graph fine path of a prior step. Runs OUTSIDE
+        the captured graph (host branching / dynamic writes allowed). Writes the
+        persistent ``_reuse_coarse_idx`` that the next replay's fine path reads.
+        """
+        cfg = _indexer_reuse_cfg()
+        if cfg is None:
+            return
+        if (
+            getattr(self, "_reuse_q_fp8_persist", None) is None
+            or getattr(self, "_reuse_pool2d_ref", None) is None
+            or self._reuse_T_max <= 0
+        ):
+            return  # no in-graph step has run yet → nothing to refresh
+        G, C, _offset = cfg
+        seq_lens = getattr(attn_inputs, "sequence_lengths", None)
+        if seq_lens is None:
+            return
+        device = self._reuse_coarse_idx.device
+        n_cap = self._reuse_coarse_idx.size(0)
+        bsz = min(int(seq_lens.numel()), n_cap)
+        if bsz <= 0:
+            return
+        pos_row = seq_lens.reshape(-1)[:bsz].to(device).long()
+        group_id = pos_row // G
+        refresh_mask = self._reuse_group[:bsz] != group_id
+        if not bool(refresh_mask.any()):
+            return
+
+        T_max = self._reuse_T_max
+        eb = self._kv_eb
+        q_fp8 = self._reuse_q_fp8_persist[:bsz].unsqueeze(1)  # [B,1,H,D]
+        w_fold = self._reuse_w_fold_persist[:bsz]  # [B,H]
+        bt = self._reuse_bt_persist[:bsz]
+        ctx = self._reuse_ctx_lens_persist[:bsz]  # [B,1] compressed len
+        logits_c = fp8_paged_indexer_score(
+            q_fp8, w_fold, self._reuse_pool2d_ref, bt, ctx,
+            block_size=eb, max_ctx_len=T_max,
+        ).view(bsz, T_max)
+        lengths = ctx.view(bsz).to(torch.int32)
+        C_eff = min(C, T_max)
+        t_range = torch.arange(T_max, device=device).view(1, T_max)
+        logits_c = torch.where(
+            t_range < lengths.view(-1, 1),
+            logits_c,
+            torch.full_like(logits_c, float("-inf")),
+        )
+        coarse_idx = logits_c.topk(C_eff, dim=-1)[1].to(torch.int32)
+        coarse_len = torch.clamp(lengths, max=C_eff).to(torch.int32)
+        k_arange = torch.arange(C_eff, device=device).view(1, C_eff)
+        coarse_idx = torch.where(
+            k_arange < coarse_len.view(-1, 1),
+            coarse_idx,
+            torch.full_like(coarse_idx, -1),
+        )
+        rows = refresh_mask.nonzero(as_tuple=True)[0]
+        self._reuse_coarse_idx[rows, :C_eff] = coarse_idx[rows]
+        if C_eff < C:
+            self._reuse_coarse_idx[rows, C_eff:] = -1
+        self._reuse_coarse_len[rows] = coarse_len[rows]
+        self._reuse_group[rows] = group_id[rows]
 
     # --------------------------------------------------------------
     # Prefill prepare — caller invokes once per layer-call, before forward

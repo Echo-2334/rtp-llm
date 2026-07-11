@@ -188,3 +188,14 @@ class DSv4DecodeFmhaImplFP8:
             paged_pool_entries_per_block=self._paged_entries_per_block,
             paged_pool_tokens_per_block=self._paged_tokens_per_block,
         )
+        # Phase 3a: out-of-graph coarse refresh for the decode indexer top-k
+        # reuse (no-op unless DSV4_INDEXER_REUSE_GRAPH is on). Runs here so the
+        # captured decode graph's fine path reads a ready coarse pool.
+        try:
+            from rtp_llm.models_py.modules.dsv4.fp8.indexer import (
+                dsv4_indexer_coarse_refresh_all,
+            )
+
+            dsv4_indexer_coarse_refresh_all(attn_inputs)
+        except Exception:
+            pass
