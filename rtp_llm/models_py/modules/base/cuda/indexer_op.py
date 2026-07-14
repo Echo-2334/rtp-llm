@@ -237,6 +237,68 @@ def _try_fused_prefill_rope_hadamard_qk(
     )
 
 
+# =====================================================================
+# Decode indexer top-k reuse (paged / GLM5 hybrid path)
+# ---------------------------------------------------------------------
+# GLM5 decode top-k = ``fp8_paged_mqa_logits`` (full O(seqlen) dense score
+# over the whole paged KV, every step) -> ``dsv4_persistent_topk`` (top-2048).
+# The full score is the dominant decode-indexer cost at long context.
+#
+# Reuse (16-step grouping): refresh a coarse top-C=8192 candidate pool once
+# per group; on the other steps score ONLY those C candidates (plus the small
+# "tail" of keys appended since the refresh) by gathering their raw KV slots
+# into a compact paged pool and reusing the SAME scoring kernel — byte-exact
+# with the full-context kernel, only cheaper (C ≪ seqlen). Candidate top-K is
+# mapped back to global positions. See docs/dsv4/indexer_decode_topk_reuse_plan.md.
+#
+# This synchronous (single-stream, host-conditioned refresh) variant targets
+# eager decode (enable_cuda_graph=0) and is the correctness/precision baseline;
+# side-stream prefetch + cuda-graph integration are the follow-on phases.
+# Gated by ``GLM5_INDEXER_REUSE`` (default off) — no behavior change when off.
+# =====================================================================
+_REUSE_PATH_LOGGED: Dict[str, bool] = {}
+
+
+def _decode_reuse_cfg() -> Optional[Tuple[int, int, int]]:
+    """Return ``(G, C, tail_cap)`` when ``GLM5_INDEXER_REUSE`` is on, else None.
+
+    - ``G`` (``GLM5_INDEXER_REUSE_GROUP``, default 16): steps sharing a pool.
+    - ``C`` (``GLM5_INDEXER_REUSE_COARSE``, default 8192): coarse pool size.
+    - ``tail_cap`` (``GLM5_INDEXER_REUSE_TAIL``, default G): max new keys scored
+      on top of the pool per group (recency-gap fix). ``-1`` -> G.
+    """
+    if os.environ.get("GLM5_INDEXER_REUSE", "0").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return None
+    g = max(1, int(os.environ.get("GLM5_INDEXER_REUSE_GROUP", "16")))
+    c = max(1, int(os.environ.get("GLM5_INDEXER_REUSE_COARSE", "8192")))
+    tail = int(os.environ.get("GLM5_INDEXER_REUSE_TAIL", str(g)))
+    if tail < 0:
+        tail = g
+    return g, c, tail
+
+
+def _paged_compact_slot_index(
+    cand_idx: torch.Tensor,  # [B, W] global token positions (-1 = pad)
+    bt_i32: torch.Tensor,  # [B, max_blocks] physical page ids
+    eb: int,  # entries (tokens) per page = blocksize
+) -> torch.Tensor:
+    """Map per-row candidate token positions to absolute slots in the flat KV
+    pool ``[num_pages * eb, feat]`` using the exact paged addressing the kernel
+    uses: ``abs = bt[b, t // eb] * eb + (t % eb)``. Padding (-1) is clamped to
+    slot 0 and masked out later via the ``valid`` mask. Returns [B, W] int64.
+    """
+    t = cand_idx.clamp(min=0).long()
+    blk_in_seq = (t // eb).clamp(max=bt_i32.shape[1] - 1)
+    within = t % eb
+    phys = bt_i32.long().gather(1, blk_in_seq)  # [B, W]
+    return phys * eb + within
+
+
 class IndexerOp(nn.Module):
     """
     Indexer operations for DeepSeek-V3.2 DSA mechanism.
@@ -278,6 +340,17 @@ class IndexerOp(nn.Module):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.is_neox_style = is_neox_style
+
+        # Per-layer decode top-k reuse state (lazy; sized to max seen batch).
+        # ``_reuse_group[row]`` holds the group id whose coarse pool is currently
+        # cached for that batch slot; ``-1`` forces a refresh (cold start / slot
+        # reuse by a new sequence with a different group id).
+        self._reuse_C: int = 0
+        self._reuse_max_bsz: int = 0
+        self._reuse_group: Optional[torch.Tensor] = None  # [max_bsz] int32
+        self._reuse_coarse_idx: Optional[torch.Tensor] = None  # [max_bsz, C] int32
+        self._reuse_coarse_len: Optional[torch.Tensor] = None  # [max_bsz] int32
+        self._reuse_refresh_ctxlen: Optional[torch.Tensor] = None  # [max_bsz] int32
 
     def _head_dim_with_sf(self) -> int:
         return self.index_head_dim + self.index_head_dim // self.block_size * 4
@@ -798,6 +871,256 @@ class IndexerOp(nn.Module):
                 )
 
         return topk_result
+
+    # -----------------------------------------------------------------
+    # Decode top-k reuse (paged path). See _decode_reuse_cfg / module doc.
+    # -----------------------------------------------------------------
+    def _ensure_paged_reuse_state(
+        self, bsz: int, C: int, device: torch.device
+    ) -> None:
+        """Allocate (or grow) the per-layer reuse buffers. Growing / a device
+        change resets ``_reuse_group`` to -1, which safely forces a coarse
+        refresh for every row on the next step."""
+        if (
+            self._reuse_group is not None
+            and self._reuse_C == C
+            and self._reuse_max_bsz >= bsz
+            and self._reuse_group.device == device
+        ):
+            return
+        new_bsz = max(bsz, self._reuse_max_bsz)
+        self._reuse_C = C
+        self._reuse_max_bsz = new_bsz
+        self._reuse_group = torch.full((new_bsz,), -1, dtype=torch.int32, device=device)
+        self._reuse_coarse_idx = torch.full(
+            (new_bsz, C), -1, dtype=torch.int32, device=device
+        )
+        self._reuse_coarse_len = torch.zeros(new_bsz, dtype=torch.int32, device=device)
+        self._reuse_refresh_ctxlen = torch.zeros(
+            new_bsz, dtype=torch.int32, device=device
+        )
+
+    def _coarse_refresh_paged(
+        self,
+        rows: torch.Tensor,  # [nr] int64 batch-row indices to refresh
+        group_id: torch.Tensor,  # [B] int32 group id per row
+        q_fp8: torch.Tensor,  # [B, H, D]
+        weights2d: torch.Tensor,  # [B, H]
+        pool_blocks: torch.Tensor,  # [num_pages, eb, 1, hdsf] uint8
+        block_table: torch.Tensor,  # [B, max_blocks]
+        kvlen_2d: torch.Tensor,  # [B, 1]
+        kvlen: torch.Tensor,  # [B]
+        max_seq_len: int,
+        C: int,
+    ) -> None:
+        """Full-context score for ``rows`` -> top-C candidate pool. Written into
+        the per-layer reuse state. Dynamic (subset) shape -> out of any cuda
+        graph capture by construction (caller guards)."""
+        device = q_fp8.device
+        nr = int(rows.numel())
+        q_sub = q_fp8.index_select(0, rows)  # [nr, H, D]
+        w_sub = weights2d.index_select(0, rows)  # [nr, H]
+        bt_sub = block_table.index_select(0, rows).contiguous()  # [nr, max_blocks]
+        kvlen_sub_2d = kvlen_2d.index_select(0, rows).contiguous()  # [nr, 1]
+        ctx_sub = kvlen.index_select(0, rows)  # [nr]
+
+        sched = deep_gemm.get_paged_mqa_logits_metadata(
+            kvlen_sub_2d, self.blocksize, deep_gemm.get_num_sms()
+        )
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_sub.unsqueeze(1),
+            pool_blocks.view(dtype=torch.uint8),
+            w_sub,
+            kvlen_sub_2d,
+            bt_sub,
+            sched,
+            max_seq_len,
+            clean_logits=False,
+        )  # [nr, max_seq_len]
+
+        C_take = min(C, max_seq_len)
+        tcol = torch.arange(max_seq_len, device=device).view(1, -1)
+        logits = torch.where(
+            tcol < ctx_sub.view(-1, 1),
+            logits,
+            torch.full_like(logits, float("-inf")),
+        )
+        coarse_idx = logits.topk(C_take, dim=-1).indices.to(torch.int32)  # [nr, C_take]
+        coarse_len = torch.clamp(ctx_sub, max=C_take).to(torch.int32)  # [nr]
+        karange = torch.arange(C_take, device=device).view(1, -1)
+        coarse_idx = torch.where(
+            karange < coarse_len.view(-1, 1),
+            coarse_idx,
+            torch.full_like(coarse_idx, -1),
+        )
+
+        self._reuse_coarse_idx[rows, :C_take] = coarse_idx
+        if C_take < self._reuse_C:
+            self._reuse_coarse_idx[rows, C_take:] = -1
+        self._reuse_coarse_len[rows] = coarse_len
+        self._reuse_refresh_ctxlen[rows] = ctx_sub.to(torch.int32)
+        self._reuse_group[rows] = group_id.index_select(0, rows)
+
+    def _candidate_logits_paged(
+        self,
+        q_fp8: torch.Tensor,  # [B, H, D]
+        weights2d: torch.Tensor,  # [B, H]
+        pool_flat: torch.Tensor,  # [num_pages * eb, hdsf] uint8
+        cand: torch.Tensor,  # [B, W] global token positions (-1 pad)
+        block_table: torch.Tensor,  # [B, max_blocks]
+        eb: int,
+        hdsf: int,
+    ) -> torch.Tensor:
+        """Score ONLY the W candidates: gather their raw KV slots into a compact
+        paged pool and reuse ``fp8_paged_mqa_logits`` (byte-exact with the full
+        kernel, only cheaper). Returns fine logits ``[B, W]``."""
+        B, W = cand.shape
+        nb = (W + eb - 1) // eb
+        W_pad = nb * eb
+        if W_pad != W:
+            pad = torch.full(
+                (B, W_pad - W), -1, dtype=cand.dtype, device=cand.device
+            )
+            cand_pad = torch.cat([cand, pad], dim=1)
+        else:
+            cand_pad = cand
+        abs_slot = _paged_compact_slot_index(cand_pad, block_table, eb)  # [B, W_pad]
+        cand_pool = (
+            pool_flat.index_select(0, abs_slot.reshape(-1))
+            .view(B * nb, eb, 1, hdsf)
+            .contiguous()
+        )
+        cand_bt = torch.arange(
+            B * nb, device=cand.device, dtype=torch.int32
+        ).view(B, nb)
+        cand_kvlen_2d = torch.full(
+            (B, 1), W_pad, dtype=torch.int32, device=cand.device
+        )
+        sched = deep_gemm.get_paged_mqa_logits_metadata(
+            cand_kvlen_2d, eb, deep_gemm.get_num_sms()
+        )
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_fp8.unsqueeze(1),
+            cand_pool.view(dtype=torch.uint8),
+            weights2d,
+            cand_kvlen_2d,
+            cand_bt,
+            sched,
+            W_pad,
+            clean_logits=False,
+        )  # [B, W_pad]
+        return logits[:, :W]
+
+    def _get_topk_paged_reuse(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache: KVCache,
+        fmha_params: Any,
+        attention_inputs: Any,
+        G: int,
+        C: int,
+        tail_cap: int,
+    ) -> torch.Tensor:
+        """16-step-grouped reuse of the decode top-k. Same signature/return as
+        ``_get_topk_paged`` ([T, index_topk] int32). Plain decode only (caller
+        guards out prefill / target_verify / CP / cuda-graph capture)."""
+        device = q_fp8.device
+        K = self.index_topk
+        eb = self.blocksize
+        hdsf = self._head_dim_with_sf()
+        weights2d = weights.view(-1, self.index_n_heads)  # [T, H]
+        bsz = q_fp8.shape[0]
+        self._ensure_paged_reuse_state(bsz, C, device)
+
+        pool_blocks = (
+            self._kv_cache_blocks(kv_cache)
+            .view(-1, eb, 1, hdsf)
+            .view(dtype=torch.uint8)
+        )  # [num_pages, eb, 1, hdsf]
+        pool_flat = pool_blocks.reshape(-1, hdsf)  # [num_pages * eb, hdsf]
+
+        block_table = _physical_block_table(attention_inputs)  # [B, max_blocks]
+        kvlen = fmha_params.kvlen_d  # [B]
+        kvlen_2d = kvlen.unsqueeze(1)
+        max_seq_len = block_table.shape[1] * eb
+
+        pos_row = fmha_params.positions_d.reshape(-1)[:bsz].long()
+        group_id = (pos_row // G).to(torch.int32)
+        cur_len = kvlen[:bsz].long()  # [B]
+        stored_refresh = self._reuse_refresh_ctxlen[:bsz].long()  # [B]
+        gap = cur_len - stored_refresh
+        # Refresh when: entering a new group; the slot was reused by a shorter /
+        # different sequence (stored_refresh > cur_len); or the new-key gap
+        # exceeds the tail budget (stale beyond what the tail can cover).
+        refresh_mask = (
+            (self._reuse_group[:bsz] != group_id)
+            | (stored_refresh > cur_len)
+            | (gap > tail_cap)
+        )
+
+        if not _REUSE_PATH_LOGGED.get("paged"):
+            _REUSE_PATH_LOGGED["paged"] = True
+            logging.warning(
+                "[GLM5_INDEXER_REUSE] paged decode reuse ACTIVE: G=%d C=%d "
+                "tail=%d bsz=%d K=%d eb=%d",
+                G,
+                C,
+                tail_cap,
+                bsz,
+                K,
+                eb,
+            )
+
+        if bool(refresh_mask.any()):
+            rows = refresh_mask.nonzero(as_tuple=True)[0]
+            self._coarse_refresh_paged(
+                rows,
+                group_id,
+                q_fp8,
+                weights2d,
+                pool_blocks,
+                block_table,
+                kvlen_2d,
+                kvlen,
+                max_seq_len,
+                C,
+            )
+
+        # Candidate set = coarse pool ∪ tail (keys appended since the refresh).
+        cand_coarse = self._reuse_coarse_idx[:bsz, :C]  # [B, C]
+        refresh_len = self._reuse_refresh_ctxlen[:bsz].long()  # [B]
+        if tail_cap > 0:
+            j = torch.arange(tail_cap, device=device).view(1, -1)  # [1, tail_cap]
+            tail_abs = refresh_len.view(-1, 1) + j  # [B, tail_cap]
+            tail_valid = tail_abs < cur_len.view(-1, 1)
+            tail_idx = torch.where(
+                tail_valid,
+                tail_abs.to(torch.int32),
+                torch.full_like(cand_coarse[:, :tail_cap], -1),
+            )
+            cand = torch.cat([cand_coarse, tail_idx], dim=1)  # [B, C + tail_cap]
+            valid = torch.cat([cand_coarse >= 0, tail_valid], dim=1)
+        else:
+            cand = cand_coarse
+            valid = cand_coarse >= 0
+
+        W = cand.shape[1]
+        logits_fine = self._candidate_logits_paged(
+            q_fp8, weights2d, pool_flat, cand, block_table, eb, hdsf
+        )  # [B, W]
+        logits_fine = torch.where(
+            valid, logits_fine, torch.full_like(logits_fine, float("-inf"))
+        )
+        K_eff = min(K, W)
+        top_scores, local_idx = logits_fine.topk(K_eff, dim=-1)
+        global_idx = cand.gather(1, local_idx.long()).to(torch.int32)
+        global_idx = torch.where(
+            torch.isfinite(top_scores), global_idx, torch.full_like(global_idx, -1)
+        )
+        out_topk = torch.full((bsz, K), -1, dtype=torch.int32, device=device)
+        out_topk[:, :K_eff] = global_idx
+        return out_topk
 
     def _get_topk_ragged(
         self,

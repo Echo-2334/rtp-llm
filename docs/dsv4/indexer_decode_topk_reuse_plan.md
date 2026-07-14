@@ -197,3 +197,21 @@ Phase 1b（写 `fp8_indexer_score_gather` 候选 kernel，先在关图下验证�
 - v2 的「主图等待外部 event」需在捕获时用 `cudaStreamWaitEvent` 记录并每轮重录 event，实现需谨慎（否则 replay 读到未就绪 coarse）。
 - 逐行触发的紧凑子批 gather/scatter 的 host 开销（每步少量）；
 - 冷启动首组与 batch slot 复用：用 `coarse_group[row]` 版本号判定刷新（Phase 1 已如此），图外逻辑照搬。
+
+### 12.10 GLM5 hybrid（paged）路径实现 —— 重要更正
+**此前 §12.9 的实现全部写在 `dsv4/fp8/indexer.py`（DSV4 compression 路径），但 GLM5（`GlmMoeDsaForCausalLM`）decode 实际走 `hybrid/indexer.py`，那份代码从未被执行**——这也是 eager 模式结果异常、且「性能提升」无法复现的根因。真实 decode top-k 路径：
+`hybrid/indexer.py::Indexer.forward`（decode → `_fused_forward_decode`）→ `_get_logits_head_gate` → `_compute_topk`（`not is_prefill` 分支）→ `IndexerOp._get_topk_paged` → `deep_gemm.fp8_paged_mqa_logits`（全上下文稠密打分，主开销）→ `dsv4_persistent_topk`（top-2048）。
+
+已按最终设计在 **paged 路径**重新实现（env `GLM5_INDEXER_REUSE`，默认关）：
+- 路径确认：`GLM5_INDEXER_DECODE_TRACE=1` 限次打印，证明 on-model 确实走到 `hybrid/indexer.py` decode 分支。
+- 机制（`rtp_llm/models_py/modules/base/cuda/indexer_op.py`，紧邻 `_get_topk_paged` 的原语）：
+  - `_get_topk_paged_reuse`：编排器，返回 `[T, index_topk]` int32，与 baseline 同签名。
+  - `_coarse_refresh_paged`：进入新组的行做子批全量 `fp8_paged_mqa_logits` → `torch.topk(C)`，写每层复用状态。
+  - `_candidate_logits_paged`：按候选全局位置 gather 原始 KV 槽到紧凑 paged pool（`_paged_compact_slot_index`: `abs=bt[b,t//eb]*eb+t%eb`），复用同一 `fp8_paged_mqa_logits`（字节级一致，只是 C≪seqlen 更省）。
+  - 候选集 = coarse pool ∪ tail（自上次刷新以来新增的 key，补 recency gap）；top-K 映射回全局位置。
+  - **无 i+8 中点 RoPE**（按用户决定）：coarse 直接用当步已算好的精确 q；刷新步因此对 baseline 无损。
+  - 刷新触发（host 条件）：组号变化 ∪ 槽被更短序列复用 ∪ 新增 gap > tail_cap，自纠正。
+- 配置：`GLM5_INDEXER_REUSE`（总开关）、`_GROUP`(G=16)、`_COARSE`(C=8192)、`_TAIL`(默认 G)。
+- 生效范围：**仅 plain decode-DP**；prefill / target_verify(MTP) / prefill-CP / cuda-graph 捕获期一律走 baseline（同步刷新含 host 分支，捕获期不安全）。
+- 已验证（纯 CPU，无 GPU）：`_paged_compact_slot_index` 分页寻址、env 解析、`C≥ctx` 时 reuse==baseline top-K 集合等价。
+- **待办（需 GPU 上模型，当前 8 卡被占）**：① 用 `GLM5_INDEXER_DECODE_TRACE=1` 确认路径；② `enable_cuda_graph=0` 下跑 ruler_cwe/NIAH 128k 对拍 baseline 校验精度、测 decode tok/s；③ 精度过关后做 Phase D（侧流预取 + cuda-graph 集成，fine 入图 / coarse 迁 `prepare_cuda_graph`）。

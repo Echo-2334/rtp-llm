@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Any, Dict, Optional, Tuple
 
@@ -6,10 +7,51 @@ from torch import nn
 
 from rtp_llm.device.device_type import DeviceType, get_device_type
 from rtp_llm.models_py.modules import IndexerOp, LayerNorm
+from rtp_llm.models_py.modules.base.cuda.indexer_op import (
+    _cuda_graph_capturing,
+    _decode_reuse_cfg,
+)
 from rtp_llm.models_py.modules.factory import LinearFactory
 from rtp_llm.ops import AttentionConfigs, HWKernelConfig, ParallelismConfig
 from rtp_llm.ops.compute_ops import KVCache
 from rtp_llm.utils.model_weight import W
+
+_logger = logging.getLogger(__name__)
+
+# One-time path-confirmation trace for the GLM5 decode indexer top-k.
+# Purpose: prove on-model that GLM5 (GlmMoeDsaForCausalLM) decode really enters
+# THIS file's `_compute_topk` decode branch -> `IndexerOp._get_topk_paged`,
+# before any reuse logic is wired in. Fully gated + capped: with the env off
+# (default) this is a single cheap dict lookup and nothing is logged, so it
+# cannot change behavior. Enable with ``GLM5_INDEXER_DECODE_TRACE=1``.
+_DECODE_TRACE_STATE: Dict[str, int] = {"n": 0}
+_DECODE_TRACE_LIMIT = 8
+
+
+def _decode_trace_enabled() -> bool:
+    return os.environ.get("GLM5_INDEXER_DECODE_TRACE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _decode_trace_take() -> bool:
+    """Return True at most ``_DECODE_TRACE_LIMIT`` times per process (only when
+    the trace env is on). Lets the first decode step across a few layers log
+    without spamming every layer / every token."""
+    if not _decode_trace_enabled():
+        return False
+    if _DECODE_TRACE_STATE["n"] >= _DECODE_TRACE_LIMIT:
+        return False
+    _DECODE_TRACE_STATE["n"] += 1
+    return True
+
+
+def _shape_of(t: Any) -> Any:
+    return tuple(t.shape) if isinstance(t, torch.Tensor) else None
+
 
 _DEVICE_TYPE = get_device_type()
 if _DEVICE_TYPE == DeviceType.Cuda:
@@ -329,6 +371,46 @@ class Indexer(nn.Module):
         if not attention_inputs.is_prefill or bool(
             getattr(attention_inputs, "is_target_verify", False)
         ):
+            if _decode_trace_take():
+                _logger.info(
+                    "[GLM5_INDEXER_DECODE_TRACE] hybrid/indexer.py decode top-k "
+                    "reached: layer_idx=%s is_target_verify=%s q_fp8=%s "
+                    "weights=%s kvlen_d=%s index_topk=%s prefill_cp=%s",
+                    self.layer_idx,
+                    bool(getattr(attention_inputs, "is_target_verify", False)),
+                    _shape_of(q_fp8),
+                    _shape_of(weights),
+                    _shape_of(getattr(fmha_params, "kvlen_d", None)),
+                    self.index_topk,
+                    self._prefill_cp_enabled(),
+                )
+            # Decode top-k reuse (GLM5_INDEXER_REUSE). Plain decode-DP only:
+            # target_verify (MTP, multi-token) and prefill-CP keep the baseline,
+            # and the synchronous refresh (host-conditioned) is unsafe under
+            # cuda-graph capture, so fall back to baseline there too. When the
+            # env is off, ``_decode_reuse_cfg()`` is None -> zero overhead.
+            reuse_cfg = _decode_reuse_cfg()
+            is_target_verify = bool(
+                getattr(attention_inputs, "is_target_verify", False)
+            )
+            if (
+                reuse_cfg is not None
+                and not is_target_verify
+                and cp_params is None
+                and not self._prefill_cp_enabled()
+                and not _cuda_graph_capturing()
+            ):
+                G, C, tail_cap = reuse_cfg
+                return self.indexer_op._get_topk_paged_reuse(
+                    q_fp8,
+                    weights,
+                    kv_cache,
+                    fmha_params,
+                    attention_inputs,
+                    G,
+                    C,
+                    tail_cap,
+                )
             return self.indexer_op._get_topk_paged(
                 q_fp8, weights, kv_cache, fmha_params, attention_inputs
             )
