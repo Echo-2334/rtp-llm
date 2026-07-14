@@ -175,5 +175,45 @@ class TestCompactSlotMapping(unittest.TestCase):
                 self.assertTrue(torch.equal(got[b, c], ref))
 
 
+class TestTailInclusion(unittest.TestCase):
+    """Recency-gap fix: fine candidate set = frozen coarse pool ∪ tail
+    (keys generated since the last refresh). A high-scoring recent token must
+    be selectable even though it wasn't in the frozen coarse pool."""
+
+    @staticmethod
+    def _reuse_with_tail(fine_scores, coarse_idx, coarse_valid, refresh_len,
+                         cur_len, K, tail_cap):
+        import torch as t
+        C = coarse_idx.shape[0]
+        j = t.arange(tail_cap)
+        tail_abs = refresh_len + j
+        tail_valid = tail_abs < cur_len
+        cand = t.cat([coarse_idx, tail_abs.to(coarse_idx.dtype)])
+        valid = t.cat([coarse_valid, tail_valid])
+        sc = fine_scores.gather(0, cand.clamp(min=0).long())
+        sc = t.where(valid, sc, t.full_like(sc, float("-inf")))
+        K_eff = min(K, int(valid.sum()))
+        loc = sc.topk(K_eff)[1]
+        return set(cand.gather(0, loc).tolist())
+
+    def test_recent_token_selectable(self):
+        T, C, K, tail_cap = 4096, 512, 128, 16
+        fine = torch.full((T,), -5.0)
+        # frozen coarse pool covers [0, refresh_len); some old keys scored.
+        refresh_len = torch.tensor(3000)
+        cur_len = torch.tensor(3010)  # 10 new tokens since refresh
+        coarse_idx = torch.arange(C, dtype=torch.int32)  # old keys 0..C-1
+        coarse_valid = torch.ones(C, dtype=torch.bool)
+        fine[:C] = torch.linspace(0, 1, C)  # modest old scores
+        # a NEW token (pos 3005, in the tail) is the single most relevant key
+        fine[3005] = 100.0
+        picked = self._reuse_with_tail(
+            fine, coarse_idx, coarse_valid, refresh_len, cur_len, K, tail_cap
+        )
+        # with tail, the recent high-score key IS selected; coarse-only would miss it
+        self.assertIn(3005, picked)
+        self.assertNotIn(3005, set(coarse_idx.tolist()))  # it wasn't in coarse pool
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

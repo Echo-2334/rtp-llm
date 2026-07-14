@@ -175,6 +175,8 @@ def _reuse_graph_enabled() -> bool:
 # out-of-graph ``prepare_cuda_graph`` hook so every layer's coarse pool is
 # refreshed before the captured decode graph replays.
 _DSV4_DECODE_INDEXERS: "list" = []
+# one-shot proof-of-execution flags [fine_path, coarse_refresh]
+_REUSE_PATH_LOGGED = [False, False]
 
 
 def dsv4_indexer_coarse_refresh_all(attn_inputs: Any) -> None:
@@ -188,6 +190,22 @@ def dsv4_indexer_coarse_refresh_all(attn_inputs: Any) -> None:
             idx.coarse_refresh(attn_inputs)
         except Exception as e:  # never break decode on a refresh hiccup
             _reuse_logger.warning(f"indexer coarse_refresh skipped: {e}")
+
+
+def _reuse_prefetch_cfg() -> Optional[int]:
+    """Phase 3b: side-stream prefetch. Returns the in-group step at which to
+    precompute the NEXT group's coarse pool on a side stream (default G-4), or
+    None when disabled (``DSV4_INDEXER_REUSE_PREFETCH`` off). Requires graph
+    mode. When off, coarse runs on-demand at the group boundary (synchronous)."""
+    if os.environ.get("DSV4_INDEXER_REUSE_PREFETCH", "0").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return None
+    s = os.environ.get("DSV4_INDEXER_REUSE_PREFETCH_STEP", "-1")
+    return int(s)
 
 
 def _reuse_fine_kernel_enabled() -> bool:
@@ -484,6 +502,12 @@ class IndexerFP8(PoolBackedModule):
         self._reuse_bt_persist: Optional[torch.Tensor] = None
         self._reuse_ctx_lens_persist: Optional[torch.Tensor] = None
         self._reuse_T_max: int = 0
+        # Phase 3b: side-stream coarse prefetch (double-buffered staging + event).
+        self._reuse_side_stream: Optional[torch.cuda.Stream] = None
+        self._reuse_coarse_evt: Optional[torch.cuda.Event] = None
+        self._reuse_stage_idx: Optional[torch.Tensor] = None
+        self._reuse_stage_len: Optional[torch.Tensor] = None
+        self._reuse_stage_group: Optional[torch.Tensor] = None
         # Register for out-of-graph coarse refresh (idempotent per instance).
         if self not in _DSV4_DECODE_INDEXERS:
             _DSV4_DECODE_INDEXERS.append(self)
@@ -834,18 +858,37 @@ class IndexerFP8(PoolBackedModule):
             self._reuse_group = torch.full(
                 (n,), -1, dtype=torch.int64, device=device
             )
-            # Persisted fine query/weights (written in-graph each step) so the
-            # out-of-graph coarse_refresh can rebuild the pool from a prior
-            # step's query (Phase 3a). Allocated on first persist (H/D known).
+            # compressed_len at the last refresh — tail start so the fine step
+            # can add keys generated AFTER the refresh (recency-gap fix).
+            self._reuse_refresh_ctxlen = torch.zeros(
+                n, dtype=torch.int32, device=device
+            )
+            self._reuse_stage_ctxlen = torch.zeros(
+                n, dtype=torch.int32, device=device
+            )
+            # Persisted pre-RoPE query/weights (written in-graph each step) so
+            # the out-of-graph coarse_refresh can rebuild the pool at the
+            # group-middle RoPE position. Allocated on first persist.
             self._reuse_q_fp8_persist = None
             self._reuse_w_fold_persist = None
+            # Prefetch staging (group_id+1 pool computed ahead on side stream).
+            self._reuse_stage_idx = torch.full(
+                (n, C), -1, dtype=torch.int32, device=device
+            )
+            self._reuse_stage_len = torch.zeros(n, dtype=torch.int32, device=device)
+            self._reuse_stage_group = torch.full(
+                (n,), -2, dtype=torch.int64, device=device
+            )
 
     def _persist_fine_query(
         self, q_fp8: torch.Tensor, w_fold: torch.Tensor, bt_i32: torch.Tensor,
         ctx_lens_2d: torch.Tensor, pool_2d: torch.Tensor, T_max: int, bsz: int,
     ) -> None:
-        """In-graph, fixed-shape copy of this step's fine query + pool snapshot
-        into persistent buffers for the out-of-graph coarse_refresh."""
+        """In-graph, fixed-shape copy of this step's (already RoPE'd + quantized)
+        query + weights + pool snapshot into persistent buffers, so the
+        out-of-graph coarse_refresh can score directly — no wq_b / RoPE / quant
+        recompute (the coarse query's RoPE position is simply whichever step
+        last persisted it, ~group-start / prefetch step)."""
         device = q_fp8.device
         n = self._reuse_coarse_idx.size(0)
         if self._reuse_q_fp8_persist is None:
@@ -1042,9 +1085,15 @@ class IndexerFP8(PoolBackedModule):
         eb = self._kv_eb
         device = q_fp8.device
         self._ensure_reuse_state(bsz, C, device)
+        if not _REUSE_PATH_LOGGED[0]:
+            _REUSE_PATH_LOGGED[0] = True
+            _reuse_logger.warning(
+                "[DSV4_INDEXER_REUSE] fine path ACTIVE (graph=%s prefetch=%s G=%d C=%d bsz=%d)",
+                _reuse_graph_enabled(), _reuse_prefetch_cfg(), G, C, bsz,
+            )
 
-        # Persist this step's fine query + pool snapshot for the out-of-graph
-        # coarse_refresh (Phase 3a). Fixed-shape copies → graph-safe.
+        # Persist this step's query + weights + pool snapshot for the
+        # out-of-graph coarse_refresh (Phase 3a). Fixed-shape copies → graph-safe.
         self._persist_fine_query(
             q_fp8, w_fold, bt_i32, ctx_lens_2d, pool_2d, T_max, bsz
         )
@@ -1104,21 +1153,34 @@ class IndexerFP8(PoolBackedModule):
             if C_eff < C:
                 self._reuse_coarse_idx[rows, C_eff:] = -1
             self._reuse_coarse_len[rows] = coarse_len[rows]
+            self._reuse_refresh_ctxlen[rows] = lengths_i32[rows].to(torch.int32)
             self._reuse_group[rows] = group_id[rows]
 
-        # ---- Fine: exact per-step score over the C candidates only.
-        cand = self._reuse_coarse_idx[:bsz, :C]
-        cand_len = self._reuse_coarse_len[:bsz]
-        logits_fine = self._reuse_candidate_logits(
-            q_fp8, w_fold, cand, cand_len, bt_i32, pool_2d, eb, C
-        )  # [B, C]
-        c_range = torch.arange(C, device=device).view(1, C)
-        logits_fine = torch.where(
-            c_range < cand_len.view(-1, 1),
-            logits_fine,
-            torch.full_like(logits_fine, float("-inf")),
+        # ---- Fine: exact per-step score over the coarse pool PLUS the "tail"
+        # (keys generated since the last refresh — recency-gap fix). Candidate
+        # set = coarse_idx[C] ∪ tail[tail_cap]; tail = compressed indices
+        # [refresh_ctxlen, current_len). Fixed shape (C + tail_cap) → graph-safe.
+        tail_cap = G  # ≤ G new compressed keys per group (ratio ≥ 1)
+        cand_coarse = self._reuse_coarse_idx[:bsz, :C]  # [B, C]
+        refresh_len = self._reuse_refresh_ctxlen[:bsz].long()  # [B]
+        cur_len = lengths_i32.long()  # [B] current compressed_len
+        j = torch.arange(tail_cap, device=device).view(1, tail_cap)  # [1,tail_cap]
+        tail_abs = refresh_len.view(-1, 1) + j  # [B, tail_cap] global compressed idx
+        tail_valid = tail_abs < cur_len.view(-1, 1)  # in-range new keys
+        tail_idx = torch.where(
+            tail_valid, tail_abs.to(torch.int32), torch.full_like(cand_coarse[:, :tail_cap], -1)
         )
-        K_eff = min(K, C)
+        cand = torch.cat([cand_coarse, tail_idx], dim=1)  # [B, C+tail_cap]
+        Cext = C + tail_cap
+        full_len = torch.full((bsz,), Cext, dtype=torch.int32, device=device)
+        logits_fine = self._reuse_candidate_logits(
+            q_fp8, w_fold, cand, full_len, bt_i32, pool_2d, eb, Cext
+        )  # [B, C+tail_cap] — score all, mask below
+        valid = torch.cat([cand_coarse >= 0, tail_valid], dim=1)  # [B, Cext]
+        logits_fine = torch.where(
+            valid, logits_fine, torch.full_like(logits_fine, float("-inf"))
+        )
+        K_eff = min(K, Cext)
         top_scores, local_idx = logits_fine.topk(K_eff, dim=-1)
         global_idx = cand.gather(1, local_idx.long()).to(torch.int32)
         global_idx = torch.where(
@@ -1128,14 +1190,54 @@ class IndexerFP8(PoolBackedModule):
         out_topk_2d[:, :K_eff] = global_idx
 
     # --------------------------------------------------------------
-    # Phase 3a: out-of-graph coarse refresh (called from prepare_cuda_graph)
+    # Phase 3a/3b: out-of-graph coarse refresh (from prepare_cuda_graph)
     # --------------------------------------------------------------
+    def _compute_coarse_pool(
+        self, rows: torch.Tensor, C: int, T_max: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the coarse top-C pool for a subset of ``rows`` using the
+        already-RoPE'd + quantized query persisted by the in-graph fine path
+        (no wq_b / RoPE / quant recompute — that was a net-negative). Runs on the
+        current CUDA stream. Returns ``(idx[nr, C] int32, len[nr] int32)``."""
+        device = self._reuse_coarse_idx.device
+        eb = self._kv_eb
+        nr = int(rows.numel())
+        q_fp8 = self._reuse_q_fp8_persist.index_select(0, rows)  # [nr,H,D]
+        w_fold = self._reuse_w_fold_persist.index_select(0, rows)  # [nr,H]
+        bt = self._reuse_bt_persist.index_select(0, rows)
+        ctx = self._reuse_ctx_lens_persist.index_select(0, rows)  # [nr,1]
+        logits_c = fp8_paged_indexer_score(
+            q_fp8.view(nr, 1, self.n_heads, self.head_dim),
+            w_fold.view(nr, self.n_heads),
+            self._reuse_pool2d_ref, bt, ctx, block_size=eb, max_ctx_len=T_max,
+        ).view(nr, T_max)
+        lengths = ctx.view(nr).to(torch.int32)
+        C_eff = min(C, T_max)
+        t_range = torch.arange(T_max, device=device).view(1, T_max)
+        logits_c = torch.where(
+            t_range < lengths.view(-1, 1),
+            logits_c, torch.full_like(logits_c, float("-inf")),
+        )
+        idx = logits_c.topk(C_eff, dim=-1)[1].to(torch.int32)  # [nr, C_eff]
+        clen = torch.clamp(lengths, max=C_eff).to(torch.int32)
+        k_arange = torch.arange(C_eff, device=device).view(1, C_eff)
+        idx = torch.where(
+            k_arange < clen.view(-1, 1), idx, torch.full_like(idx, -1)
+        )
+        if C_eff < C:
+            idx = torch.cat(
+                [idx, torch.full((nr, C - C_eff), -1, dtype=torch.int32, device=device)],
+                dim=1,
+            )
+        return idx, clen, lengths  # lengths = unclamped compressed_len (tail start)
+
     @torch.no_grad()
     def coarse_refresh(self, attn_inputs: Any) -> None:
-        """Rebuild the coarse pool for rows entering a new group, using the
-        query persisted by the in-graph fine path of a prior step. Runs OUTSIDE
-        the captured graph (host branching / dynamic writes allowed). Writes the
-        persistent ``_reuse_coarse_idx`` that the next replay's fine path reads.
+        """Out-of-graph coarse refresh. On-demand mode (default): synchronously
+        rebuild the coarse pool at the group boundary (i+offset RoPE). Prefetch
+        mode (DSV4_INDEXER_REUSE_PREFETCH): precompute the next group's pool on a
+        side stream at in-group step ``prefetch_step`` and promote it (with an
+        event wait) when the group is entered — overlapping coarse with decode.
         """
         cfg = _indexer_reuse_cfg()
         if cfg is None:
@@ -1145,8 +1247,8 @@ class IndexerFP8(PoolBackedModule):
             or getattr(self, "_reuse_pool2d_ref", None) is None
             or self._reuse_T_max <= 0
         ):
-            return  # no in-graph step has run yet → nothing to refresh
-        G, C, _offset = cfg
+            return  # no in-graph step has run yet
+        G, C, offset = cfg
         seq_lens = getattr(attn_inputs, "sequence_lengths", None)
         if seq_lens is None:
             return
@@ -1157,42 +1259,70 @@ class IndexerFP8(PoolBackedModule):
             return
         pos_row = seq_lens.reshape(-1)[:bsz].to(device).long()
         group_id = pos_row // G
-        refresh_mask = self._reuse_group[:bsz] != group_id
-        if not bool(refresh_mask.any()):
+        T_max = self._reuse_T_max
+        prefetch_step = _reuse_prefetch_cfg()
+        if not _REUSE_PATH_LOGGED[1]:
+            _REUSE_PATH_LOGGED[1] = True
+            _reuse_logger.warning(
+                "[DSV4_INDEXER_REUSE] coarse_refresh ACTIVE (prefetch=%s bsz=%d T_max=%d)",
+                prefetch_step, bsz, T_max,
+            )
+
+        if prefetch_step is None:
+            # ---- On-demand (Phase 3a): synchronous coarse at the boundary.
+            refresh = self._reuse_group[:bsz] != group_id
+            if not bool(refresh.any()):
+                return
+            rows = refresh.nonzero(as_tuple=True)[0]
+            idx, clen, rlen = self._compute_coarse_pool(rows, C, T_max)
+            self._reuse_coarse_idx[rows] = idx
+            self._reuse_coarse_len[rows] = clen
+            self._reuse_refresh_ctxlen[rows] = rlen
+            self._reuse_group[rows] = group_id[rows]
             return
 
-        T_max = self._reuse_T_max
-        eb = self._kv_eb
-        q_fp8 = self._reuse_q_fp8_persist[:bsz].unsqueeze(1)  # [B,1,H,D]
-        w_fold = self._reuse_w_fold_persist[:bsz]  # [B,H]
-        bt = self._reuse_bt_persist[:bsz]
-        ctx = self._reuse_ctx_lens_persist[:bsz]  # [B,1] compressed len
-        logits_c = fp8_paged_indexer_score(
-            q_fp8, w_fold, self._reuse_pool2d_ref, bt, ctx,
-            block_size=eb, max_ctx_len=T_max,
-        ).view(bsz, T_max)
-        lengths = ctx.view(bsz).to(torch.int32)
-        C_eff = min(C, T_max)
-        t_range = torch.arange(T_max, device=device).view(1, T_max)
-        logits_c = torch.where(
-            t_range < lengths.view(-1, 1),
-            logits_c,
-            torch.full_like(logits_c, float("-inf")),
+        # ---- Prefetch (Phase 3b): side-stream double buffer + event.
+        pstep = prefetch_step if prefetch_step >= 0 else max(0, G - 4)
+        if self._reuse_side_stream is None:
+            self._reuse_side_stream = torch.cuda.Stream(device=device)
+            self._reuse_coarse_evt = torch.cuda.Event()
+        cur = torch.cuda.current_stream(device)
+
+        # 1) Promote a ready staged pool for rows entering its target group.
+        promote = (self._reuse_group[:bsz] != group_id) & (
+            self._reuse_stage_group[:bsz] == group_id
         )
-        coarse_idx = logits_c.topk(C_eff, dim=-1)[1].to(torch.int32)
-        coarse_len = torch.clamp(lengths, max=C_eff).to(torch.int32)
-        k_arange = torch.arange(C_eff, device=device).view(1, C_eff)
-        coarse_idx = torch.where(
-            k_arange < coarse_len.view(-1, 1),
-            coarse_idx,
-            torch.full_like(coarse_idx, -1),
-        )
-        rows = refresh_mask.nonzero(as_tuple=True)[0]
-        self._reuse_coarse_idx[rows, :C_eff] = coarse_idx[rows]
-        if C_eff < C:
-            self._reuse_coarse_idx[rows, C_eff:] = -1
-        self._reuse_coarse_len[rows] = coarse_len[rows]
-        self._reuse_group[rows] = group_id[rows]
+        if bool(promote.any()):
+            cur.wait_event(self._reuse_coarse_evt)  # ensure side coarse finished
+            rows = promote.nonzero(as_tuple=True)[0]
+            self._reuse_coarse_idx[rows] = self._reuse_stage_idx[rows]
+            self._reuse_coarse_len[rows] = self._reuse_stage_len[rows]
+            self._reuse_refresh_ctxlen[rows] = self._reuse_stage_ctxlen[rows]
+            self._reuse_group[rows] = group_id[rows]
+
+        # 2) Cold/miss: entered a new group without a ready stage → sync now.
+        miss = self._reuse_group[:bsz] != group_id
+        if bool(miss.any()):
+            rows = miss.nonzero(as_tuple=True)[0]
+            idx, clen, rlen = self._compute_coarse_pool(rows, C, T_max)
+            self._reuse_coarse_idx[rows] = idx
+            self._reuse_coarse_len[rows] = clen
+            self._reuse_refresh_ctxlen[rows] = rlen
+            self._reuse_group[rows] = group_id[rows]
+
+        # 3) Prefetch next group's pool on the side stream for rows at pstep.
+        next_g = group_id + 1
+        want = ((pos_row % G) == pstep) & (self._reuse_stage_group[:bsz] != next_g)
+        if bool(want.any()):
+            rows = want.nonzero(as_tuple=True)[0]
+            self._reuse_side_stream.wait_stream(cur)  # see current persisted inputs
+            with torch.cuda.stream(self._reuse_side_stream):
+                idx, clen, rlen = self._compute_coarse_pool(rows, C, T_max)
+                self._reuse_stage_idx[rows] = idx
+                self._reuse_stage_len[rows] = clen
+                self._reuse_stage_ctxlen[rows] = rlen
+                self._reuse_stage_group[rows] = next_g[rows]
+            self._reuse_coarse_evt.record(self._reuse_side_stream)
 
     # --------------------------------------------------------------
     # Prefill prepare — caller invokes once per layer-call, before forward
