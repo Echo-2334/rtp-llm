@@ -10,6 +10,10 @@ from torch import nn
 
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, barrier
 from rtp_llm.models_py.kernels.cuda.fp8_kernel import sgl_per_token_group_quant_fp8
+from rtp_llm.models_py.modules.base.cuda.decode_indexer_pool import (
+    DecodeIndexerPool,
+    DecodeIndexerPoolConfig,
+)
 from rtp_llm.models_py.modules.dsv4.chunk_env import dsv4_chunk_tokens_from_env
 from rtp_llm.ops.compute_ops import KVCache, rtp_llm_ops
 
@@ -28,14 +32,15 @@ except Exception as e:
 
 
 _PD_DEBUG_INDEXER_LOG_COUNTS: Dict[str, int] = {}
-_persistent_topk_workspace: Dict[torch.device, torch.Tensor] = {}
+_persistent_topk_workspace: Dict[Tuple[torch.device, str], torch.Tensor] = {}
 
 
-def _get_topk_workspace(device: torch.device) -> torch.Tensor:
-    ws = _persistent_topk_workspace.get(device)
+def _get_topk_workspace(device: torch.device, lane: str = "main") -> torch.Tensor:
+    key = (device, lane)
+    ws = _persistent_topk_workspace.get(key)
     if ws is None:
         ws = torch.empty(1 << 20, dtype=torch.uint8, device=device)
-        _persistent_topk_workspace[device] = ws
+        _persistent_topk_workspace[key] = ws
     return ws
 
 
@@ -274,6 +279,18 @@ class IndexerOp(nn.Module):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.is_neox_style = is_neox_style
+
+        pool_config = DecodeIndexerPoolConfig.from_env()
+        self._decode_indexer_pool = (
+            DecodeIndexerPool(
+                pool_config,
+                index_topk=index_topk,
+                index_n_heads=index_n_heads,
+                index_head_dim=index_head_dim,
+            )
+            if pool_config.enabled
+            else None
+        )
 
     def _head_dim_with_sf(self) -> int:
         return self.index_head_dim + self.index_head_dim // self.block_size * 4
@@ -658,6 +675,193 @@ class IndexerOp(nn.Module):
         q_scale = q_scale.view(-1, self.index_n_heads, 1)
         return q_fp8, q_scale
 
+    def _select_persistent_topk(
+        self,
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        max_seq_len: int,
+        lane: str = "main",
+    ) -> torch.Tensor:
+        topk_result = logits.new_empty(
+            (logits.shape[0], self.index_topk), dtype=torch.int32
+        )
+        rtp_llm_ops.dsv4_persistent_topk(
+            logits,
+            lengths,
+            topk_result,
+            _get_topk_workspace(logits.device, lane),
+            self.index_topk,
+            max_seq_len,
+        )
+        return topk_result
+
+    def _paged_score_logits(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        block_table: torch.Tensor,
+        lengths: torch.Tensor,
+        max_seq_len: int,
+        schedule_metadata: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        kvlen_2d = lengths.reshape(-1, 1).contiguous()
+        if schedule_metadata is None:
+            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                kvlen_2d,
+                self.blocksize,
+                deep_gemm.get_num_sms(),
+            )
+        return deep_gemm.fp8_paged_mqa_logits(
+            q_fp8.unsqueeze(1),
+            kv_cache_fp8,
+            weights,
+            kvlen_2d,
+            block_table,
+            schedule_metadata,
+            max_seq_len,
+            clean_logits=False,
+        )
+
+    def _score_paged_exact(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        block_table: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        max_seq_len = block_table.shape[1] * self.blocksize
+        logits = self._paged_score_logits(
+            q_fp8,
+            weights,
+            kv_cache_fp8,
+            block_table,
+            lengths,
+            max_seq_len,
+        )
+        return logits, self._select_persistent_topk(
+            logits, lengths, max_seq_len, "main"
+        )
+
+    def _materialize_paged_candidates(
+        self,
+        kv_cache_fp8: torch.Tensor,
+        block_table: torch.Tensor,
+        candidate_indices: torch.Tensor,
+        candidate_lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        batch_size, candidate_width = candidate_indices.shape
+        device = candidate_indices.device
+        offsets = torch.arange(candidate_width, device=device, dtype=torch.long)
+        valid = offsets.unsqueeze(0) < candidate_lengths.long().unsqueeze(1)
+        safe_indices = torch.where(
+            valid,
+            candidate_indices.long(),
+            torch.zeros((), device=device, dtype=torch.long),
+        )
+
+        logical_blocks = torch.div(
+            safe_indices, self.blocksize, rounding_mode="floor"
+        )
+        block_offsets = torch.remainder(safe_indices, self.blocksize)
+        physical_blocks = torch.gather(
+            block_table.long(), 1, logical_blocks
+        )
+        physical_slots = physical_blocks * self.blocksize + block_offsets
+
+        head_dim_with_sf = self._head_dim_with_sf()
+        flat_cache = kv_cache_fp8.view(-1, head_dim_with_sf)
+        packed_candidates = flat_cache.index_select(
+            0, physical_slots.reshape(-1)
+        ).view(batch_size, candidate_width, head_dim_with_sf)
+
+        padded_width = (
+            (candidate_width + self.blocksize - 1) // self.blocksize
+        ) * self.blocksize
+        if padded_width != candidate_width:
+            padding = torch.zeros(
+                (
+                    batch_size,
+                    padded_width - candidate_width,
+                    head_dim_with_sf,
+                ),
+                dtype=packed_candidates.dtype,
+                device=device,
+            )
+            packed_candidates = torch.cat((packed_candidates, padding), dim=1)
+
+        pages_per_request = padded_width // self.blocksize
+        candidate_cache = packed_candidates.view(
+            batch_size * pages_per_request,
+            self.blocksize,
+            1,
+            head_dim_with_sf,
+        )
+        candidate_block_table = torch.arange(
+            batch_size * pages_per_request,
+            dtype=torch.int32,
+            device=device,
+        ).view(batch_size, pages_per_request)
+        return candidate_cache, candidate_block_table, padded_width
+
+    def _score_materialized_candidates(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        candidate_cache: torch.Tensor,
+        candidate_block_table: torch.Tensor,
+        padded_width: int,
+        candidate_indices: torch.Tensor,
+        candidate_lengths: torch.Tensor,
+        lane: str,
+    ) -> torch.Tensor:
+        logits = self._paged_score_logits(
+            q_fp8,
+            weights,
+            candidate_cache,
+            candidate_block_table,
+            candidate_lengths,
+            padded_width,
+        )
+        local_topk = self._select_persistent_topk(
+            logits, candidate_lengths, padded_width, lane
+        )
+        return torch.gather(
+            candidate_indices, 1, local_topk.long()
+        ).to(torch.int32)
+
+    def _score_paged_candidates(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        block_table: torch.Tensor,
+        candidate_indices: torch.Tensor,
+        candidate_lengths: torch.Tensor,
+        lane: str,
+    ) -> torch.Tensor:
+        (
+            candidate_cache,
+            candidate_block_table,
+            padded_width,
+        ) = self._materialize_paged_candidates(
+            kv_cache_fp8,
+            block_table,
+            candidate_indices,
+            candidate_lengths,
+        )
+        return self._score_materialized_candidates(
+            q_fp8,
+            weights,
+            candidate_cache,
+            candidate_block_table,
+            padded_width,
+            candidate_indices,
+            candidate_lengths,
+            lane,
+        )
+
     def _get_topk_paged(
         self,
         q_fp8: torch.Tensor,
@@ -726,6 +930,41 @@ class IndexerOp(nn.Module):
             # fmha_params.kvlen_d is 1D [B]; unsqueeze(1) -> [B, 1] for next_n=1.
             kvlen_2d = fmha_params.kvlen_d.unsqueeze(1)
 
+            if self._decode_indexer_pool is not None:
+                pooled_topk = self._decode_indexer_pool.try_compute(
+                    q_fp8,
+                    weights,
+                    block_table,
+                    lengths,
+                    attention_inputs,
+                    exact_score=lambda q, w, table, lens: self._score_paged_exact(
+                        q, w, kv_cache_fp8, table, lens
+                    ),
+                    candidate_score=lambda q, w, table, candidates, lens, lane: (
+                        self._score_paged_candidates(
+                            q,
+                            w,
+                            kv_cache_fp8,
+                            table,
+                            candidates,
+                            lens,
+                            lane,
+                        )
+                    ),
+                    prepare_candidates=lambda table, candidates, lens: (
+                        self._materialize_paged_candidates(
+                            kv_cache_fp8,
+                            table,
+                            candidates,
+                            lens,
+                        )
+                    ),
+                    score_materialized=self._score_materialized_candidates,
+                    select_topk=self._select_persistent_topk,
+                )
+                if pooled_topk is not None:
+                    return pooled_topk
+
         max_seq_len = block_table.shape[1] * self.blocksize
         schedule_metadata = getattr(fmha_params, "schedule_metadata", None)
         has_schedule_metadata = False
@@ -741,31 +980,22 @@ class IndexerOp(nn.Module):
                 deep_gemm.get_num_sms(),
             )
 
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8.unsqueeze(1),
-            kv_cache_fp8.view(dtype=torch.uint8),
+        logits = self._paged_score_logits(
+            q_fp8,
             weights,
-            kvlen_2d,
+            kv_cache_fp8.view(dtype=torch.uint8),
             block_table,
-            schedule_metadata,
+            lengths,
             max_seq_len,
-            clean_logits=False,
+            schedule_metadata,
         )
 
         assert (
             fmha_params.expanded_seq_lens.device == logits.device
         ), "expanded_seq_lens must be on the same device as logits"
 
-        topk_result = logits.new_empty(
-            (logits.shape[0], self.index_topk), dtype=torch.int32
-        )
-        rtp_llm_ops.dsv4_persistent_topk(
-            logits,
-            lengths,
-            topk_result,
-            _get_topk_workspace(logits.device),
-            self.index_topk,
-            max_seq_len,
+        topk_result = self._select_persistent_topk(
+            logits, lengths, max_seq_len, "main"
         )
 
         if _pd_debug_enabled():

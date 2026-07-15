@@ -84,6 +84,7 @@ enum GptModelInputIndex : size_t {
     mtpHiddenStatesDtype,
     skipRun,
     gptModelRequestLength,  // length of request id & pd_separation
+    decodeRequestLength,
     isFakeStream,
     // Per-tensor device hint bitmap from root so non-root ranks allocate
     // matching GPU buffers and keep tpSync broadcast lanes consistent.
