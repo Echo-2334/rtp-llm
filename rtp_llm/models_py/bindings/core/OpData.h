@@ -71,6 +71,12 @@ struct GptModelInputs {
     torch::Tensor request_id;             // int64, [context_batch_size]
     torch::Tensor request_pd_separation;  // bool, [context_batch_size]
     torch::Tensor cache_keys;             // [context_batch_size]
+    // Stable identity and committed decode-step index for incremental rows.
+    // Kept separate from request_id because request_id is part of the
+    // context/cache-store contract above.
+    torch::Tensor decode_request_id;  // int64, [decoder_batch_size]
+    torch::Tensor decode_step;        // int32, [decoder_batch_size]
+    torch::Tensor decode_kv_length;   // int32, [decoder_batch_size]
     size_t        kv_block_stride_bytes;
     size_t        kv_scale_stride_bytes;
     size_t        seq_size_per_block;

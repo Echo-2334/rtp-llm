@@ -62,6 +62,15 @@ std::string GptModelInputs::debugString(bool force) const {
     if (request_id.defined()) {
         debug_string << ", request_id: " << tb(request_id);
     }
+    if (decode_request_id.defined()) {
+        debug_string << ", decode_request_id: " << tb(decode_request_id);
+    }
+    if (decode_step.defined()) {
+        debug_string << ", decode_step: " << tb(decode_step);
+    }
+    if (decode_kv_length.defined()) {
+        debug_string << ", decode_kv_length: " << tb(decode_kv_length);
+    }
     if (request_pd_separation.defined()) {
         debug_string << ", request_pd_separation: " << tb(request_pd_separation);
     }

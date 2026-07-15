@@ -85,3 +85,11 @@ py_test (
     tags = ["open_skip", "H20"],
     exec_properties = {'gpu':'H20'},
 )
+
+py_test (
+    name = "decode_indexer_pool_test",
+    srcs = ["decode_indexer_pool_test.py"],
+    deps = py_test_deps,
+    tags = ["open_skip", "H20"],
+    exec_properties = {'gpu':'H20'},
+)

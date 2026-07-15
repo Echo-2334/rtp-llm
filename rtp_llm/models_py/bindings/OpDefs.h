@@ -291,6 +291,7 @@ struct PyContextParallelParams {
 struct PyAttentionInputs {
     bool          is_prefill{false};
     bool          is_target_verify{false};
+    bool          is_speculative{false};
     torch::Tensor prefix_lengths;
     torch::Tensor sequence_lengths;
     torch::Tensor input_lengths;
@@ -315,6 +316,10 @@ struct PyAttentionInputs {
     torch::Tensor cu_seqlens_host;
     torch::Tensor cu_kv_seqlens;
     torch::Tensor decode_cu_seqlens_host;
+    // Stable host-side metadata for decode-only stateful operators.
+    torch::Tensor decode_request_id;
+    torch::Tensor decode_step;
+    torch::Tensor decode_kv_length;
 
     int           context_total_kv_length = 0;
     int           total_tokens            = 0;

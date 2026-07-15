@@ -153,11 +153,17 @@ TEST_F(NormalBatchStreamProcessorTest, testSimpleAssemble) {
         vector<int> sequence_lengths  = {1, 2};
         vector<int> prefix_lengths    = {0, 1};
         vector<int> kv_cache_block_id = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0, 11, 12, 13, 14};
+        vector<int>     decode_steps       = {0, 0};
+        vector<int>     decode_kv_lengths  = {2, 3};
+        vector<int64_t> decode_request_ids = {stream1->streamId(), stream2->streamId()};
         EXPECT_EQ(combo_tokens, toVec<int>(model_input.combo_tokens));
         EXPECT_EQ(input_lengths, toVec<int>(model_input.input_lengths));
         EXPECT_EQ(sequence_lengths, toVec<int>(model_input.sequence_lengths));
         EXPECT_EQ(prefix_lengths, toVec<int>(model_input.prefix_lengths));
         EXPECT_EQ(kv_cache_block_id, toVec<int>(model_input.kv_cache_block_id));
+        EXPECT_EQ(decode_steps, toVec<int>(model_input.decode_step));
+        EXPECT_EQ(decode_kv_lengths, toVec<int>(model_input.decode_kv_length));
+        EXPECT_EQ(decode_request_ids, toVec<int64_t>(model_input.decode_request_id));
     }
     {
         MMModelConfig mm_model_config;

@@ -368,6 +368,9 @@ GptModelInputs NormalModelInputGatherer::allocateModelInputBuffers(const StreamG
     model_input.prefix_lengths        = torch::empty({(int64_t)total_context_batch_size}, cuda_i32);
     model_input.request_id            = torch::empty({(int64_t)total_context_batch_size}, pinned_i64);
     model_input.request_pd_separation = torch::empty({(int64_t)total_context_batch_size}, pinned_bool);
+    model_input.decode_request_id     = torch::empty({(int64_t)total_decode_batch_size}, pinned_i64);
+    model_input.decode_step           = torch::empty({(int64_t)total_decode_batch_size}, pinned_i32);
+    model_input.decode_kv_length      = torch::empty({(int64_t)total_decode_batch_size}, pinned_i32);
 
     if (max_blocks_num) {
         model_input.kv_cache_kernel_block_id =
@@ -479,8 +482,18 @@ absl::Status NormalModelInputGatherer::processDecodeStreams(GptModelInputs&     
 
         for (auto i = 0; i < current_batch_size; ++i) {
             model_input.trace_ids.push_back(stream->traceId());
+            model_input.decode_request_id.data_ptr<int64_t>()[ctx.batch_idx] = stream->streamId();
+            const auto& normal_state = stream->getNormalAsyncDeviceState();
+            const int   decode_kv_length =
+                use_normal_device_state && normal_state.next_real_seq_len > 0 ? normal_state.next_real_seq_len :
+                                                                               stream->seqLength();
+            // The first incremental forward processes the token produced by
+            // prefill and is decode step 0 for pool scheduling.
+            model_input.decode_step.data_ptr<int32_t>()[ctx.batch_idx] =
+                std::max(0, decode_kv_length - stream->inputLength() - 1);
+            model_input.decode_kv_length.data_ptr<int32_t>()[ctx.batch_idx] = decode_kv_length;
             if (use_normal_device_state) {
-                const auto& state = stream->getNormalAsyncDeviceState();
+                const auto& state = normal_state;
                 checkRuntimeCudaDevice(state.last_sample_token_gpu, "normal async last_sample_token_gpu");
                 checkRuntimeCudaDevice(state.next_seq_len_gpu, "normal async next_seq_len_gpu");
                 static std::atomic<int> debug_log_budget{200};
