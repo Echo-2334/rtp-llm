@@ -194,7 +194,8 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     const char* pool_profile       = std::getenv("RTP_LLM_DECODE_INDEXER_POOL_PROFILE");
     const std::string pool_profile_value = pool_profile == nullptr ? "" : std::string(pool_profile);
     decode_indexer_pool_enabled_ = pool_profile_value == "A" || pool_profile_value == "B"
-                                   || pool_profile_value == "a" || pool_profile_value == "b";
+                                   || pool_profile_value == "APPEND" || pool_profile_value == "a"
+                                   || pool_profile_value == "b" || pool_profile_value == "append";
     decode_indexer_pool_max_slots_ = std::max<int32_t>(1, params.concurrency_config.concurrency_limit);
     decode_indexer_pool_free_slots_.reserve(decode_indexer_pool_max_slots_);
     for (int32_t slot = decode_indexer_pool_max_slots_ - 1; slot >= 0; --slot) {

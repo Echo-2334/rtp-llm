@@ -174,6 +174,8 @@ void registerPyOpDefs(pybind11::module& m) {
         .def_readwrite("decode_step", &PyAttentionInputs::decode_step)
         .def_readwrite("decode_kv_length", &PyAttentionInputs::decode_kv_length)
         .def_readwrite("decode_indexer_pool_slot", &PyAttentionInputs::decode_indexer_pool_slot)
+        .def_readwrite("decode_indexer_pool_bootstrap_mask",
+                       &PyAttentionInputs::decode_indexer_pool_bootstrap_mask)
         .def_readwrite("position_ids", &PyAttentionInputs::position_ids)
         .def_readwrite("cache_store_inputs", &PyAttentionInputs::cache_store_inputs)
         .def_readwrite("context_parallel_info", &PyAttentionInputs::context_parallel_info)

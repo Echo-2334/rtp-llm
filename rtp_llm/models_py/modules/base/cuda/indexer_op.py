@@ -63,6 +63,14 @@ def _fp8_prefill_topk_force_radix_sort() -> bool:
     return os.environ.get("DSV4_PREFILL_TOPK_FORCE_RADIX", "1") != "0"
 
 
+def _decode_indexer_fused_sparse_score_enabled() -> bool:
+    return os.environ.get("RTP_LLM_DECODE_INDEXER_FUSED_SPARSE_SCORE", "1") != "0"
+
+
+def _decode_indexer_paged_refresh_enabled() -> bool:
+    return os.environ.get("RTP_LLM_DECODE_INDEXER_PAGED_REFRESH", "1") != "0"
+
+
 def _pd_debug_enabled() -> bool:
     return os.environ.get("RTP_LLM_PD_DEBUG", "0") == "1"
 
@@ -851,6 +859,50 @@ class IndexerOp(nn.Module):
         candidate_lengths: torch.Tensor,
         lane: str,
     ) -> torch.Tensor:
+        if lane == "refresh" and _decode_indexer_paged_refresh_enabled():
+            return self._score_paged_candidate_range(
+                q_fp8,
+                weights,
+                kv_cache_fp8,
+                block_table,
+                candidate_indices,
+                candidate_lengths,
+                lane,
+            )
+
+        if (
+            _decode_indexer_fused_sparse_score_enabled()
+            and self.blocksize == 64
+            and self.index_n_heads == 32
+            and self.index_head_dim == 128
+            and q_fp8.dtype == torch.float8_e4m3fn
+            and weights.dtype == torch.float32
+            and kv_cache_fp8.dtype == torch.uint8
+            and block_table.dtype == torch.int32
+            and candidate_lengths.dtype == torch.int32
+        ):
+            from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_score import (
+                sparse_fp8_mqa_logits,
+            )
+
+            logits = sparse_fp8_mqa_logits(
+                q_fp8,
+                weights,
+                kv_cache_fp8,
+                block_table,
+                candidate_indices,
+                candidate_lengths,
+            )
+            local_topk = self._select_persistent_topk(
+                logits,
+                candidate_lengths,
+                candidate_indices.shape[1],
+                lane,
+            )
+            return torch.gather(
+                candidate_indices, 1, local_topk.long()
+            ).to(torch.int32)
+
         (
             candidate_cache,
             candidate_block_table,
@@ -870,6 +922,109 @@ class IndexerOp(nn.Module):
             candidate_indices,
             candidate_lengths,
             lane,
+        )
+
+    def _score_paged_candidate_range(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        block_table: torch.Tensor,
+        candidate_indices: torch.Tensor,
+        candidate_lengths: torch.Tensor,
+        lane: str,
+    ) -> torch.Tensor:
+        """Score a contiguous logical range through a page-aligned KV window."""
+        _, candidate_width = candidate_indices.shape
+        page_size = self.blocksize
+        starts = candidate_indices[:, 0].long()
+        first_pages = torch.div(starts, page_size, rounding_mode="floor")
+        token_offsets = torch.remainder(starts, page_size)
+
+        window_width = (
+            (candidate_width + 2 * page_size - 2) // page_size
+        ) * page_size
+        pages_per_window = window_width // page_size
+        page_offsets = torch.arange(
+            pages_per_window,
+            device=candidate_indices.device,
+            dtype=torch.long,
+        )
+        logical_pages = first_pages.unsqueeze(1) + page_offsets.unsqueeze(0)
+        logical_pages = logical_pages.clamp(max=block_table.shape[1] - 1)
+        window_block_table = torch.gather(
+            block_table, 1, logical_pages
+        ).contiguous()
+        window_lengths = (
+            candidate_lengths.long() + token_offsets
+        ).clamp(max=window_width).to(torch.int32)
+
+        window_logits = self._paged_score_logits(
+            q_fp8,
+            weights,
+            kv_cache_fp8,
+            window_block_table,
+            window_lengths,
+            window_width,
+        )
+        offsets = torch.arange(
+            candidate_width,
+            device=candidate_indices.device,
+            dtype=torch.long,
+        )
+        logits = torch.gather(
+            window_logits,
+            1,
+            token_offsets.unsqueeze(1) + offsets.unsqueeze(0),
+        )
+        local_topk = self._select_persistent_topk(
+            logits,
+            candidate_lengths,
+            candidate_width,
+            lane,
+        )
+        return torch.gather(
+            candidate_indices, 1, local_topk.long()
+        ).to(torch.int32)
+
+    def _score_paged_pool_chunk_logits(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        block_table: torch.Tensor,
+        pool_indices: torch.Tensor,
+        pool_lengths: torch.Tensor,
+        chunk_indices: torch.Tensor,
+        chunk_lengths: torch.Tensor,
+        pool_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        if not (
+            self.blocksize == 64
+            and self.index_n_heads == 32
+            and self.index_head_dim == 128
+            and q_fp8.dtype == torch.float8_e4m3fn
+            and weights.dtype == torch.float32
+            and kv_cache_fp8.dtype == torch.uint8
+            and block_table.dtype == torch.int32
+        ):
+            raise RuntimeError(
+                "decode indexer APPEND profile requires the fused H32 D128 FP8 path"
+            )
+        from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_score import (
+            sparse_fp8_mqa_pool_chunk_logits,
+        )
+
+        return sparse_fp8_mqa_pool_chunk_logits(
+            q_fp8,
+            weights,
+            kv_cache_fp8,
+            block_table,
+            pool_indices,
+            pool_lengths,
+            chunk_indices,
+            chunk_lengths,
+            pool_slots=pool_slots,
         )
 
     def _get_topk_paged(
@@ -971,6 +1126,19 @@ class IndexerOp(nn.Module):
                     ),
                     score_materialized=self._score_materialized_candidates,
                     select_topk=self._select_persistent_topk,
+                    pool_chunk_score=lambda q, w, table, pool, pool_lens, chunk, chunk_lens, slots: (
+                        self._score_paged_pool_chunk_logits(
+                            q,
+                            w,
+                            kv_cache_fp8,
+                            table,
+                            pool,
+                            pool_lens,
+                            chunk,
+                            chunk_lens,
+                            slots,
+                        )
+                    ),
                     graph_max_seq_len=block_table.shape[1] * self.blocksize,
                 )
                 if pooled_topk is not None:
@@ -1031,6 +1199,7 @@ class IndexerOp(nn.Module):
                 attention_inputs,
                 self._select_persistent_topk,
                 max_seq_len,
+                topk_result,
             )
 
         if _pd_debug_enabled():

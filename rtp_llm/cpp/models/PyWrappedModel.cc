@@ -304,7 +304,10 @@ void PyWrappedModel::assignDecodeIndexerPoolSlots(torch_ext::PyAttentionInputs& 
     const int64_t count = request_ids.numel();
     auto slots = torch::empty(
         {count}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
-    auto* slot_ptr = slots.data_ptr<int32_t>();
+    auto bootstrap_mask = torch::zeros(
+        {count}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+    auto* slot_ptr           = slots.data_ptr<int32_t>();
+    auto* bootstrap_mask_ptr = bootstrap_mask.data_ptr<int32_t>();
     const auto* request_ptr = request_ids.data_ptr<int64_t>();
     const auto* step_ptr    = decode_steps.data_ptr<int32_t>();
     const auto* kv_ptr      = kv_lengths.data_ptr<int32_t>();
@@ -325,6 +328,7 @@ void PyWrappedModel::assignDecodeIndexerPoolSlots(torch_ext::PyAttentionInputs& 
         const bool    eligible   = kv_length > kDecodeIndexerPoolMinKvLength;
         auto          it         = decode_indexer_pool_slots_.find(request_id);
 
+        bool needs_bootstrap = false;
         if (it == decode_indexer_pool_slots_.end()) {
             int32_t slot = -1;
             if (!decode_indexer_pool_free_slots_.empty()) {
@@ -348,8 +352,9 @@ void PyWrappedModel::assignDecodeIndexerPoolSlots(torch_ext::PyAttentionInputs& 
                 }
             }
             if (slot < 0) {
-                slot_ptr[row] = -1;
-                bootstrap     = true;
+                slot_ptr[row]           = -1;
+                bootstrap_mask_ptr[row] = 1;
+                bootstrap               = true;
                 continue;
             }
             DecodeIndexerPoolSlotState state;
@@ -359,23 +364,27 @@ void PyWrappedModel::assignDecodeIndexerPoolSlots(torch_ext::PyAttentionInputs& 
             state.eligible       = eligible;
             state.last_seen_tick = decode_indexer_pool_tick_;
             it = decode_indexer_pool_slots_.emplace(request_id, state).first;
-            bootstrap = true;
+            needs_bootstrap = true;
         } else {
             auto& state      = it->second;
             const bool same  = step == state.last_step && kv_length == state.last_kv_length;
             const bool next  = step == state.last_step + 1 && kv_length == state.last_kv_length + 1;
-            bootstrap        = bootstrap || (!same && !next) || (eligible && !state.eligible);
+            needs_bootstrap  = (!same && !next) || (eligible && !state.eligible);
             state.last_step      = step;
             state.last_kv_length = kv_length;
             state.eligible       = eligible;
             state.last_seen_tick = decode_indexer_pool_tick_;
         }
-        slot_ptr[row] = it->second.slot;
+        slot_ptr[row]           = it->second.slot;
+        bootstrap_mask_ptr[row] = needs_bootstrap ? 1 : 0;
+        bootstrap               = bootstrap || needs_bootstrap;
     }
 
-    py_attn_inputs.decode_indexer_pool_slot = slots;
-    py_attn_inputs.indexer_pool_bootstrap   = bootstrap;
+    py_attn_inputs.decode_indexer_pool_slot           = slots;
+    py_attn_inputs.decode_indexer_pool_bootstrap_mask = bootstrap_mask;
+    py_attn_inputs.indexer_pool_bootstrap             = bootstrap;
     buffer_holder_.hold_host(slots);
+    buffer_holder_.hold_host(bootstrap_mask);
 }
 
 torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptModelInputs& inputs) {

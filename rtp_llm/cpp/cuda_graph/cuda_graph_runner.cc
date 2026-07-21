@@ -28,7 +28,8 @@ const bool kDecodeIndexerPoolEnabled = []() {
         return false;
     }
     const std::string profile(value);
-    return profile == "A" || profile == "B" || profile == "a" || profile == "b";
+    return profile == "A" || profile == "B" || profile == "APPEND" || profile == "a" || profile == "b"
+           || profile == "append";
 }();
 const int32_t kDecodeIndexerPoolMinKvLength = []() {
     constexpr int32_t default_value = 64 * 1024;
@@ -41,6 +42,15 @@ const int32_t kDecodeIndexerPoolMinKvLength = []() {
     return end != value && *end == '\0' && parsed > 0 && parsed <= std::numeric_limits<int32_t>::max() ?
                static_cast<int32_t>(parsed) :
                default_value;
+}();
+const bool kDecodeIndexerPoolLogBatch = []() {
+    const char* value = std::getenv("RTP_LLM_DECODE_INDEXER_POOL_LOG_BATCH");
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string normalized(value);
+    return normalized == "1" || normalized == "true" || normalized == "TRUE" || normalized == "on"
+           || normalized == "ON";
 }();
 
 class ScopedCudaGraphForwardFlag {
@@ -501,6 +511,11 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
                                           state.current_batch_size,
                                           captured_batch_capacity,
                                           0);
+            addCudaGraphPrepareFillRegion(fill_params,
+                                          py_model_inputs_.attention_inputs.decode_indexer_pool_bootstrap_mask,
+                                          state.current_batch_size,
+                                          captured_batch_capacity,
+                                          0);
         }
         invokeCudaGraphPrepareFill(fill_params, cuda_graph::graphGetCurrentStream().stream());
     }
@@ -594,6 +609,12 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
                                 invalid_decode_indexer_pool_slots_;
         optimizedCopyAsync(slots,
                            py_model_inputs_.attention_inputs.decode_indexer_pool_slot,
+                           state.current_batch_size * sizeof(int32_t));
+        const auto& bootstrap_mask = inputs.attention_inputs.decode_indexer_pool_bootstrap_mask.defined() ?
+                                         inputs.attention_inputs.decode_indexer_pool_bootstrap_mask :
+                                         invalid_decode_indexer_pool_bootstrap_masks_;
+        optimizedCopyAsync(bootstrap_mask,
+                           py_model_inputs_.attention_inputs.decode_indexer_pool_bootstrap_mask,
                            state.current_batch_size * sizeof(int32_t));
     }
 
@@ -884,36 +905,70 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
         const auto& request_ids = attn.decode_request_id;
         const auto& kv_lengths  = attn.decode_kv_length;
         const auto& pool_slots  = attn.decode_indexer_pool_slot;
+        const auto& bootstrap_mask = attn.decode_indexer_pool_bootstrap_mask;
         const bool metadata_valid = request_ids.defined() && kv_lengths.defined() && pool_slots.defined()
-                                    && !request_ids.is_cuda() && !kv_lengths.is_cuda() && !pool_slots.is_cuda()
+                                    && bootstrap_mask.defined() && !request_ids.is_cuda() && !kv_lengths.is_cuda()
+                                    && !pool_slots.is_cuda() && !bootstrap_mask.is_cuda()
                                     && request_ids.scalar_type() == torch::kInt64
                                     && kv_lengths.scalar_type() == torch::kInt32
                                     && pool_slots.scalar_type() == torch::kInt32
+                                    && bootstrap_mask.scalar_type() == torch::kInt32
                                     && request_ids.numel() == kv_lengths.numel()
-                                    && request_ids.numel() == pool_slots.numel();
+                                    && request_ids.numel() == pool_slots.numel()
+                                    && request_ids.numel() == bootstrap_mask.numel();
         if (metadata_valid) {
-            bool                        all_pool_eligible = !attn.indexer_pool_bootstrap;
-            bool                        any_pool_eligible = false;
+            bool                        any_exact         = false;
+            bool                        any_sparse        = false;
+            bool                        any_bootstrap     = false;
             bool                        unique           = true;
+            int64_t                     exact_rows       = 0;
+            int64_t                     sparse_rows      = 0;
+            int64_t                     bootstrap_rows   = 0;
             std::unordered_set<int64_t> unique_ids;
             const auto* request_ptr = request_ids.data_ptr<int64_t>();
             const auto* kv_ptr      = kv_lengths.data_ptr<int32_t>();
             const auto* slot_ptr    = pool_slots.data_ptr<int32_t>();
+            const auto* bootstrap_ptr = bootstrap_mask.data_ptr<int32_t>();
             for (int64_t row = 0; row < request_ids.numel(); ++row) {
                 unique = unique && unique_ids.insert(request_ptr[row]).second;
                 const bool eligible = kv_ptr[row] > kDecodeIndexerPoolMinKvLength && slot_ptr[row] >= 0;
-                any_pool_eligible   = any_pool_eligible || eligible;
-                all_pool_eligible   = all_pool_eligible && eligible;
+                const bool row_bootstrap = eligible && bootstrap_ptr[row] != 0;
+                const bool row_sparse    = eligible && !row_bootstrap;
+                any_exact                = any_exact || !row_sparse;
+                any_sparse               = any_sparse || row_sparse;
+                any_bootstrap            = any_bootstrap || row_bootstrap;
+                exact_rows += !eligible;
+                sparse_rows += row_sparse;
+                bootstrap_rows += row_bootstrap;
             }
-            state.allow_decode_indexer_pool_bootstrap = unique;
-            state.use_decode_indexer_pool_graph       = unique && all_pool_eligible;
+            state.use_decode_indexer_pool_graph      = unique && any_sparse && !any_exact;
             state.use_decode_indexer_bootstrap_graph =
-                unique && attn.indexer_pool_bootstrap && any_pool_eligible;
+                unique && any_exact && (any_sparse || any_bootstrap);
+            state.allow_decode_indexer_pool_bootstrap =
+                state.use_decode_indexer_pool_graph || state.use_decode_indexer_bootstrap_graph;
+            if (kDecodeIndexerPoolLogBatch) {
+                const char* graph_path = state.use_decode_indexer_pool_graph       ? "steady"
+                                         : state.use_decode_indexer_bootstrap_graph ? "hybrid"
+                                                                                    : "exact";
+                RTP_LLM_LOG_INFO(
+                    "decode indexer batch: real_bs=%ld bootstrap=%ld sparse=%ld exact=%ld cuda_graph_path=%s",
+                    request_ids.numel(),
+                    bootstrap_rows,
+                    sparse_rows,
+                    exact_rows,
+                    graph_path);
+            }
         }
         if (state.use_decode_indexer_pool_graph) {
             static std::once_flag pool_graph_admission_log;
             std::call_once(pool_graph_admission_log, []() {
                 std::cout << "decode indexer candidate pool admitted to steady CUDA graph replay" << std::endl;
+            });
+        }
+        if (state.use_decode_indexer_bootstrap_graph) {
+            static std::once_flag hybrid_graph_admission_log;
+            std::call_once(hybrid_graph_admission_log, []() {
+                std::cout << "decode indexer mixed batch admitted to hybrid CUDA graph replay" << std::endl;
             });
         }
     }
@@ -1075,8 +1130,12 @@ void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_
         inputs.attention_inputs.decode_kv_length =
             torch::full({int(max_bs_)}, kDecodeIndexerPoolMinKvLength + 1, options_cuda_int32_);
         inputs.attention_inputs.decode_indexer_pool_slot = torch::arange(0, max_bs_, 1, options_cuda_int32_);
+        inputs.attention_inputs.decode_indexer_pool_bootstrap_mask =
+            torch::zeros({int(max_bs_)}, options_cuda_int32_);
         invalid_decode_indexer_pool_slots_ =
             torch::full({int(max_bs_)}, -1, options_cpu_int32_).pin_memory();
+        invalid_decode_indexer_pool_bootstrap_masks_ =
+            torch::zeros({int(max_bs_)}, options_cpu_int32_).pin_memory();
     }
 }
 
@@ -1420,12 +1479,15 @@ void CudaGraphRunner::prepareCaptureInputs(PyModelInputs& inputs, int batch_size
     const auto& cap_attn = capture_mem_hold_.py_model_inputs_.attention_inputs;
     if (kDecodeIndexerPoolEnabled && !is_prefill_cuda_graph_mode_ && !is_target_verify_) {
         RTP_LLM_CHECK_WITH_INFO(cap_attn.decode_step.defined() && cap_attn.decode_kv_length.defined()
-                                    && cap_attn.decode_indexer_pool_slot.defined(),
+                                    && cap_attn.decode_indexer_pool_slot.defined()
+                                    && cap_attn.decode_indexer_pool_bootstrap_mask.defined(),
                                 "decode indexer pool capture metadata is undefined");
         inputs.attention_inputs.decode_step = cap_attn.decode_step.slice(0, 0, batch_size);
         inputs.attention_inputs.decode_kv_length = cap_attn.decode_kv_length.slice(0, 0, batch_size);
         inputs.attention_inputs.decode_indexer_pool_slot =
             cap_attn.decode_indexer_pool_slot.slice(0, 0, batch_size);
+        inputs.attention_inputs.decode_indexer_pool_bootstrap_mask =
+            cap_attn.decode_indexer_pool_bootstrap_mask.slice(0, 0, batch_size);
         inputs.attention_inputs.indexer_pool_graph_mode = cap_attn.indexer_pool_graph_mode;
         inputs.attention_inputs.indexer_pool_bootstrap_graph_mode =
             cap_attn.indexer_pool_bootstrap_graph_mode;

@@ -323,6 +323,9 @@ struct PyAttentionInputs {
     // Stable pool slot assigned on the host. CUDA graph instances mirror this
     // into a fixed device buffer before replay.
     torch::Tensor decode_indexer_pool_slot;
+    // Per-row host admission flag. A non-zero value means that row must use
+    // the exact path and initialize its pool during a hybrid graph replay.
+    torch::Tensor decode_indexer_pool_bootstrap_mask;
 
     int           context_total_kv_length = 0;
     int           total_tokens            = 0;
@@ -343,8 +346,7 @@ struct PyAttentionInputs {
     // one-step exact bootstrap path.
     bool indexer_pool_graph_mode = false;
     bool indexer_pool_bootstrap_graph_mode = false;
-    // Host-side batch admission signal. The bootstrap graph initializes pool
-    // state without leaving CUDA Graph replay.
+    // Host-side batch admission signal retained for non-graph/eager callers.
     bool indexer_pool_bootstrap = false;
 
     std::optional<PyContextParallelParams> context_parallel_info;

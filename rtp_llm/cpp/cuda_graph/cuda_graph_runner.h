@@ -155,6 +155,7 @@ private:
     torch::Tensor                          position_encoding_;
     torch::Tensor                          token_type_embedding_;
     torch::Tensor                          invalid_decode_indexer_pool_slots_;
+    torch::Tensor                          invalid_decode_indexer_pool_bootstrap_masks_;
     float                                  input_embedding_scalar_;
     c10::ScalarType                        model_data_type_;
     at::TensorOptions                      options_cuda_int32_;
