@@ -14,7 +14,11 @@ struct CudaGraphState {
     int current_seq_len{1};
     int current_real_graph_bs{1};       // for decode
     int current_real_graph_seq_len{1};  // for prefill
+    int current_graph_key{1};           // graph_instances_ key selected for replay
     int seq_len_sum{0};
+    bool use_decode_indexer_pool_graph{false};
+    bool use_decode_indexer_bootstrap_graph{false};
+    bool allow_decode_indexer_pool_bootstrap{false};
 };
 
 struct GraphParams {

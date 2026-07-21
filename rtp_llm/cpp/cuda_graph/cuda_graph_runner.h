@@ -76,7 +76,7 @@ public:
     }
     void           captureDecode();
     void           capturePrefill();
-    void           captureDecodeOneBatchSize(int bs);
+    void           captureDecodeOneBatchSize(int bs, bool pool_mode = false, bool bootstrap_mode = false);
     void           capturePrefillOneSeqLen(int seq_len);
     void           prepareInputs(const PyModelInputs& inputs, CudaGraphState& state);
     void           prepareInputData(const PyModelInputs& inputs, CudaGraphState& state);
@@ -121,6 +121,9 @@ private:
     void                    initCaptureAttentionInputs(PyModelInputs& inputs, int max_bs, int num_tokens_per_bs);
     void                    initCaptureBertEmbeddingInputs(PyModelInputs& inputs, int max_bs, int max_num_token);
     void                    initCaptureAttentionInputsPost();
+    int                     decodeGraphKey(int batch_size, bool pool_mode, bool bootstrap_mode = false) const;
+    bool                    decodeIndexerPoolEnabled() const;
+    int32_t                 decodeIndexerPoolMinKvLength() const;
     py::object              py_forward_method_;
     py::object              py_attn_pyobj_method_;
     bool                    enable_cuda_graph_{false};
@@ -151,6 +154,7 @@ private:
     CaptureMemoryHold                      capture_mem_hold_;
     torch::Tensor                          position_encoding_;
     torch::Tensor                          token_type_embedding_;
+    torch::Tensor                          invalid_decode_indexer_pool_slots_;
     float                                  input_embedding_scalar_;
     c10::ScalarType                        model_data_type_;
     at::TensorOptions                      options_cuda_int32_;

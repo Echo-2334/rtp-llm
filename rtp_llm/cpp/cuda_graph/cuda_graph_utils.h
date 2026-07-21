@@ -60,6 +60,9 @@ public:
         py_model_inputs_.attention_inputs.decode_step                = inputs.attention_inputs.decode_step;
         py_model_inputs_.attention_inputs.decode_kv_length           = inputs.attention_inputs.decode_kv_length;
         py_model_inputs_.attention_inputs.decode_indexer_pool_slot   = inputs.attention_inputs.decode_indexer_pool_slot;
+        py_model_inputs_.attention_inputs.indexer_pool_graph_mode    = inputs.attention_inputs.indexer_pool_graph_mode;
+        py_model_inputs_.attention_inputs.indexer_pool_bootstrap_graph_mode =
+            inputs.attention_inputs.indexer_pool_bootstrap_graph_mode;
     }
 
 public:

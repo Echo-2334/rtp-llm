@@ -5,10 +5,11 @@ pools because this mode is used when indexcache cross-layer reuse is disabled.
 New or discontinuous requests bootstrap with one eager exact pass; subsequent
 decode steps use a fixed-shape CUDA Graph data path when graph mode is enabled.
 
-Enable it with ``RTP_LLM_DECODE_INDEXER_POOL_PROFILE=A`` or ``B``. The optional
-``RTP_LLM_DECODE_INDEXER_POOL_Q_MODE`` overrides rolling/fixed anchor mode, and
-``RTP_LLM_DECODE_INDEXER_POOL_ASYNC_REFRESH=0`` keeps refresh work on the main
-stream for debugging.
+Enable it with ``RTP_LLM_DECODE_INDEXER_POOL_PROFILE=A`` or ``B``. Pool reuse
+starts strictly above ``RTP_LLM_DECODE_INDEXER_POOL_MIN_KV_LENGTH`` (64K by
+default). ``RTP_LLM_DECODE_INDEXER_POOL_SIZE`` defaults to 16K; because every
+chunk retains the final Indexer TopK, Profile A uses pool_size / topk chunks and
+the same number of decode steps per refresh interval.
 """
 
 import logging
@@ -92,6 +93,7 @@ def _get_refresh_stream(device: torch.device) -> torch.cuda.Stream:
 @dataclass(frozen=True)
 class DecodeIndexerPoolConfig:
     profile: str = "OFF"
+    min_kv_length: int = 64 * 1024
     interval: int = 8
     pool_size: int = 16 * 1024
     chunks: int = 8
@@ -131,19 +133,31 @@ class DecodeIndexerPoolConfig:
         profile = os.environ.get(env_name, "OFF").strip().upper()
         if profile in ("", "0", "OFF", "NONE"):
             return cls()
+        pool_size = int(
+            os.environ.get("RTP_LLM_DECODE_INDEXER_POOL_SIZE", str(16 * 1024))
+        )
+        chunk_topk = 2048
+        if pool_size <= 0 or pool_size % chunk_topk != 0:
+            raise ValueError(
+                "RTP_LLM_DECODE_INDEXER_POOL_SIZE must be a positive multiple of 2048"
+            )
+        chunks = pool_size // chunk_topk
+        interval = chunks
         if profile == "A":
             defaults = dict(
                 chunks_per_step=1,
-                refresh_lead=8,
+                refresh_lead=chunks,
                 q_mode="rolling",
                 anchor_phase=0,
             )
         elif profile == "B":
+            if chunks % 2 != 0:
+                raise ValueError("profile B requires an even number of pool chunks")
             defaults = dict(
                 chunks_per_step=2,
-                refresh_lead=4,
+                refresh_lead=chunks // 2,
                 q_mode="fixed",
-                anchor_phase=4,
+                anchor_phase=chunks // 2,
             )
         else:
             raise ValueError(f"{env_name} must be OFF, A, or B, got {profile!r}")
@@ -157,6 +171,14 @@ class DecodeIndexerPoolConfig:
             )
         config = cls(
             profile=profile,
+            min_kv_length=int(
+                os.environ.get(
+                    "RTP_LLM_DECODE_INDEXER_POOL_MIN_KV_LENGTH", str(64 * 1024)
+                )
+            ),
+            interval=interval,
+            pool_size=pool_size,
+            chunks=chunks,
             chunks_per_step=defaults["chunks_per_step"],
             refresh_lead=defaults["refresh_lead"],
             q_mode=q_mode,
@@ -170,6 +192,10 @@ class DecodeIndexerPoolConfig:
         )
         if config.pool_size % config.chunks != 0:
             raise ValueError("decode indexer pool size must divide evenly into chunks")
+        if config.min_kv_length < config.pool_size:
+            raise ValueError(
+                "RTP_LLM_DECODE_INDEXER_POOL_MIN_KV_LENGTH must be at least pool size"
+            )
         if config.refresh_lead * config.chunks_per_step != config.chunks:
             raise ValueError("decode indexer refresh schedule must cover every chunk")
         if config.anchor_phase != config.interval - config.refresh_lead:
@@ -184,13 +210,14 @@ class DecodeIndexerPoolConfig:
             "decode-indexer-pool-enabled",
             logging.INFO,
             "decode indexer pool enabled: profile=%s q_mode=%s async_refresh=%s "
-            "N=%d P=%d C=%d",
+            "N=%d P=%d C=%d min_kv=%d",
             config.profile,
             config.q_mode,
             config.async_refresh,
             config.interval,
             config.pool_size,
             config.chunks,
+            config.min_kv_length,
         )
         return config
 
@@ -677,6 +704,105 @@ class DecodeIndexerPool:
             state.build_mask |= 1 << chunk
             state.pending_event = event
 
+    def bootstrap_cuda_graph_exact(
+        self,
+        logits: torch.Tensor,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        attention_inputs: Any,
+        select_topk: SelectTopkFn,
+        graph_max_seq_len: int,
+    ) -> None:
+        """Initialize eligible pool rows inside the exact CUDA Graph variant."""
+        if bool(getattr(attention_inputs, "indexer_pool_graph_mode", False)) or not bool(
+            getattr(attention_inputs, "indexer_pool_bootstrap_graph_mode", False)
+        ):
+            return
+        slots_input = getattr(attention_inputs, "decode_indexer_pool_slot", None)
+        kv_lengths = getattr(attention_inputs, "decode_kv_length", None)
+        batch_size = logits.shape[0]
+        metadata = (slots_input, kv_lengths)
+        if any(not isinstance(tensor, torch.Tensor) for tensor in metadata):
+            return
+        if any(not tensor.is_cuda or tensor.numel() != batch_size for tensor in metadata):
+            return
+
+        device = logits.device
+        if self._device != device:
+            self._reset_runtime(device)
+        if self._graph_slot_base is None:
+            self._graph_slot_base = batch_size
+        if batch_size > self._graph_slot_base:
+            raise RuntimeError(
+                f"decode indexer exact graph batch {batch_size} exceeds slot base "
+                f"{self._graph_slot_base}"
+            )
+        self._ensure_capacity(
+            self._graph_slot_base + batch_size, q_fp8, weights
+        )
+        assert self._pools is not None
+        assert self._graph_active_parity is not None
+        assert self._graph_coverage is not None
+
+        rows = torch.arange(batch_size, device=device, dtype=torch.long)
+        kv_lengths_l = kv_lengths.to(torch.long)
+        slots_l = slots_input.to(torch.long)
+        valid_rows = (kv_lengths_l > self.config.min_kv_length) & slots_l.ge(0)
+        dummy_slots = rows + self._graph_slot_base
+        slots = torch.where(valid_rows, slots_l, dummy_slots).clamp(
+            min=0, max=self._capacity - 1
+        )
+
+        # Invalid and padded rows still execute the captured fixed-shape TopK,
+        # but write only to disjoint dummy slots.
+        safe_kv_lengths = torch.where(
+            valid_rows,
+            kv_lengths_l,
+            torch.full_like(kv_lengths_l, self.config.min_kv_length + 1),
+        ).clamp(max=graph_max_seq_len)
+        chunks = torch.arange(self.config.chunks, device=device, dtype=torch.long)
+        job_rows = rows.repeat_interleave(self.config.chunks)
+        job_chunks = chunks.repeat(batch_size)
+        job_kv_lengths = safe_kv_lengths.repeat_interleave(self.config.chunks)
+        starts = torch.div(
+            job_kv_lengths * job_chunks,
+            self.config.chunks,
+            rounding_mode="floor",
+        )
+        ends = torch.div(
+            job_kv_lengths * (job_chunks + 1),
+            self.config.chunks,
+            rounding_mode="floor",
+        )
+        local_lengths = (ends - starts).to(torch.int32)
+        max_chunk_width = (
+            graph_max_seq_len + self.config.chunks - 1
+        ) // self.config.chunks
+        offsets = torch.arange(max_chunk_width, device=device, dtype=torch.long)
+        gather_indices = starts.unsqueeze(1) + offsets.unsqueeze(0)
+        gather_indices = gather_indices.clamp(max=logits.shape[1] - 1)
+        chunk_logits = torch.gather(
+            logits.index_select(0, job_rows), 1, gather_indices
+        )
+        local_topk = select_topk(
+            chunk_logits, local_lengths, max_chunk_width, "main"
+        )
+        pool = (
+            local_topk.to(torch.long) + starts.unsqueeze(1)
+        ).reshape(batch_size, self.config.chunks, self.index_topk).to(torch.int32)
+        pool_pair = pool.unsqueeze(1).expand(-1, 2, -1, -1)
+        self._pools.index_copy_(0, slots, pool_pair)
+
+        coverage = torch.where(valid_rows, kv_lengths_l, torch.zeros_like(kv_lengths_l))
+        self._graph_coverage.index_copy_(
+            0, slots, coverage.unsqueeze(1).expand(-1, 2)
+        )
+        self._graph_active_parity.index_copy_(0, slots, torch.zeros_like(slots))
+        if self._anchor_q is not None:
+            self._anchor_q.index_copy_(0, slots, q_fp8)
+            assert self._anchor_weights is not None
+            self._anchor_weights.index_copy_(0, slots, weights)
+
     def _try_compute_cuda_graph(
         self,
         q_fp8: torch.Tensor,
@@ -730,7 +856,7 @@ class DecodeIndexerPool:
 
         rows = torch.arange(batch_size, device=device, dtype=torch.long)
         kv_lengths_l = kv_lengths.to(torch.long)
-        valid_rows = kv_lengths_l >= self.config.pool_size
+        valid_rows = kv_lengths_l > self.config.min_kv_length
         dummy_slots = rows + self._graph_slot_base
         slots = torch.where(valid_rows, slots_input.to(torch.long), dummy_slots)
         slots = slots.clamp(min=0, max=self._capacity - 1)
@@ -891,6 +1017,10 @@ class DecodeIndexerPool:
                 getattr(attention_inputs, "is_target_verify", False)
             ):
                 return None
+            if not bool(
+                getattr(attention_inputs, "indexer_pool_graph_mode", False)
+            ):
+                return None
             return self._try_compute_cuda_graph(
                 q_fp8,
                 weights,
@@ -929,7 +1059,7 @@ class DecodeIndexerPool:
         eligible_rows = [
             row
             for row, kv_length in enumerate(kv_lengths)
-            if kv_length >= self.config.pool_size
+            if kv_length > self.config.min_kv_length
         ]
         if not eligible_rows:
             return None
@@ -962,7 +1092,7 @@ class DecodeIndexerPool:
             kv_length = int(kv_lengths[row])
             preferred_slot = pool_slots[row]
             state = self._states.get(request_id)
-            if kv_length < self.config.pool_size:
+            if kv_length <= self.config.min_kv_length:
                 if state is not None:
                     self._wait_pending(state, q_fp8.device)
                     self._states.pop(request_id)

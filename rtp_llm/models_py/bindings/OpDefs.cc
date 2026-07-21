@@ -143,6 +143,9 @@ void registerPyOpDefs(pybind11::module& m) {
         .def(pybind11::init<>())
         .def_readwrite("is_prefill", &PyAttentionInputs::is_prefill)
         .def_readwrite("is_cuda_graph", &PyAttentionInputs::is_cuda_graph)
+        .def_readwrite("indexer_pool_graph_mode", &PyAttentionInputs::indexer_pool_graph_mode)
+        .def_readwrite("indexer_pool_bootstrap_graph_mode",
+                       &PyAttentionInputs::indexer_pool_bootstrap_graph_mode)
         .def_readwrite("indexer_pool_bootstrap", &PyAttentionInputs::indexer_pool_bootstrap)
         .def_readwrite("is_target_verify", &PyAttentionInputs::is_target_verify)
         .def_readwrite("mtp_iteration_step", &PyAttentionInputs::mtp_iteration_step)

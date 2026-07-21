@@ -340,8 +340,12 @@ struct PyAttentionInputs {
 
     // CUDA Graph mode flags
     bool is_cuda_graph = false;  // True when running in CUDA graph mode (capture or replay)
-    // Force one eager exact launch to initialize persistent pool state before
-    // the request is admitted to the steady CUDA graph.
+    // Static per-graph variants for the steady candidate-pool path and the
+    // one-step exact bootstrap path.
+    bool indexer_pool_graph_mode = false;
+    bool indexer_pool_bootstrap_graph_mode = false;
+    // Host-side batch admission signal. The bootstrap graph initializes pool
+    // state without leaving CUDA Graph replay.
     bool indexer_pool_bootstrap = false;
 
     std::optional<PyContextParallelParams> context_parallel_info;

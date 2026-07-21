@@ -1009,6 +1009,30 @@ class IndexerOp(nn.Module):
             logits, lengths, max_seq_len, "main"
         )
 
+        if (
+            self._decode_indexer_pool is not None
+            and bool(getattr(attention_inputs, "is_cuda_graph", False))
+            and not is_target_verify
+            and not bool(
+                getattr(attention_inputs, "indexer_pool_graph_mode", False)
+            )
+            and bool(
+                getattr(
+                    attention_inputs,
+                    "indexer_pool_bootstrap_graph_mode",
+                    False,
+                )
+            )
+        ):
+            self._decode_indexer_pool.bootstrap_cuda_graph_exact(
+                logits,
+                q_fp8,
+                weights,
+                attention_inputs,
+                self._select_persistent_topk,
+                max_seq_len,
+            )
+
         if _pd_debug_enabled():
             if _pd_debug_take(f"paged:{self.index_topk}", 32):
                 logging.info(

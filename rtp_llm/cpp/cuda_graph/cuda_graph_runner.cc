@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -28,6 +29,18 @@ const bool kDecodeIndexerPoolEnabled = []() {
     }
     const std::string profile(value);
     return profile == "A" || profile == "B" || profile == "a" || profile == "b";
+}();
+const int32_t kDecodeIndexerPoolMinKvLength = []() {
+    constexpr int32_t default_value = 64 * 1024;
+    const char*       value         = std::getenv("RTP_LLM_DECODE_INDEXER_POOL_MIN_KV_LENGTH");
+    if (value == nullptr || *value == '\0') {
+        return default_value;
+    }
+    char*      end    = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    return end != value && *end == '\0' && parsed > 0 && parsed <= std::numeric_limits<int32_t>::max() ?
+               static_cast<int32_t>(parsed) :
+               default_value;
 }();
 
 class ScopedCudaGraphForwardFlag {
@@ -304,8 +317,8 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
 void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphState& state) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputData");
     c10::DeviceGuard graph_device_guard(cuda_graph::graphDevice(device_index_));
-    const size_t     graph_idx =
-        is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
+    const int graph_idx =
+        is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_graph_key;
     auto& py_model_inputs_ = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
     int   token_num        = is_prefill_cuda_graph_mode_ ? state.current_seq_len : inputs.input_ids.size(0);
 
@@ -372,15 +385,15 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
     }
     prepared_attention_inputs_.store(true, std::memory_order_release);
 
-    const size_t graph_idx =
-        is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
+    const int graph_idx =
+        is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_graph_key;
     auto&     py_model_inputs_        = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
     auto      attn_pyobj              = graph_instances_[graph_idx].mem_hold_.attn_pyobj_;
     const int captured_batch_capacity = py_model_inputs_.attention_inputs.input_lengths.defined() ?
                                             static_cast<int>(py_model_inputs_.attention_inputs.input_lengths.size(0)) :
                                             static_cast<int>(max_bs_);
     RTP_LLM_CHECK_WITH_INFO(state.current_batch_size <= captured_batch_capacity,
-                            "cuda graph replay batch size %d exceeds captured capacity %d for graph %zu",
+                            "cuda graph replay batch size %d exceeds captured capacity %d for graph %d",
                             state.current_batch_size,
                             captured_batch_capacity,
                             graph_idx);
@@ -576,7 +589,10 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
         optimizedCopyAsync(inputs.attention_inputs.decode_kv_length,
                            py_model_inputs_.attention_inputs.decode_kv_length,
                            state.current_batch_size * sizeof(int32_t));
-        optimizedCopyAsync(inputs.attention_inputs.decode_indexer_pool_slot,
+        const auto& slots = state.allow_decode_indexer_pool_bootstrap ?
+                                inputs.attention_inputs.decode_indexer_pool_slot :
+                                invalid_decode_indexer_pool_slots_;
+        optimizedCopyAsync(slots,
                            py_model_inputs_.attention_inputs.decode_indexer_pool_slot,
                            state.current_batch_size * sizeof(int32_t));
     }
@@ -661,8 +677,8 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
 void CudaGraphRunner::updateKVCacheKernelBlockId(const PyModelInputs& inputs, CudaGraphState& state) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.updateKVCacheKernelBlockId");
     c10::DeviceGuard graph_device_guard(cuda_graph::graphDevice(device_index_));
-    const size_t     graph_idx =
-        is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
+    const int graph_idx =
+        is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_graph_key;
     auto& py_model_inputs_ = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
     auto  attn_pyobj       = graph_instances_[graph_idx].mem_hold_.attn_pyobj_;
 
@@ -757,16 +773,16 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
     } else {
         {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayDecode)");
-            replayDecode(state.current_real_graph_bs);
+            replayDecode(state.current_graph_key);
             if (debugSyncCudaGraphReplayEnabled()) {
                 RTP_LLM_LOG_INFO("[CudaGraphRunner] debug sync after decode replay key=%d seq_len_sum=%d",
-                                 state.current_real_graph_bs,
+                                 state.current_graph_key,
                                  state.seq_len_sum);
                 cuda_graph::graphDeviceSynchronize();
             }
         }
         outputs.hidden_states =
-            graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_.slice(
+            graph_instances_[state.current_graph_key].mem_hold_.decoder_layer_hidden_states_.slice(
                 0, 0, state.seq_len_sum);
     }
     // record forward done event
@@ -810,8 +826,14 @@ bool CudaGraphRunner::tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs
                             state.current_batch_size,
                             capture_range_.back());
     state.current_real_graph_bs = *it;
+    state.current_graph_key = decodeGraphKey(state.current_real_graph_bs,
+                                             state.use_decode_indexer_pool_graph,
+                                             state.use_decode_indexer_bootstrap_graph);
     RTP_LLM_LOG_DEBUG(
-        "batch size used in replay: %d (graph key %d)", state.current_batch_size, state.current_real_graph_bs);
+        "batch size used in replay: %d (capacity %d, graph key %d)",
+        state.current_batch_size,
+        state.current_real_graph_bs,
+        state.current_graph_key);
 
     const bool target_verify_decode = is_target_verify_ || inputs.attention_inputs.is_target_verify;
     if (target_verify_decode) {
@@ -853,33 +875,47 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
         return false;
     }
 
-    if (kDecodeIndexerPoolEnabled && !is_prefill_cuda_graph_mode_ && !target_verify_decode) {
+    state.use_decode_indexer_pool_graph       = false;
+    state.use_decode_indexer_bootstrap_graph  = false;
+    state.allow_decode_indexer_pool_bootstrap = false;
+    if (kDecodeIndexerPoolEnabled && !is_prefill_cuda_graph_mode_ && !target_verify_decode
+        && !inputs.attention_inputs.is_prefill && !inputs.attention_inputs.is_speculative) {
         const auto& attn = inputs.attention_inputs;
-        if (attn.is_speculative || attn.indexer_pool_bootstrap) {
-            return false;
-        }
         const auto& request_ids = attn.decode_request_id;
         const auto& kv_lengths  = attn.decode_kv_length;
         const auto& pool_slots  = attn.decode_indexer_pool_slot;
-        if (!request_ids.defined() || !kv_lengths.defined() || !pool_slots.defined() || request_ids.is_cuda()
-            || kv_lengths.is_cuda() || pool_slots.is_cuda() || request_ids.scalar_type() != torch::kInt64
-            || kv_lengths.scalar_type() != torch::kInt32 || pool_slots.scalar_type() != torch::kInt32
-            || request_ids.numel() != kv_lengths.numel() || request_ids.numel() != pool_slots.numel()) {
-            return false;
-        }
-        std::unordered_set<int64_t> unique_ids;
-        const auto* request_ptr = request_ids.data_ptr<int64_t>();
-        const auto* kv_ptr      = kv_lengths.data_ptr<int32_t>();
-        const auto* slot_ptr    = pool_slots.data_ptr<int32_t>();
-        for (int64_t row = 0; row < request_ids.numel(); ++row) {
-            if (kv_ptr[row] < 16 * 1024 || slot_ptr[row] < 0 || !unique_ids.insert(request_ptr[row]).second) {
-                return false;
+        const bool metadata_valid = request_ids.defined() && kv_lengths.defined() && pool_slots.defined()
+                                    && !request_ids.is_cuda() && !kv_lengths.is_cuda() && !pool_slots.is_cuda()
+                                    && request_ids.scalar_type() == torch::kInt64
+                                    && kv_lengths.scalar_type() == torch::kInt32
+                                    && pool_slots.scalar_type() == torch::kInt32
+                                    && request_ids.numel() == kv_lengths.numel()
+                                    && request_ids.numel() == pool_slots.numel();
+        if (metadata_valid) {
+            bool                        all_pool_eligible = !attn.indexer_pool_bootstrap;
+            bool                        any_pool_eligible = false;
+            bool                        unique           = true;
+            std::unordered_set<int64_t> unique_ids;
+            const auto* request_ptr = request_ids.data_ptr<int64_t>();
+            const auto* kv_ptr      = kv_lengths.data_ptr<int32_t>();
+            const auto* slot_ptr    = pool_slots.data_ptr<int32_t>();
+            for (int64_t row = 0; row < request_ids.numel(); ++row) {
+                unique = unique && unique_ids.insert(request_ptr[row]).second;
+                const bool eligible = kv_ptr[row] > kDecodeIndexerPoolMinKvLength && slot_ptr[row] >= 0;
+                any_pool_eligible   = any_pool_eligible || eligible;
+                all_pool_eligible   = all_pool_eligible && eligible;
             }
+            state.allow_decode_indexer_pool_bootstrap = unique;
+            state.use_decode_indexer_pool_graph       = unique && all_pool_eligible;
+            state.use_decode_indexer_bootstrap_graph =
+                unique && attn.indexer_pool_bootstrap && any_pool_eligible;
         }
-        static std::once_flag pool_graph_admission_log;
-        std::call_once(pool_graph_admission_log, []() {
-            std::cout << "decode indexer candidate pool admitted to steady CUDA graph replay" << std::endl;
-        });
+        if (state.use_decode_indexer_pool_graph) {
+            static std::once_flag pool_graph_admission_log;
+            std::call_once(pool_graph_admission_log, []() {
+                std::cout << "decode indexer candidate pool admitted to steady CUDA graph replay" << std::endl;
+            });
+        }
     }
 
     if (!inputs.attention_inputs.kv_cache_kernel_block_id_device_by_group.empty()) {
@@ -931,6 +967,26 @@ void CudaGraphRunner::initKernelInternalMemory() {
 
 int CudaGraphRunner::getCurrentRealGraphBs(const CudaGraphState& state) const {
     return state.current_real_graph_bs;
+}
+
+int CudaGraphRunner::decodeGraphKey(int batch_size, bool pool_mode, bool bootstrap_mode) const {
+    RTP_LLM_CHECK_WITH_INFO(!(pool_mode && bootstrap_mode),
+                            "decode indexer graph cannot be pool and bootstrap mode simultaneously");
+    if (pool_mode) {
+        return -batch_size;
+    }
+    if (bootstrap_mode) {
+        return static_cast<int>(max_bs_) + batch_size;
+    }
+    return batch_size;
+}
+
+bool CudaGraphRunner::decodeIndexerPoolEnabled() const {
+    return kDecodeIndexerPoolEnabled;
+}
+
+int32_t CudaGraphRunner::decodeIndexerPoolMinKvLength() const {
+    return kDecodeIndexerPoolMinKvLength;
 }
 
 void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_bs, int num_tokens_per_bs) {
@@ -1016,8 +1072,11 @@ void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_
     inputs.attention_inputs.decode_cu_seqlens_d       = torch::arange(0, max_bs_ + 1, 1, options_cuda_int32_);
     if (kDecodeIndexerPoolEnabled && !is_prefill_cuda_graph_mode_ && !is_target_verify_) {
         inputs.attention_inputs.decode_step = torch::zeros({int(max_bs_)}, options_cuda_int32_);
-        inputs.attention_inputs.decode_kv_length = torch::full({int(max_bs_)}, 16 * 1024, options_cuda_int32_);
+        inputs.attention_inputs.decode_kv_length =
+            torch::full({int(max_bs_)}, kDecodeIndexerPoolMinKvLength + 1, options_cuda_int32_);
         inputs.attention_inputs.decode_indexer_pool_slot = torch::arange(0, max_bs_, 1, options_cuda_int32_);
+        invalid_decode_indexer_pool_slots_ =
+            torch::full({int(max_bs_)}, -1, options_cpu_int32_).pin_memory();
     }
 }
 
@@ -1367,6 +1426,9 @@ void CudaGraphRunner::prepareCaptureInputs(PyModelInputs& inputs, int batch_size
         inputs.attention_inputs.decode_kv_length = cap_attn.decode_kv_length.slice(0, 0, batch_size);
         inputs.attention_inputs.decode_indexer_pool_slot =
             cap_attn.decode_indexer_pool_slot.slice(0, 0, batch_size);
+        inputs.attention_inputs.indexer_pool_graph_mode = cap_attn.indexer_pool_graph_mode;
+        inputs.attention_inputs.indexer_pool_bootstrap_graph_mode =
+            cap_attn.indexer_pool_bootstrap_graph_mode;
     }
     inputs.attention_inputs.kv_cache_kernel_block_id_device_by_group.clear();
     if (!cap_attn.kv_cache_kernel_block_id_device_by_group.empty()) {

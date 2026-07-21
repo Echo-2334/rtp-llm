@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include "rtp_llm/cpp/utils/DevicePerfWrapper.h"
@@ -66,6 +67,16 @@ const bool kPdDebugEnabled = []() {
 const bool kMtpDecodeDebugEnabled = []() {
     const char* env = std::getenv("RTP_LLM_DEBUG_MTP_DECODE_DATA");
     return env != nullptr && std::string(env) != "0";
+}();
+
+const int32_t kDecodeIndexerPoolMinKvLength = []() {
+    constexpr int32_t default_value = 64 * 1024;
+    const char*       value         = std::getenv("RTP_LLM_DECODE_INDEXER_POOL_MIN_KV_LENGTH");
+    if (value == nullptr || *value == '\0') {
+        return default_value;
+    }
+    const long parsed = std::strtol(value, nullptr, 10);
+    return parsed > 0 && parsed <= std::numeric_limits<int32_t>::max() ? static_cast<int32_t>(parsed) : default_value;
 }();
 
 bool pdDebugEnabled() {
@@ -306,13 +317,12 @@ void PyWrappedModel::assignDecodeIndexerPoolSlots(torch_ext::PyAttentionInputs& 
         current_ids.insert(request_ptr[row]);
     }
 
-    constexpr int32_t kPoolSize = 16 * 1024;
-    bool              bootstrap = false;
+    bool bootstrap = false;
     for (int64_t row = 0; row < count; ++row) {
         const int64_t request_id = request_ptr[row];
         const int32_t step       = step_ptr[row];
         const int32_t kv_length  = kv_ptr[row];
-        const bool    eligible   = kv_length >= kPoolSize;
+        const bool    eligible   = kv_length > kDecodeIndexerPoolMinKvLength;
         auto          it         = decode_indexer_pool_slots_.find(request_id);
 
         if (it == decode_indexer_pool_slots_.end()) {

@@ -18,6 +18,8 @@ POOL_ENV = {
     "RTP_LLM_DECODE_INDEXER_POOL_Q_MODE": None,
     "RTP_LLM_DECODE_INDEXER_POOL_ASYNC_REFRESH": None,
     "RTP_LLM_DECODE_INDEXER_POOL_STATE_TTL": None,
+    "RTP_LLM_DECODE_INDEXER_POOL_SIZE": None,
+    "RTP_LLM_DECODE_INDEXER_POOL_MIN_KV_LENGTH": None,
 }
 
 
@@ -53,6 +55,23 @@ class DecodeIndexerPoolConfigTest(TestCase):
         self.assertEqual(
             [config.refresh_chunks(step) for step in range(8)],
             [(0,), (1,), (2,), (3,), (4,), (5,), (6,), (7,)],
+        )
+
+    def test_profile_a_8k_pool_uses_four_step_interval(self):
+        with _pool_env(
+            RTP_LLM_DECODE_INDEXER_POOL_PROFILE="A",
+            RTP_LLM_DECODE_INDEXER_POOL_SIZE="8192",
+        ):
+            config = DecodeIndexerPoolConfig.from_env()
+
+        self.assertEqual(config.min_kv_length, 64 * 1024)
+        self.assertEqual(config.pool_size, 8192)
+        self.assertEqual(config.chunks, 4)
+        self.assertEqual(config.interval, 4)
+        self.assertEqual(config.refresh_lead, 4)
+        self.assertEqual(
+            [config.refresh_chunks(step) for step in range(4)],
+            [(0,), (1,), (2,), (3,)],
         )
 
     def test_profile_b_refreshes_two_fixed_anchor_chunks_from_phase_four(self):
@@ -181,6 +200,7 @@ class DecodeIndexerCudaGraphTest(TestCase):
     def test_first_graph_call_initializes_slots_and_replays(self):
         config = DecodeIndexerPoolConfig(
             profile="A",
+            min_kv_length=16 * 1024,
             chunks_per_step=1,
             refresh_lead=8,
             q_mode="rolling",
@@ -199,6 +219,7 @@ class DecodeIndexerCudaGraphTest(TestCase):
         lengths = torch.tensor([16385], dtype=torch.int32, device=self.device)
         attention_inputs = SimpleNamespace(
             is_cuda_graph=True,
+            indexer_pool_graph_mode=True,
             is_speculative=False,
             is_target_verify=False,
             decode_indexer_pool_slot=torch.tensor(
@@ -249,6 +270,109 @@ class DecodeIndexerCudaGraphTest(TestCase):
 
         self.assertEqual(captured.shape, (1, 2048))
         self.assertEqual(captured.dtype, torch.int32)
+
+    def test_exact_graph_bootstraps_8k_pool_above_64k(self):
+        config = DecodeIndexerPoolConfig(
+            profile="A",
+            min_kv_length=64 * 1024,
+            interval=4,
+            pool_size=8 * 1024,
+            chunks=4,
+            chunks_per_step=1,
+            refresh_lead=4,
+            q_mode="rolling",
+            anchor_phase=0,
+            async_refresh=False,
+        )
+        pool = DecodeIndexerPool(
+            config,
+            index_topk=2048,
+            index_n_heads=1,
+            index_head_dim=4,
+        )
+        graph_max_seq_len = 64 * 1024 + 64
+        logits = torch.randn(
+            (1, graph_max_seq_len), dtype=torch.float32, device=self.device
+        )
+        q_fp8 = torch.zeros((1, 1, 4), dtype=torch.float16, device=self.device)
+        weights = torch.ones((1, 1), dtype=torch.float32, device=self.device)
+        attention_inputs = SimpleNamespace(
+            indexer_pool_graph_mode=False,
+            indexer_pool_bootstrap_graph_mode=True,
+            decode_indexer_pool_slot=torch.tensor(
+                [0], dtype=torch.int32, device=self.device
+            ),
+            decode_kv_length=torch.tensor(
+                [64 * 1024 + 1], dtype=torch.int32, device=self.device
+            ),
+        )
+
+        def select_topk(values, lengths, max_seq_len, lane):
+            return torch.topk(values, 2048, dim=1).indices.to(torch.int32)
+
+        def run_exact_bootstrap():
+            pool.bootstrap_cuda_graph_exact(
+                logits,
+                q_fp8,
+                weights,
+                attention_inputs,
+                select_topk,
+                graph_max_seq_len,
+            )
+
+        for _ in range(2):
+            run_exact_bootstrap()
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_exact_bootstrap()
+        attention_inputs.decode_kv_length.fill_(64 * 1024 + 2)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert pool._pools is not None
+        assert pool._graph_coverage is not None
+        self.assertEqual(tuple(pool._pools.shape), (2, 2, 4, 2048))
+        self.assertEqual(pool._graph_coverage[0].tolist(), [64 * 1024 + 2] * 2)
+
+    def test_normal_exact_graph_does_not_run_bootstrap(self):
+        config = DecodeIndexerPoolConfig(
+            profile="A",
+            min_kv_length=64 * 1024,
+            interval=4,
+            pool_size=8 * 1024,
+            chunks=4,
+            chunks_per_step=1,
+            refresh_lead=4,
+            q_mode="rolling",
+            anchor_phase=0,
+            async_refresh=False,
+        )
+        pool = DecodeIndexerPool(
+            config,
+            index_topk=2048,
+            index_n_heads=1,
+            index_head_dim=4,
+        )
+        logits = torch.zeros((1, 128), dtype=torch.float32, device=self.device)
+        q_fp8 = torch.zeros((1, 1, 4), dtype=torch.float16, device=self.device)
+        weights = torch.ones((1, 1), dtype=torch.float32, device=self.device)
+        attention_inputs = SimpleNamespace(
+            indexer_pool_graph_mode=False,
+            indexer_pool_bootstrap_graph_mode=False,
+        )
+
+        pool.bootstrap_cuda_graph_exact(
+            logits,
+            q_fp8,
+            weights,
+            attention_inputs,
+            lambda *args: (_ for _ in ()).throw(AssertionError("unexpected TopK")),
+            128,
+        )
+
+        self.assertIsNone(pool._pools)
 
 
 if __name__ == "__main__":
