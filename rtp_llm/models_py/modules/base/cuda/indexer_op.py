@@ -255,6 +255,7 @@ class IndexerOp(nn.Module):
         block_size: int = 128,
         scale_fmt: str = "ue8m0",
         is_neox_style: bool = True,
+        layer_idx: int = -1,
     ):
         """
         Initialize IndexerOp.
@@ -279,6 +280,7 @@ class IndexerOp(nn.Module):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.is_neox_style = is_neox_style
+        self.layer_idx = layer_idx
 
         pool_config = DecodeIndexerPoolConfig.from_env()
         self._decode_indexer_pool = (
@@ -287,6 +289,7 @@ class IndexerOp(nn.Module):
                 index_topk=index_topk,
                 index_n_heads=index_n_heads,
                 index_head_dim=index_head_dim,
+                layer_idx=layer_idx,
             )
             if pool_config.enabled
             else None
@@ -753,6 +756,11 @@ class IndexerOp(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         batch_size, candidate_width = candidate_indices.shape
         device = candidate_indices.device
+        bs = self.blocksize
+        head_dim_with_sf = self._head_dim_with_sf()
+        hd = self.index_head_dim
+        sf = head_dim_with_sf - hd  # scale bytes per token (fp8 scale factors)
+
         offsets = torch.arange(candidate_width, device=device, dtype=torch.long)
         valid = offsets.unsqueeze(0) < candidate_lengths.long().unsqueeze(1)
         safe_indices = torch.where(
@@ -761,42 +769,44 @@ class IndexerOp(nn.Module):
             torch.zeros((), device=device, dtype=torch.long),
         )
 
-        logical_blocks = torch.div(
-            safe_indices, self.blocksize, rounding_mode="floor"
-        )
-        block_offsets = torch.remainder(safe_indices, self.blocksize)
-        physical_blocks = torch.gather(
-            block_table.long(), 1, logical_blocks
-        )
-        physical_slots = physical_blocks * self.blocksize + block_offsets
+        logical_blocks = torch.div(safe_indices, bs, rounding_mode="floor")
+        block_offsets = torch.remainder(safe_indices, bs)
+        physical_blocks = torch.gather(block_table.long(), 1, logical_blocks)
 
-        head_dim_with_sf = self._head_dim_with_sf()
-        flat_cache = kv_cache_fp8.view(-1, head_dim_with_sf)
-        packed_candidates = flat_cache.index_select(
-            0, physical_slots.reshape(-1)
-        ).view(batch_size, candidate_width, head_dim_with_sf)
+        # 关键:indexer 的 paged K cache 每个 block 内是"分区存"——先 blocksize 个
+        # token 的 fp8 K(bs*hd 字节),再 blocksize 个 token 的 scale(bs*sf 字节),
+        # 不是每 token 连续的 [K|scale]。见 mla_quant_kernel.cu 的
+        # indexer_k_quant_and_cache_kernel。必须按分区布局分别 gather K 与 scale,
+        # 否则候选打分读到串位的字节,top-k 全错。
+        num_blocks = kv_cache_fp8.shape[0]
+        raw = kv_cache_fp8.reshape(num_blocks, bs * head_dim_with_sf)
+        k_region = raw[:, : bs * hd].reshape(num_blocks, bs, hd)
+        s_region = raw[:, bs * hd :].reshape(num_blocks, bs, sf)
 
-        padded_width = (
-            (candidate_width + self.blocksize - 1) // self.blocksize
-        ) * self.blocksize
+        cand_k = k_region[physical_blocks, block_offsets]  # [batch, cand_w, hd]
+        cand_s = s_region[physical_blocks, block_offsets]  # [batch, cand_w, sf]
+
+        padded_width = ((candidate_width + bs - 1) // bs) * bs
         if padded_width != candidate_width:
-            padding = torch.zeros(
-                (
-                    batch_size,
-                    padded_width - candidate_width,
-                    head_dim_with_sf,
-                ),
-                dtype=packed_candidates.dtype,
-                device=device,
+            pad = padded_width - candidate_width
+            cand_k = torch.cat(
+                (cand_k, cand_k.new_zeros((batch_size, pad, hd))), dim=1
             )
-            packed_candidates = torch.cat((packed_candidates, padding), dim=1)
+            cand_s = torch.cat(
+                (cand_s, cand_s.new_zeros((batch_size, pad, sf))), dim=1
+            )
 
-        pages_per_request = padded_width // self.blocksize
-        candidate_cache = packed_candidates.view(
-            batch_size * pages_per_request,
-            self.blocksize,
-            1,
-            head_dim_with_sf,
+        pages_per_request = padded_width // bs
+        # 按分区布局重组每个候选页:[bs*hd 的 K][bs*sf 的 scale]
+        block_buf = torch.cat(
+            (
+                cand_k.reshape(batch_size, pages_per_request, bs * hd),
+                cand_s.reshape(batch_size, pages_per_request, bs * sf),
+            ),
+            dim=2,
+        )
+        candidate_cache = block_buf.reshape(
+            batch_size * pages_per_request, bs, 1, head_dim_with_sf
         )
         candidate_block_table = torch.arange(
             batch_size * pages_per_request,
@@ -961,6 +971,7 @@ class IndexerOp(nn.Module):
                     ),
                     score_materialized=self._score_materialized_candidates,
                     select_topk=self._select_persistent_topk,
+                    graph_max_seq_len=block_table.shape[1] * self.blocksize,
                 )
                 if pooled_topk is not None:
                     return pooled_topk

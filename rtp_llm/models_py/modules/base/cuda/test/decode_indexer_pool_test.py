@@ -1,10 +1,12 @@
 import os
+from types import SimpleNamespace
 from unittest import SkipTest, TestCase, main
 from unittest.mock import patch
 
 import torch
 
 from rtp_llm.models_py.modules.base.cuda.decode_indexer_pool import (
+    DecodeIndexerPool,
     DecodeIndexerPoolConfig,
 )
 from rtp_llm.models_py.modules.base.cuda.indexer_op import IndexerOp
@@ -47,6 +49,7 @@ class DecodeIndexerPoolConfigTest(TestCase):
         self.assertTrue(config.enabled)
         self.assertEqual(config.q_mode, "rolling")
         self.assertEqual(config.refresh_lead, 8)
+        self.assertEqual(config.max_recent_tokens, 16)
         self.assertEqual(
             [config.refresh_chunks(step) for step in range(8)],
             [(0,), (1,), (2,), (3,), (4,), (5,), (6,), (7,)],
@@ -59,6 +62,7 @@ class DecodeIndexerPoolConfigTest(TestCase):
         self.assertEqual(config.q_mode, "fixed")
         self.assertEqual(config.anchor_phase, 4)
         self.assertEqual(config.refresh_lead, 4)
+        self.assertEqual(config.max_recent_tokens, 12)
         self.assertEqual(
             [config.refresh_chunks(step) for step in range(8)],
             [(), (), (), (), (0, 1), (2, 3), (4, 5), (6, 7)],
@@ -144,7 +148,10 @@ class DecodeIndexerCandidateScoreTest(TestCase):
         _, exact_topk = op._score_paged_exact(
             q_fp8, weights, cache, block_table, lengths
         )
-        candidates = torch.arange(
+        # A monotonic full candidate set preserves the raw page bytes even when
+        # the implementation incorrectly treats partitioned [all K][all scale]
+        # storage as token-major [K|scale]. Permute it to exercise real gathers.
+        candidates = torch.randperm(
             seq_len, dtype=torch.long, device=self.device
         ).view(1, seq_len)
         candidate_topk = op._score_paged_candidates(
@@ -156,7 +163,92 @@ class DecodeIndexerCandidateScoreTest(TestCase):
             lengths,
             "main",
         )
-        torch.testing.assert_close(candidate_topk, exact_topk, rtol=0, atol=0)
+        torch.testing.assert_close(
+            torch.sort(candidate_topk, dim=1).values,
+            torch.sort(exact_topk, dim=1).values,
+            rtol=0,
+            atol=0,
+        )
+
+
+class DecodeIndexerCudaGraphTest(TestCase):
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            raise SkipTest("CUDA is required")
+        self.device = torch.device("cuda:0")
+        torch.cuda.set_device(self.device)
+
+    def test_first_graph_call_initializes_slots_and_replays(self):
+        config = DecodeIndexerPoolConfig(
+            profile="A",
+            chunks_per_step=1,
+            refresh_lead=8,
+            q_mode="rolling",
+            anchor_phase=0,
+            async_refresh=False,
+        )
+        pool = DecodeIndexerPool(
+            config,
+            index_topk=2048,
+            index_n_heads=1,
+            index_head_dim=4,
+        )
+        q_fp8 = torch.zeros((1, 1, 4), dtype=torch.float16, device=self.device)
+        weights = torch.ones((1, 1), dtype=torch.float32, device=self.device)
+        block_table = torch.zeros((1, 512), dtype=torch.int32, device=self.device)
+        lengths = torch.tensor([16385], dtype=torch.int32, device=self.device)
+        attention_inputs = SimpleNamespace(
+            is_cuda_graph=True,
+            is_speculative=False,
+            is_target_verify=False,
+            decode_indexer_pool_slot=torch.tensor(
+                [0], dtype=torch.int32, device=self.device
+            ),
+            decode_step=torch.tensor([1], dtype=torch.int32, device=self.device),
+            decode_kv_length=torch.tensor(
+                [16385], dtype=torch.int32, device=self.device
+            ),
+        )
+
+        def candidate_score(q, w, table, candidates, lens, lane):
+            return candidates[:, :2048].to(torch.int32)
+
+        def prepare_candidates(table, candidates, lens):
+            cache = torch.empty(
+                (candidates.shape[0], 1), dtype=torch.uint8, device=self.device
+            )
+            return cache, table[:, :1], candidates.shape[1]
+
+        def score_materialized(q, w, cache, table, width, candidates, lens, lane):
+            return candidates[:, :2048].to(torch.int32)
+
+        def run_graph_path():
+            return pool._try_compute_cuda_graph(
+                q_fp8,
+                weights,
+                block_table,
+                lengths,
+                attention_inputs,
+                candidate_score,
+                prepare_candidates,
+                score_materialized,
+                32768,
+            )
+
+        for _ in range(3):
+            run_graph_path()
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run_graph_path()
+        attention_inputs.decode_step.fill_(2)
+        attention_inputs.decode_kv_length.fill_(16386)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertEqual(captured.shape, (1, 2048))
+        self.assertEqual(captured.dtype, torch.int32)
 
 
 if __name__ == "__main__":

@@ -57,6 +57,9 @@ public:
         py_model_inputs_.attention_inputs.is_s_padded               = inputs.attention_inputs.is_s_padded;
         py_model_inputs_.attention_inputs.decode_cu_seqlens_d       = inputs.attention_inputs.decode_cu_seqlens_d;
         py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d = inputs.attention_inputs.sequence_lengths_plus_1_d;
+        py_model_inputs_.attention_inputs.decode_step                = inputs.attention_inputs.decode_step;
+        py_model_inputs_.attention_inputs.decode_kv_length           = inputs.attention_inputs.decode_kv_length;
+        py_model_inputs_.attention_inputs.decode_indexer_pool_slot   = inputs.attention_inputs.decode_indexer_pool_slot;
     }
 
 public:

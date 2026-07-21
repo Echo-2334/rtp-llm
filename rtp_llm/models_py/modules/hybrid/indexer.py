@@ -135,6 +135,7 @@ class Indexer(nn.Module):
             block_size=self.block_size,
             scale_fmt=self.scale_fmt,
             is_neox_style=self.is_neox_style,
+            layer_idx=self.layer_idx,
         )
 
     def _prefill_cp_enabled(self) -> bool:

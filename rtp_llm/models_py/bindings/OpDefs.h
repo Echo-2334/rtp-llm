@@ -321,6 +321,9 @@ struct PyAttentionInputs {
     torch::Tensor decode_request_id;
     torch::Tensor decode_step;
     torch::Tensor decode_kv_length;
+    // Stable pool slot assigned on the host. CUDA graph instances mirror this
+    // into a fixed device buffer before replay.
+    torch::Tensor decode_indexer_pool_slot;
 
     int           context_total_kv_length = 0;
     int           total_tokens            = 0;
@@ -337,6 +340,9 @@ struct PyAttentionInputs {
 
     // CUDA Graph mode flags
     bool is_cuda_graph = false;  // True when running in CUDA graph mode (capture or replay)
+    // Force one eager exact launch to initialize persistent pool state before
+    // the request is admitted to the steady CUDA graph.
+    bool indexer_pool_bootstrap = false;
 
     std::optional<PyContextParallelParams> context_parallel_info;
 

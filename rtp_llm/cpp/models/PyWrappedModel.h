@@ -7,6 +7,8 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <c10/core/DeviceGuard.h>
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
@@ -91,8 +93,17 @@ private:
     std::optional<PyCacheStoreInputs> prepareWriteCacheParams(const GptModelInputs& inputs);
 
 private:
+    struct DecodeIndexerPoolSlotState {
+        int32_t  slot{-1};
+        int32_t  last_step{-1};
+        int32_t  last_kv_length{-1};
+        bool     eligible{false};
+        uint64_t last_seen_tick{0};
+    };
+
     // Helper functions to reduce code duplication
     torch_ext::PyAttentionInputs   buildPyAttentionInputs(const GptModelInputs& inputs);
+    void assignDecodeIndexerPoolSlots(torch_ext::PyAttentionInputs& py_attn_inputs);
     torch_ext::BertEmbeddingInputs buildBertEmbeddingInputs(const GptModelInputs& inputs);
     void setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs& py_attn_inputs, const GptModelInputs& inputs);
     GptModelOutputs callForwardPostLayers(torch::Tensor         hidden_states,
@@ -142,6 +153,12 @@ private:
     bool       use_spec_decoding_{false};
     bool       enable_device_perf_{false};
     bool       check_nan_{false};
+    bool       decode_indexer_pool_enabled_{false};
+    int32_t    decode_indexer_pool_max_slots_{1};
+    uint64_t   decode_indexer_pool_tick_{0};
+    std::mutex decode_indexer_pool_mutex_;
+    std::unordered_map<int64_t, DecodeIndexerPoolSlotState> decode_indexer_pool_slots_;
+    std::vector<int32_t>                                    decode_indexer_pool_free_slots_;
 
     std::unique_ptr<IContextParallelProcessor> context_parallel_processor_{nullptr};
     std::unique_ptr<CacheStoreAsyncWriter>     cache_store_async_writer_;
@@ -174,6 +191,15 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     use_spec_decoding_(use_spec_decoding),
     enable_device_perf_(params.profile_debug_logging_config.enable_device_perf),
     check_nan_(params.profile_debug_logging_config.check_nan) {
+    const char* pool_profile       = std::getenv("RTP_LLM_DECODE_INDEXER_POOL_PROFILE");
+    const std::string pool_profile_value = pool_profile == nullptr ? "" : std::string(pool_profile);
+    decode_indexer_pool_enabled_ = pool_profile_value == "A" || pool_profile_value == "B"
+                                   || pool_profile_value == "a" || pool_profile_value == "b";
+    decode_indexer_pool_max_slots_ = std::max<int32_t>(1, params.concurrency_config.concurrency_limit);
+    decode_indexer_pool_free_slots_.reserve(decode_indexer_pool_max_slots_);
+    for (int32_t slot = decode_indexer_pool_max_slots_ - 1; slot >= 0; --slot) {
+        decode_indexer_pool_free_slots_.push_back(slot);
+    }
     weights_               = params.weights;
     model_id_              = params.model_id;
     kv_cache_layer_layout_ = params.kv_cache_layer_layout;

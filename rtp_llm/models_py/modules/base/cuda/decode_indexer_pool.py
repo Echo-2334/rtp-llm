@@ -1,8 +1,9 @@
 """Decode-only candidate-pool reuse for the GLM/DSA indexer.
 
-The feature is intentionally eager-only and excludes speculative target verify.
-It keeps per-request, per-layer pools because this mode is used when indexcache
-cross-layer reuse is disabled.
+The feature excludes speculative target verify and keeps per-request, per-layer
+pools because this mode is used when indexcache cross-layer reuse is disabled.
+New or discontinuous requests bootstrap with one eager exact pass; subsequent
+decode steps use a fixed-shape CUDA Graph data path when graph mode is enabled.
 
 Enable it with ``RTP_LLM_DECODE_INDEXER_POOL_PROFILE=A`` or ``B``. The optional
 ``RTP_LLM_DECODE_INDEXER_POOL_Q_MODE`` overrides rolling/fixed anchor mode, and
@@ -109,6 +110,12 @@ class DecodeIndexerPoolConfig:
     def full_chunk_mask(self) -> int:
         return (1 << self.chunks) - 1
 
+    @property
+    def max_recent_tokens(self) -> int:
+        # A pool is built at an anchor and becomes active refresh_lead steps
+        # later. It then serves one full interval before the next swap.
+        return self.interval + self.refresh_lead
+
     def refresh_chunks(self, decode_step: int) -> Tuple[int, ...]:
         phase = decode_step % self.interval
         if self.profile == "A":
@@ -211,6 +218,7 @@ class DecodeIndexerPool:
         index_topk: int,
         index_n_heads: int,
         index_head_dim: int,
+        layer_idx: int = -1,
     ) -> None:
         if config.pool_size != config.chunks * index_topk:
             raise ValueError(
@@ -221,12 +229,16 @@ class DecodeIndexerPool:
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
+        self.layer_idx = layer_idx
         self._states: Dict[int, _RequestState] = {}
         self._free_slots: List[int] = []
         self._capacity = 0
         self._pools: Optional[torch.Tensor] = None
         self._anchor_q: Optional[torch.Tensor] = None
         self._anchor_weights: Optional[torch.Tensor] = None
+        self._graph_active_parity: Optional[torch.Tensor] = None
+        self._graph_coverage: Optional[torch.Tensor] = None
+        self._graph_slot_base: Optional[int] = None
         self._device: Optional[torch.device] = None
         self._tick = 0
 
@@ -250,13 +262,6 @@ class DecodeIndexerPool:
                 "decode-indexer-pool-target-verify",
                 logging.WARNING,
                 "decode indexer pool is disabled for target verify",
-            )
-            return False
-        if bool(getattr(attention_inputs, "is_cuda_graph", False)):
-            _log_once(
-                "decode-indexer-pool-cuda-graph",
-                logging.WARNING,
-                "decode indexer pool is eager-only; CUDA graph uses exact indexer topk",
             )
             return False
         request_ids = getattr(attention_inputs, "decode_request_id", None)
@@ -296,6 +301,9 @@ class DecodeIndexerPool:
         self._pools = None
         self._anchor_q = None
         self._anchor_weights = None
+        self._graph_active_parity = None
+        self._graph_coverage = None
+        self._graph_slot_base = None
         self._device = device
 
     def _ensure_capacity(
@@ -319,7 +327,7 @@ class DecodeIndexerPool:
         if refresh_stream != main_stream:
             main_stream.wait_stream(refresh_stream)
 
-        new_pools = torch.empty(
+        new_pools = torch.zeros(
             (
                 new_capacity,
                 2,
@@ -332,10 +340,26 @@ class DecodeIndexerPool:
         if self._pools is not None:
             new_pools[: self._capacity].copy_(self._pools)
 
+        new_graph_active_parity = torch.zeros(
+            new_capacity, dtype=torch.long, device=device
+        )
+        new_graph_coverage = torch.full(
+            (new_capacity, 2),
+            self.config.pool_size,
+            dtype=torch.long,
+            device=device,
+        )
+        if self._graph_active_parity is not None:
+            new_graph_active_parity[: self._capacity].copy_(
+                self._graph_active_parity
+            )
+            assert self._graph_coverage is not None
+            new_graph_coverage[: self._capacity].copy_(self._graph_coverage)
+
         new_anchor_q: Optional[torch.Tensor] = None
         new_anchor_weights: Optional[torch.Tensor] = None
         if self.config.q_mode == "fixed":
-            new_anchor_q = torch.empty(
+            new_anchor_q = torch.zeros(
                 (
                     new_capacity,
                     self.index_n_heads,
@@ -344,7 +368,7 @@ class DecodeIndexerPool:
                 dtype=q_fp8.dtype,
                 device=device,
             )
-            new_anchor_weights = torch.empty(
+            new_anchor_weights = torch.zeros(
                 (new_capacity, self.index_n_heads),
                 dtype=weights.dtype,
                 device=device,
@@ -358,6 +382,8 @@ class DecodeIndexerPool:
         self._pools = new_pools
         self._anchor_q = new_anchor_q
         self._anchor_weights = new_anchor_weights
+        self._graph_active_parity = new_graph_active_parity
+        self._graph_coverage = new_graph_coverage
         self._capacity = new_capacity
 
     def _evict_stale(self, device: torch.device) -> None:
@@ -371,10 +397,44 @@ class DecodeIndexerPool:
             self._wait_pending(state, device)
             self._free_slots.append(state.slot)
 
-    def _new_state(self, request_id: int) -> _RequestState:
-        if not self._free_slots:
-            raise RuntimeError("decode indexer pool slot allocator is empty")
-        state = _RequestState(request_id=request_id, slot=self._free_slots.pop())
+    def _claim_slot(
+        self,
+        request_id: int,
+        device: torch.device,
+        preferred_slot: Optional[int],
+    ) -> int:
+        if preferred_slot is None:
+            if not self._free_slots:
+                raise RuntimeError("decode indexer pool slot allocator is empty")
+            return self._free_slots.pop()
+        if preferred_slot < 0 or preferred_slot >= self._capacity:
+            raise RuntimeError(
+                f"decode indexer pool slot {preferred_slot} is outside capacity {self._capacity}"
+            )
+
+        occupant_id = next(
+            (
+                existing_id
+                for existing_id, existing in self._states.items()
+                if existing.slot == preferred_slot and existing_id != request_id
+            ),
+            None,
+        )
+        if occupant_id is not None:
+            occupant = self._states.pop(occupant_id)
+            self._wait_pending(occupant, device)
+        if preferred_slot in self._free_slots:
+            self._free_slots.remove(preferred_slot)
+        return preferred_slot
+
+    def _new_state(
+        self,
+        request_id: int,
+        device: torch.device,
+        preferred_slot: Optional[int] = None,
+    ) -> _RequestState:
+        slot = self._claim_slot(request_id, device, preferred_slot)
+        state = _RequestState(request_id=request_id, slot=slot)
         self._states[request_id] = state
         return state
 
@@ -387,6 +447,10 @@ class DecodeIndexerPool:
         state.coverage[1] = 0
         state.build_started = False
         state.build_mask = 0
+        if self._graph_active_parity is not None:
+            self._graph_active_parity[state.slot] = 0
+            assert self._graph_coverage is not None
+            self._graph_coverage[state.slot].zero_()
 
     def _swap_or_reset(
         self,
@@ -401,6 +465,8 @@ class DecodeIndexerPool:
             return False
         self._wait_pending(state, device)
         state.active_parity = 1 - state.active_parity
+        if self._graph_active_parity is not None:
+            self._graph_active_parity[state.slot] = state.active_parity
         state.build_started = False
         state.build_mask = 0
         return True
@@ -445,6 +511,15 @@ class DecodeIndexerPool:
         )
         self._pools[slots, 0] = pool
         self._pools[slots, 1] = pool
+        if self._graph_active_parity is not None:
+            self._graph_active_parity.index_fill_(0, slots, 0)
+            assert self._graph_coverage is not None
+            coverage_d = torch.tensor(
+                kv_lengths, device=device, dtype=torch.long
+            ).unsqueeze(1)
+            self._graph_coverage.index_copy_(
+                0, slots, coverage_d.expand(-1, 2)
+            )
         for state, kv_length in zip(states, kv_lengths):
             state.active_parity = 0
             state.coverage[0] = kv_length
@@ -470,6 +545,15 @@ class DecodeIndexerPool:
             state.build_mask = (
                 self.config.full_chunk_mask if keep_bootstrap_chunks else 0
             )
+
+        if self._graph_coverage is not None:
+            device = q_fp8.device
+            slots = torch.tensor(
+                [state.slot for state in states], device=device, dtype=torch.long
+            )
+            parities = torch.tensor(target_parities, device=device, dtype=torch.long)
+            coverage = torch.tensor(kv_lengths, device=device, dtype=torch.long)
+            self._graph_coverage.index_put_((slots, parities), coverage)
 
         if self.config.q_mode == "fixed":
             assert self._anchor_q is not None
@@ -593,6 +677,200 @@ class DecodeIndexerPool:
             state.build_mask |= 1 << chunk
             state.pending_event = event
 
+    def _try_compute_cuda_graph(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        block_table: torch.Tensor,
+        lengths: torch.Tensor,
+        attention_inputs: Any,
+        candidate_score: CandidateScoreFn,
+        prepare_candidates: PrepareCandidateFn,
+        score_materialized: ScoreMaterializedFn,
+        graph_max_seq_len: Optional[int],
+    ) -> torch.Tensor:
+        """Emit the fixed-shape steady-state data path during graph capture.
+
+        Request lifecycle and slot assignment stay on the host. The captured
+        graph only reads fixed input buffers and mutates per-slot parity,
+        coverage, anchors, and double-buffered pools in place.
+        """
+        batch_size = block_table.shape[0]
+        if graph_max_seq_len is None or graph_max_seq_len <= 0:
+            raise RuntimeError("decode indexer pool graph requires max sequence length")
+        slots_input = getattr(attention_inputs, "decode_indexer_pool_slot", None)
+        decode_steps = getattr(attention_inputs, "decode_step", None)
+        kv_lengths = getattr(attention_inputs, "decode_kv_length", None)
+        metadata = (slots_input, decode_steps, kv_lengths)
+        if any(not isinstance(tensor, torch.Tensor) for tensor in metadata):
+            raise RuntimeError("decode indexer pool graph metadata is missing")
+        if any(not tensor.is_cuda or tensor.numel() != batch_size for tensor in metadata):
+            raise RuntimeError(
+                "decode indexer pool graph metadata must be fixed CUDA tensors"
+            )
+
+        device = q_fp8.device
+        if self._device != device:
+            self._reset_runtime(device)
+
+        if self._graph_slot_base is None:
+            # initCapture first runs with max_bs. Reserve a disjoint dummy range
+            # for padded rows selected by smaller captured graph capacities.
+            self._graph_slot_base = batch_size
+        if batch_size > self._graph_slot_base:
+            raise RuntimeError(
+                f"decode indexer graph batch {batch_size} exceeds slot base {self._graph_slot_base}"
+            )
+        self._ensure_capacity(
+            self._graph_slot_base + batch_size, q_fp8, weights
+        )
+        assert self._pools is not None
+        assert self._graph_active_parity is not None
+        assert self._graph_coverage is not None
+
+        rows = torch.arange(batch_size, device=device, dtype=torch.long)
+        kv_lengths_l = kv_lengths.to(torch.long)
+        valid_rows = kv_lengths_l >= self.config.pool_size
+        dummy_slots = rows + self._graph_slot_base
+        slots = torch.where(valid_rows, slots_input.to(torch.long), dummy_slots)
+        slots = slots.clamp(min=0, max=self._capacity - 1)
+        phase = torch.remainder(decode_steps.to(torch.long), self.config.interval)
+
+        active_parity = self._graph_active_parity.index_select(0, slots)
+        should_swap = valid_rows & phase.eq(0)
+        active_parity = torch.where(
+            should_swap, 1 - active_parity, active_parity
+        )
+        self._graph_active_parity.index_copy_(0, slots, active_parity)
+
+        active_pool = self._pools[slots, active_parity].reshape(
+            batch_size, self.config.pool_size
+        )
+        active_coverage = self._graph_coverage[slots, active_parity]
+        recent_lengths = torch.clamp(
+            kv_lengths_l - active_coverage,
+            min=0,
+            max=self.config.max_recent_tokens,
+        )
+        recent_offsets = torch.arange(
+            self.config.max_recent_tokens, device=device, dtype=torch.long
+        )
+        recent_indices = active_coverage.unsqueeze(1) + recent_offsets.unsqueeze(0)
+        candidates = torch.cat((active_pool.to(torch.long), recent_indices), dim=1)
+        candidate_lengths = (
+            recent_lengths + self.config.pool_size
+        ).to(torch.int32)
+        result = candidate_score(
+            q_fp8,
+            weights,
+            block_table,
+            candidates,
+            candidate_lengths,
+            "main",
+        )
+
+        target_parity = 1 - active_parity
+        old_target_coverage = self._graph_coverage[slots, target_parity]
+        is_anchor = valid_rows & phase.eq(self.config.anchor_phase)
+        target_coverage = torch.where(
+            is_anchor, kv_lengths_l, old_target_coverage
+        )
+        self._graph_coverage.index_put_(
+            (slots, target_parity), target_coverage
+        )
+
+        if self.config.q_mode == "fixed":
+            assert self._anchor_q is not None
+            assert self._anchor_weights is not None
+            anchor_mask_q = is_anchor.reshape(batch_size, 1, 1)
+            anchor_mask_w = is_anchor.reshape(batch_size, 1)
+            old_q = self._anchor_q.index_select(0, slots)
+            old_weights = self._anchor_weights.index_select(0, slots)
+            self._anchor_q.index_copy_(
+                0, slots, torch.where(anchor_mask_q, q_fp8, old_q)
+            )
+            self._anchor_weights.index_copy_(
+                0, slots, torch.where(anchor_mask_w, weights, old_weights)
+            )
+
+        jobs_per_row = self.config.chunks_per_step
+        job_rows = rows.repeat_interleave(jobs_per_row)
+        job_slots = slots.repeat_interleave(jobs_per_row)
+        job_parities = target_parity.repeat_interleave(jobs_per_row)
+        job_coverage = target_coverage.repeat_interleave(jobs_per_row)
+        chunk_offsets = torch.arange(
+            jobs_per_row, device=device, dtype=torch.long
+        ).repeat(batch_size)
+        if self.config.profile == "A":
+            job_chunks = phase.repeat_interleave(jobs_per_row)
+            refresh_enabled = valid_rows.repeat_interleave(jobs_per_row)
+        else:
+            first_chunk = (
+                phase - self.config.anchor_phase
+            ) * self.config.chunks_per_step
+            job_chunks = (
+                first_chunk.repeat_interleave(jobs_per_row) + chunk_offsets
+            ).clamp(min=0, max=self.config.chunks - 1)
+            refresh_enabled = (
+                valid_rows & phase.ge(self.config.anchor_phase)
+            ).repeat_interleave(jobs_per_row)
+
+        starts = torch.div(
+            job_coverage * job_chunks,
+            self.config.chunks,
+            rounding_mode="floor",
+        )
+        ends = torch.div(
+            job_coverage * (job_chunks + 1),
+            self.config.chunks,
+            rounding_mode="floor",
+        )
+        refresh_lengths = (ends - starts).to(torch.int32)
+        max_chunk_width = (
+            graph_max_seq_len + self.config.chunks - 1
+        ) // self.config.chunks
+        refresh_offsets = torch.arange(
+            max_chunk_width, device=device, dtype=torch.long
+        )
+        refresh_candidates = starts.unsqueeze(1) + refresh_offsets.unsqueeze(0)
+        refresh_tables = block_table.index_select(0, job_rows)
+        (
+            candidate_cache,
+            candidate_block_table,
+            padded_width,
+        ) = prepare_candidates(
+            refresh_tables, refresh_candidates, refresh_lengths
+        )
+
+        if self.config.q_mode == "fixed":
+            assert self._anchor_q is not None
+            assert self._anchor_weights is not None
+            refresh_q = self._anchor_q.index_select(0, job_slots)
+            refresh_weights = self._anchor_weights.index_select(0, job_slots)
+        else:
+            refresh_q = q_fp8.index_select(0, job_rows)
+            refresh_weights = weights.index_select(0, job_rows)
+        refreshed_topk = score_materialized(
+            refresh_q,
+            refresh_weights,
+            candidate_cache,
+            candidate_block_table,
+            padded_width,
+            refresh_candidates,
+            refresh_lengths,
+            "refresh",
+        )
+        old_chunks = self._pools[job_slots, job_parities, job_chunks]
+        refreshed_topk = torch.where(
+            refresh_enabled.unsqueeze(1), refreshed_topk, old_chunks
+        )
+        self._pools.index_put_(
+            (job_slots, job_parities, job_chunks),
+            refreshed_topk,
+            accumulate=False,
+        )
+        return result
+
     def try_compute(
         self,
         q_fp8: torch.Tensor,
@@ -605,14 +883,41 @@ class DecodeIndexerPool:
         prepare_candidates: PrepareCandidateFn,
         score_materialized: ScoreMaterializedFn,
         select_topk: SelectTopkFn,
+        graph_max_seq_len: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         batch_size = block_table.shape[0]
+        if bool(getattr(attention_inputs, "is_cuda_graph", False)):
+            if bool(getattr(attention_inputs, "is_speculative", False)) or bool(
+                getattr(attention_inputs, "is_target_verify", False)
+            ):
+                return None
+            return self._try_compute_cuda_graph(
+                q_fp8,
+                weights,
+                block_table,
+                lengths,
+                attention_inputs,
+                candidate_score,
+                prepare_candidates,
+                score_materialized,
+                graph_max_seq_len,
+            )
         if not self._supported(q_fp8, attention_inputs, batch_size):
             return None
 
         request_ids = attention_inputs.decode_request_id.tolist()
         decode_steps = attention_inputs.decode_step.tolist()
         kv_lengths = attention_inputs.decode_kv_length.tolist()
+        pool_slots_tensor = getattr(
+            attention_inputs, "decode_indexer_pool_slot", None
+        )
+        pool_slots: List[Optional[int]] = [None] * batch_size
+        if isinstance(pool_slots_tensor, torch.Tensor):
+            if pool_slots_tensor.is_cuda or pool_slots_tensor.numel() != batch_size:
+                return None
+            pool_slots = [int(slot) for slot in pool_slots_tensor.tolist()]
+            if any(slot < 0 for slot in pool_slots):
+                return None
         if len(set(request_ids)) != len(request_ids):
             _log_once(
                 "decode-indexer-pool-multibeam",
@@ -636,9 +941,15 @@ class DecodeIndexerPool:
             for row in eligible_rows
             if int(request_ids[row]) not in self._states
         )
-        self._ensure_capacity(
-            len(self._states) + new_request_count, q_fp8, weights
-        )
+        required_capacity = len(self._states) + new_request_count
+        preferred_slots = [
+            pool_slots[row]
+            for row in eligible_rows
+            if pool_slots[row] is not None
+        ]
+        if preferred_slots:
+            required_capacity = max(required_capacity, max(preferred_slots) + 1)
+        self._ensure_capacity(required_capacity, q_fp8, weights)
 
         exact_rows: List[int] = []
         pool_rows: List[int] = []
@@ -649,6 +960,7 @@ class DecodeIndexerPool:
             request_id = int(request_ids[row])
             decode_step = int(decode_steps[row])
             kv_length = int(kv_lengths[row])
+            preferred_slot = pool_slots[row]
             state = self._states.get(request_id)
             if kv_length < self.config.pool_size:
                 if state is not None:
@@ -659,10 +971,24 @@ class DecodeIndexerPool:
                 continue
 
             if state is None:
-                state = self._new_state(request_id)
+                state = self._new_state(
+                    request_id, q_fp8.device, preferred_slot
+                )
                 needs_bootstrap = True
             else:
-                needs_bootstrap = (
+                slot_changed = (
+                    preferred_slot is not None and state.slot != preferred_slot
+                )
+                if slot_changed:
+                    self._wait_pending(state, q_fp8.device)
+                    old_slot = state.slot
+                    state.slot = self._claim_slot(
+                        request_id, q_fp8.device, preferred_slot
+                    )
+                    if old_slot != state.slot:
+                        self._free_slots.append(old_slot)
+                    self._reset_state(state, q_fp8.device)
+                needs_bootstrap = slot_changed or (
                     decode_step != state.last_step + 1
                     or kv_length != state.last_kv_length + 1
                 )
@@ -677,7 +1003,7 @@ class DecodeIndexerPool:
             if not needs_bootstrap:
                 coverage = state.coverage[state.active_parity]
                 recent = kv_length - coverage
-                if recent < 0 or recent > self.config.interval:
+                if recent < 0 or recent > self.config.max_recent_tokens:
                     self._reset_state(state, q_fp8.device)
                     needs_bootstrap = True
 
@@ -694,6 +1020,55 @@ class DecodeIndexerPool:
             dtype=torch.int32,
             device=q_fp8.device,
         )
+
+        dump_dir = os.environ.get("RTP_LLM_DECODE_INDEXER_POOL_DUMP_DIR", "")
+        dump_layer = int(os.environ.get("RTP_LLM_DECODE_INDEXER_POOL_DUMP_LAYER", "-1"))
+        dump_steps = int(os.environ.get("RTP_LLM_DECODE_INDEXER_POOL_DUMP_STEPS", "0"))
+        dump_active = bool(dump_dir) and self.layer_idx == dump_layer and dump_steps > 0
+
+        def dump_step(
+            row: int,
+            exact_logits_row: torch.Tensor,
+            exact_topk_row: torch.Tensor,
+            pool_topk_row: Optional[torch.Tensor] = None,
+            candidates_row: Optional[torch.Tensor] = None,
+            candidate_length: int = 0,
+        ) -> None:
+            step = int(decode_steps[row])
+            if not dump_active or step < 0 or step >= dump_steps:
+                return
+            os.makedirs(dump_dir, exist_ok=True)
+            request_id = int(request_ids[row])
+            path = os.path.join(
+                dump_dir,
+                f"layer_{self.layer_idx:02d}_request_{request_id}_step_{step:03d}.pt",
+            )
+            if os.path.exists(path):
+                return
+            score_length = int(lengths[row])
+            payload = {
+                "layer_idx": self.layer_idx,
+                "request_id": request_id,
+                "decode_step": step,
+                "kv_length": int(kv_lengths[row]),
+                "score_length": score_length,
+                "exact_logits": exact_logits_row[:score_length]
+                .detach()
+                .to(torch.float16)
+                .cpu(),
+                "exact_topk": exact_topk_row.detach().to(torch.int32).cpu(),
+                "pool_topk": (
+                    pool_topk_row.detach().to(torch.int32).cpu()
+                    if pool_topk_row is not None
+                    else torch.empty(0, dtype=torch.int32)
+                ),
+                "candidates": (
+                    candidates_row[:candidate_length].detach().to(torch.int32).cpu()
+                    if candidates_row is not None
+                    else torch.empty(0, dtype=torch.int32)
+                ),
+            }
+            torch.save(payload, path)
 
         if pool_rows:
             assert self._pools is not None
@@ -736,14 +1111,36 @@ class DecodeIndexerPool:
                 device=q_fp8.device,
                 dtype=torch.int32,
             )
+            pool_q = q_fp8.index_select(0, rows_d)
+            pool_weights = weights.index_select(0, rows_d)
+            pool_block_table = block_table.index_select(0, rows_d)
             pool_topk = candidate_score(
-                q_fp8.index_select(0, rows_d),
-                weights.index_select(0, rows_d),
-                block_table.index_select(0, rows_d),
+                pool_q,
+                pool_weights,
+                pool_block_table,
                 candidates,
                 candidate_lengths,
                 "main",
             )
+            if dump_active:
+                exact_logits_pool, exact_topk_pool = exact_score(
+                    pool_q,
+                    pool_weights,
+                    pool_block_table,
+                    lengths.index_select(0, rows_d),
+                )
+                for position, row in enumerate(pool_rows):
+                    dump_step(
+                        row,
+                        exact_logits_pool[position],
+                        exact_topk_pool[position],
+                        pool_topk[position],
+                        candidates[position],
+                        int(candidate_lengths[position]),
+                    )
+                # Keep generation on the exact trajectory while pool state and
+                # refresh logic continue to run for all 128 diagnostic steps.
+                pool_topk = exact_topk_pool
             result.index_copy_(0, rows_d, pool_topk)
 
         if exact_rows:
@@ -755,6 +1152,13 @@ class DecodeIndexerPool:
                 lengths.index_select(0, rows_d),
             )
             result.index_copy_(0, rows_d, exact_topk)
+            if dump_active:
+                for position, row in enumerate(exact_rows):
+                    dump_step(
+                        row,
+                        exact_logits[position],
+                        exact_topk[position],
+                    )
             bootstrap_positions = [
                 position
                 for position, row in enumerate(exact_rows)

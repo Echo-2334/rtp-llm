@@ -273,6 +273,101 @@ PyWrappedModel::~PyWrappedModel() {
 }
 
 // Helper function to build PyAttentionInputs from GptModelInputs
+void PyWrappedModel::assignDecodeIndexerPoolSlots(torch_ext::PyAttentionInputs& py_attn_inputs) {
+    if (!decode_indexer_pool_enabled_ || py_attn_inputs.is_prefill || py_attn_inputs.is_speculative
+        || py_attn_inputs.is_target_verify) {
+        return;
+    }
+
+    const auto& request_ids = py_attn_inputs.decode_request_id;
+    const auto& decode_steps = py_attn_inputs.decode_step;
+    const auto& kv_lengths   = py_attn_inputs.decode_kv_length;
+    if (!request_ids.defined() || !decode_steps.defined() || !kv_lengths.defined() || request_ids.is_cuda()
+        || decode_steps.is_cuda() || kv_lengths.is_cuda() || request_ids.scalar_type() != torch::kInt64
+        || decode_steps.scalar_type() != torch::kInt32 || kv_lengths.scalar_type() != torch::kInt32
+        || request_ids.numel() != decode_steps.numel() || request_ids.numel() != kv_lengths.numel()) {
+        py_attn_inputs.indexer_pool_bootstrap = true;
+        return;
+    }
+
+    const int64_t count = request_ids.numel();
+    auto slots = torch::empty(
+        {count}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+    auto* slot_ptr = slots.data_ptr<int32_t>();
+    const auto* request_ptr = request_ids.data_ptr<int64_t>();
+    const auto* step_ptr    = decode_steps.data_ptr<int32_t>();
+    const auto* kv_ptr      = kv_lengths.data_ptr<int32_t>();
+
+    std::lock_guard<std::mutex> lock(decode_indexer_pool_mutex_);
+    ++decode_indexer_pool_tick_;
+    std::unordered_set<int64_t> current_ids;
+    current_ids.reserve(static_cast<size_t>(count));
+    for (int64_t row = 0; row < count; ++row) {
+        current_ids.insert(request_ptr[row]);
+    }
+
+    constexpr int32_t kPoolSize = 16 * 1024;
+    bool              bootstrap = false;
+    for (int64_t row = 0; row < count; ++row) {
+        const int64_t request_id = request_ptr[row];
+        const int32_t step       = step_ptr[row];
+        const int32_t kv_length  = kv_ptr[row];
+        const bool    eligible   = kv_length >= kPoolSize;
+        auto          it         = decode_indexer_pool_slots_.find(request_id);
+
+        if (it == decode_indexer_pool_slots_.end()) {
+            int32_t slot = -1;
+            if (!decode_indexer_pool_free_slots_.empty()) {
+                slot = decode_indexer_pool_free_slots_.back();
+                decode_indexer_pool_free_slots_.pop_back();
+            } else {
+                auto victim = decode_indexer_pool_slots_.end();
+                for (auto candidate = decode_indexer_pool_slots_.begin(); candidate != decode_indexer_pool_slots_.end();
+                     ++candidate) {
+                    if (current_ids.count(candidate->first) != 0) {
+                        continue;
+                    }
+                    if (victim == decode_indexer_pool_slots_.end()
+                        || candidate->second.last_seen_tick < victim->second.last_seen_tick) {
+                        victim = candidate;
+                    }
+                }
+                if (victim != decode_indexer_pool_slots_.end()) {
+                    slot = victim->second.slot;
+                    decode_indexer_pool_slots_.erase(victim);
+                }
+            }
+            if (slot < 0) {
+                slot_ptr[row] = -1;
+                bootstrap     = true;
+                continue;
+            }
+            DecodeIndexerPoolSlotState state;
+            state.slot           = slot;
+            state.last_step      = step;
+            state.last_kv_length = kv_length;
+            state.eligible       = eligible;
+            state.last_seen_tick = decode_indexer_pool_tick_;
+            it = decode_indexer_pool_slots_.emplace(request_id, state).first;
+            bootstrap = true;
+        } else {
+            auto& state      = it->second;
+            const bool same  = step == state.last_step && kv_length == state.last_kv_length;
+            const bool next  = step == state.last_step + 1 && kv_length == state.last_kv_length + 1;
+            bootstrap        = bootstrap || (!same && !next) || (eligible && !state.eligible);
+            state.last_step      = step;
+            state.last_kv_length = kv_length;
+            state.eligible       = eligible;
+            state.last_seen_tick = decode_indexer_pool_tick_;
+        }
+        slot_ptr[row] = it->second.slot;
+    }
+
+    py_attn_inputs.decode_indexer_pool_slot = slots;
+    py_attn_inputs.indexer_pool_bootstrap   = bootstrap;
+    buffer_holder_.hold_host(slots);
+}
+
 torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs");
     c10::DeviceGuard             runtime_device_guard(getTorchCudaDevice());
@@ -358,12 +453,14 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     }
 
     // Calculate cu_seqlens
-    int    batch_size               = py_attn_inputs.input_lengths.size(0);
-    size_t context_batch_size       = py_attn_inputs.prefix_lengths.size(0);
-    size_t decode_batch_size        = py_attn_inputs.sequence_lengths.size(0);
-    py_attn_inputs.dtype            = dataTypeToTorchType(description_.data_type);
-    py_attn_inputs.is_prefill       = !decode_batch_size;
-    py_attn_inputs.is_target_verify = inputs.is_target_verify;
+    int    batch_size                 = py_attn_inputs.input_lengths.size(0);
+    size_t context_batch_size         = py_attn_inputs.prefix_lengths.size(0);
+    size_t decode_batch_size          = py_attn_inputs.sequence_lengths.size(0);
+    py_attn_inputs.dtype              = dataTypeToTorchType(description_.data_type);
+    py_attn_inputs.is_prefill         = !decode_batch_size;
+    py_attn_inputs.is_target_verify   = inputs.is_target_verify;
+    py_attn_inputs.mtp_iteration_step = inputs.mtp_iteration_step;
+    assignDecodeIndexerPoolSlots(py_attn_inputs);
     RTP_LLM_CHECK_WITH_INFO(
         context_batch_size + decode_batch_size == batch_size,
         "batch size check failed context_batch_size[%ld] decode_batch_size[%ld] total_batch_size[%ld]",

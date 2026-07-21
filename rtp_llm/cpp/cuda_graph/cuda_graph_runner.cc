@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <c10/core/DeviceGuard.h>
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -18,6 +21,14 @@ namespace rtp_llm {
 namespace {
 
 const bool kDebugSyncCudaGraphReplayEnabled = std::getenv("RTP_LLM_DEBUG_SYNC_CUDA_GRAPH_REPLAY") != nullptr;
+const bool kDecodeIndexerPoolEnabled = []() {
+    const char* value = std::getenv("RTP_LLM_DECODE_INDEXER_POOL_PROFILE");
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string profile(value);
+    return profile == "A" || profile == "B" || profile == "a" || profile == "b";
+}();
 
 class ScopedCudaGraphForwardFlag {
 public:
@@ -467,6 +478,16 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
                                           state.current_batch_size + 1,
                                           captured_batch_capacity + 1,
                                           last_valid);
+            addCudaGraphPrepareFillRegion(fill_params,
+                                          py_model_inputs_.attention_inputs.decode_step,
+                                          state.current_batch_size,
+                                          captured_batch_capacity,
+                                          0);
+            addCudaGraphPrepareFillRegion(fill_params,
+                                          py_model_inputs_.attention_inputs.decode_kv_length,
+                                          state.current_batch_size,
+                                          captured_batch_capacity,
+                                          0);
         }
         invokeCudaGraphPrepareFill(fill_params, cuda_graph::graphGetCurrentStream().stream());
     }
@@ -546,6 +567,18 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
     {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(fused_d2d_copy)");
         launchFusedD2DCopies(d2d_copies, strided_d2d_copies);
+    }
+
+    if (!is_prefill_cuda_graph_mode_ && kDecodeIndexerPoolEnabled) {
+        optimizedCopyAsync(inputs.attention_inputs.decode_step,
+                           py_model_inputs_.attention_inputs.decode_step,
+                           state.current_batch_size * sizeof(int32_t));
+        optimizedCopyAsync(inputs.attention_inputs.decode_kv_length,
+                           py_model_inputs_.attention_inputs.decode_kv_length,
+                           state.current_batch_size * sizeof(int32_t));
+        optimizedCopyAsync(inputs.attention_inputs.decode_indexer_pool_slot,
+                           py_model_inputs_.attention_inputs.decode_indexer_pool_slot,
+                           state.current_batch_size * sizeof(int32_t));
     }
 
     // NOTE: we do H2H after D2D copies to let GPU finish the D2D copies as soon as possible,
@@ -820,6 +853,35 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
         return false;
     }
 
+    if (kDecodeIndexerPoolEnabled && !is_prefill_cuda_graph_mode_ && !target_verify_decode) {
+        const auto& attn = inputs.attention_inputs;
+        if (attn.is_speculative || attn.indexer_pool_bootstrap) {
+            return false;
+        }
+        const auto& request_ids = attn.decode_request_id;
+        const auto& kv_lengths  = attn.decode_kv_length;
+        const auto& pool_slots  = attn.decode_indexer_pool_slot;
+        if (!request_ids.defined() || !kv_lengths.defined() || !pool_slots.defined() || request_ids.is_cuda()
+            || kv_lengths.is_cuda() || pool_slots.is_cuda() || request_ids.scalar_type() != torch::kInt64
+            || kv_lengths.scalar_type() != torch::kInt32 || pool_slots.scalar_type() != torch::kInt32
+            || request_ids.numel() != kv_lengths.numel() || request_ids.numel() != pool_slots.numel()) {
+            return false;
+        }
+        std::unordered_set<int64_t> unique_ids;
+        const auto* request_ptr = request_ids.data_ptr<int64_t>();
+        const auto* kv_ptr      = kv_lengths.data_ptr<int32_t>();
+        const auto* slot_ptr    = pool_slots.data_ptr<int32_t>();
+        for (int64_t row = 0; row < request_ids.numel(); ++row) {
+            if (kv_ptr[row] < 16 * 1024 || slot_ptr[row] < 0 || !unique_ids.insert(request_ptr[row]).second) {
+                return false;
+            }
+        }
+        static std::once_flag pool_graph_admission_log;
+        std::call_once(pool_graph_admission_log, []() {
+            std::cout << "decode indexer candidate pool admitted to steady CUDA graph replay" << std::endl;
+        });
+    }
+
     if (!inputs.attention_inputs.kv_cache_kernel_block_id_device_by_group.empty()) {
         const size_t group = inputs.attention_inputs.kv_cache_kernel_block_id_device_by_group.size();
         RTP_LLM_CHECK_WITH_INFO(kv_cache_group_num_ > 0,
@@ -952,6 +1014,11 @@ void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_
     inputs.attention_inputs.is_s_padded               = true;
     inputs.attention_inputs.sequence_lengths_plus_1_d = torch::zeros({int(max_bs_)}, options_cuda_int32_);
     inputs.attention_inputs.decode_cu_seqlens_d       = torch::arange(0, max_bs_ + 1, 1, options_cuda_int32_);
+    if (kDecodeIndexerPoolEnabled && !is_prefill_cuda_graph_mode_ && !is_target_verify_) {
+        inputs.attention_inputs.decode_step = torch::zeros({int(max_bs_)}, options_cuda_int32_);
+        inputs.attention_inputs.decode_kv_length = torch::full({int(max_bs_)}, 16 * 1024, options_cuda_int32_);
+        inputs.attention_inputs.decode_indexer_pool_slot = torch::arange(0, max_bs_, 1, options_cuda_int32_);
+    }
 }
 
 void CudaGraphRunner::initCaptureAttentionInputsPost() {
@@ -1292,6 +1359,15 @@ void CudaGraphRunner::prepareCaptureInputs(PyModelInputs& inputs, int batch_size
         capture_mem_hold_.py_model_inputs_.attention_inputs.sequence_lengths_plus_1_d.slice(0, 0, batch_size);
 
     const auto& cap_attn = capture_mem_hold_.py_model_inputs_.attention_inputs;
+    if (kDecodeIndexerPoolEnabled && !is_prefill_cuda_graph_mode_ && !is_target_verify_) {
+        RTP_LLM_CHECK_WITH_INFO(cap_attn.decode_step.defined() && cap_attn.decode_kv_length.defined()
+                                    && cap_attn.decode_indexer_pool_slot.defined(),
+                                "decode indexer pool capture metadata is undefined");
+        inputs.attention_inputs.decode_step = cap_attn.decode_step.slice(0, 0, batch_size);
+        inputs.attention_inputs.decode_kv_length = cap_attn.decode_kv_length.slice(0, 0, batch_size);
+        inputs.attention_inputs.decode_indexer_pool_slot =
+            cap_attn.decode_indexer_pool_slot.slice(0, 0, batch_size);
+    }
     inputs.attention_inputs.kv_cache_kernel_block_id_device_by_group.clear();
     if (!cap_attn.kv_cache_kernel_block_id_device_by_group.empty()) {
         const size_t group = cap_attn.kv_cache_kernel_block_id_device_by_group.size();
