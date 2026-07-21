@@ -8,9 +8,11 @@ from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_pool_update impo
     initialize_global_pool_inverse_map,
 )
 from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_score import (
+    sparse_fp8_mqa_append_logits,
     sparse_fp8_mqa_logits,
     sparse_fp8_mqa_pool_chunk_logits,
 )
+from rtp_llm.ops.compute_ops import rtp_llm_ops
 
 
 class SparseIndexerPoolKernelsTest(TestCase):
@@ -127,6 +129,9 @@ class SparseIndexerPoolKernelsTest(TestCase):
         pool_slots = torch.tensor(
             [2, 0], device=self.device, dtype=torch.int32
         )
+        slotted_lengths = torch.empty(
+            batch, device=self.device, dtype=torch.int32
+        )
         slotted_actual = sparse_fp8_mqa_pool_chunk_logits(
             q,
             weights,
@@ -137,6 +142,7 @@ class SparseIndexerPoolKernelsTest(TestCase):
             chunk,
             chunk_lengths,
             pool_slots=pool_slots,
+            candidate_lengths_out=slotted_lengths,
         )
         torch.cuda.synchronize()
 
@@ -151,6 +157,85 @@ class SparseIndexerPoolKernelsTest(TestCase):
             torch.testing.assert_close(
                 slotted_actual[row], actual[row], rtol=0, atol=0
             )
+        torch.testing.assert_close(slotted_lengths, combined_lengths)
+
+        scheduled_pool = torch.zeros(
+            4, 16 * 1024, device=self.device, dtype=torch.int32
+        )
+        scheduled_pool[:batch].copy_(pool)
+        scheduled_lengths = torch.tensor(
+            [4096, 6144, 0, 0], device=self.device, dtype=torch.int32
+        )
+        scheduled_slots = torch.tensor(
+            [0, 1], device=self.device, dtype=torch.int32
+        )
+        decode_steps = torch.tensor(
+            [1, 5], device=self.device, dtype=torch.int32
+        )
+        kv_lengths = torch.full(
+            (batch,), seq_len, device=self.device, dtype=torch.int32
+        )
+        (
+            scheduled_logits,
+            scheduled_topk_lengths,
+            scheduled_starts,
+            scheduled_chunk_lengths,
+            safe_slots,
+            scheduled_active,
+        ) = sparse_fp8_mqa_append_logits(
+            q,
+            weights,
+            kv_cache,
+            block_table,
+            scheduled_pool,
+            scheduled_lengths,
+            scheduled_slots,
+            decode_steps,
+            kv_lengths,
+            min_kv_length=4096,
+            source_chunks=16,
+            graph_max_seq_len=seq_len,
+            dummy_slot_base=2,
+        )
+        expected_starts = torch.tensor(
+            [0, 4096], device=self.device, dtype=torch.int32
+        )
+        expected_chunk_lengths = torch.full(
+            (batch,), 1024, device=self.device, dtype=torch.int32
+        )
+        scheduled_chunks = expected_starts.unsqueeze(1) + torch.arange(
+            1024, device=self.device, dtype=torch.int32
+        ).unsqueeze(0)
+        scheduled_reference = sparse_fp8_mqa_pool_chunk_logits(
+            q,
+            weights,
+            kv_cache,
+            block_table,
+            scheduled_pool,
+            scheduled_lengths,
+            scheduled_chunks,
+            expected_chunk_lengths,
+            pool_slots=scheduled_slots,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(scheduled_logits, scheduled_reference, rtol=0, atol=0)
+        torch.testing.assert_close(scheduled_starts, expected_starts, rtol=0, atol=0)
+        torch.testing.assert_close(
+            scheduled_chunk_lengths, expected_chunk_lengths, rtol=0, atol=0
+        )
+        torch.testing.assert_close(safe_slots, scheduled_slots, rtol=0, atol=0)
+        torch.testing.assert_close(
+            scheduled_active,
+            torch.ones_like(scheduled_active),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            scheduled_topk_lengths,
+            scheduled_lengths[:batch] + expected_chunk_lengths,
+            rtol=0,
+            atol=0,
+        )
 
     def test_append_and_compact_preserve_inverse_map(self):
         seq_len = 32 * 1024
@@ -176,6 +261,8 @@ class SparseIndexerPoolKernelsTest(TestCase):
             pool_lengths[:, None]
             + torch.arange(2048, device=self.device, dtype=torch.int32)
         ).contiguous()
+        pool_slots = torch.zeros(1, device=self.device, dtype=torch.int32)
+        active_mask = torch.ones(1, device=self.device, dtype=torch.int32)
 
         selected = append_global_pool_from_pool_chunk_topk(
             local_topk,
@@ -184,15 +271,20 @@ class SparseIndexerPoolKernelsTest(TestCase):
             chunk,
             chunk_lengths,
             inverse_map,
+            pool_slots,
+            active_mask,
         )
         torch.cuda.synchronize()
         self.assertEqual(pool_lengths.item(), 10 * 1024)
         torch.testing.assert_close(selected, chunk[:, :2048])
-        torch.testing.assert_close(pool[0, 8192 : 10 * 1024], chunk[0, :2048])
-        torch.testing.assert_close(
-            inverse_map[0, chunk[0, :2048]],
-            torch.arange(8193, 10 * 1024 + 1, device=self.device, dtype=torch.int32),
+        self.assertEqual(
+            set(pool[0, 8192 : 10 * 1024].cpu().tolist()),
+            set(chunk[0, :2048].cpu().tolist()),
         )
+        appended_slots = inverse_map[0, chunk[0, :2048]]
+        self.assertTrue((appended_slots >= 8193).all())
+        self.assertTrue((appended_slots <= 10 * 1024).all())
+        self.assertEqual(torch.unique(appended_slots).numel(), 2048)
 
         full_pool = torch.arange(
             16 * 1024, device=self.device, dtype=torch.int32
@@ -215,6 +307,203 @@ class SparseIndexerPoolKernelsTest(TestCase):
         torch.testing.assert_close(
             full_inverse[0, 8192 : 16 * 1024],
             torch.arange(1, 8193, device=self.device, dtype=torch.int32),
+        )
+
+    def test_fused_topk_pool_matches_separate_postprocess(self):
+        batch = 2
+        topk = 2048
+        candidate_width = 24 * 1024
+        pool_capacity = 16 * 1024
+        initial_pool_size = 8 * 1024
+        max_seq_len = 32 * 1024
+
+        initial_pool = torch.zeros(
+            batch, pool_capacity, device=self.device, dtype=torch.int32
+        )
+        initial_pool[0, :initial_pool_size] = torch.arange(
+            0, initial_pool_size, device=self.device, dtype=torch.int32
+        )
+        initial_pool[1, :initial_pool_size] = torch.arange(
+            16 * 1024,
+            24 * 1024,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        initial_lengths = torch.full(
+            (batch,), initial_pool_size, device=self.device, dtype=torch.int32
+        )
+        chunk = torch.stack(
+            (
+                torch.arange(
+                    8 * 1024, 16 * 1024, device=self.device, dtype=torch.int32
+                ),
+                torch.arange(
+                    24 * 1024, 32 * 1024, device=self.device, dtype=torch.int32
+                ),
+            )
+        )
+        chunk_lengths = torch.full(
+            (batch,), 8 * 1024, device=self.device, dtype=torch.int32
+        )
+        pool_slots = torch.tensor([1, 0], device=self.device, dtype=torch.int32)
+        active_mask = torch.tensor([1, 0], device=self.device, dtype=torch.int32)
+        candidate_lengths = torch.full(
+            (batch,), 16 * 1024, device=self.device, dtype=torch.int32
+        )
+        logits = torch.randn(
+            batch, candidate_width, device=self.device, dtype=torch.float32
+        )
+        logits[:, 16 * 1024 :].fill_(-float("inf"))
+
+        reference_pool = initial_pool.clone()
+        reference_lengths = initial_lengths.clone()
+        reference_inverse = initialize_global_pool_inverse_map(
+            reference_pool, max_seq_len, reference_lengths
+        )
+        local_topk = torch.empty(
+            batch, topk, device=self.device, dtype=torch.int32
+        )
+        reference_workspace = torch.empty(
+            1 << 20, device=self.device, dtype=torch.uint8
+        )
+        rtp_llm_ops.dsv4_persistent_topk(
+            logits,
+            candidate_lengths,
+            local_topk,
+            reference_workspace,
+            topk,
+            candidate_width,
+        )
+        reference_output = append_global_pool_from_pool_chunk_topk(
+            local_topk,
+            reference_pool,
+            reference_lengths,
+            chunk,
+            chunk_lengths,
+            reference_inverse,
+            pool_slots,
+            active_mask,
+        )
+
+        fused_pool = initial_pool.clone()
+        fused_lengths = initial_lengths.clone()
+        fused_inverse = initialize_global_pool_inverse_map(
+            fused_pool, max_seq_len, fused_lengths
+        )
+        fused_output = torch.empty_like(local_topk)
+        fused_workspace = torch.empty_like(reference_workspace)
+        rtp_llm_ops.dsv4_persistent_topk_pool(
+            logits,
+            candidate_lengths,
+            fused_output,
+            fused_workspace,
+            candidate_width,
+            fused_pool,
+            fused_lengths,
+            chunk,
+            chunk_lengths,
+            fused_inverse,
+            pool_slots,
+            active_mask,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(fused_lengths, reference_lengths, rtol=0, atol=0)
+        for row in range(batch):
+            self.assertEqual(
+                set(fused_output[row].cpu().tolist()),
+                set(reference_output[row].cpu().tolist()),
+            )
+        for pool_slot in range(batch):
+            pool_length = int(fused_lengths[pool_slot].item())
+            self.assertEqual(
+                set(fused_pool[pool_slot, :pool_length].cpu().tolist()),
+                set(reference_pool[pool_slot, :pool_length].cpu().tolist()),
+            )
+            ids = fused_pool[pool_slot, :pool_length].to(torch.long)
+            positions = fused_inverse[pool_slot, ids].to(torch.long) - 1
+            torch.testing.assert_close(
+                fused_pool[pool_slot, positions], ids.to(torch.int32), rtol=0, atol=0
+            )
+
+    def test_fused_topk_compacts_full_pool_after_selection(self):
+        topk = 2048
+        pool_capacity = 16 * 1024
+        keep_size = 8 * 1024
+        chunk_size = 8 * 1024
+        candidate_width = pool_capacity + chunk_size
+        max_seq_len = candidate_width
+
+        initial_pool = torch.arange(
+            pool_capacity, device=self.device, dtype=torch.int32
+        ).unsqueeze(0)
+        pool = initial_pool.clone()
+        pool_lengths = torch.tensor(
+            [pool_capacity], device=self.device, dtype=torch.int32
+        )
+        inverse_map = initialize_global_pool_inverse_map(
+            pool, max_seq_len, pool_lengths
+        )
+        chunk = torch.arange(
+            pool_capacity,
+            candidate_width,
+            device=self.device,
+            dtype=torch.int32,
+        ).unsqueeze(0)
+        chunk_lengths = torch.tensor(
+            [chunk_size], device=self.device, dtype=torch.int32
+        )
+        candidate_lengths = torch.tensor(
+            [candidate_width], device=self.device, dtype=torch.int32
+        )
+        logits = torch.randn(
+            1, candidate_width, device=self.device, dtype=torch.float32
+        )
+        expected_local = torch.topk(
+            logits, topk, dim=1, sorted=False
+        ).indices.to(torch.int32)
+        expected_ids = torch.gather(
+            torch.cat((initial_pool, chunk), dim=1),
+            1,
+            expected_local.to(torch.long),
+        )
+
+        output = torch.empty(
+            1, topk, device=self.device, dtype=torch.int32
+        )
+        workspace = torch.empty(
+            1 << 20, device=self.device, dtype=torch.uint8
+        )
+        rtp_llm_ops.dsv4_persistent_topk_pool(
+            logits,
+            candidate_lengths,
+            output,
+            workspace,
+            candidate_width,
+            pool,
+            pool_lengths,
+            chunk,
+            chunk_lengths,
+            inverse_map,
+            torch.tensor([0], device=self.device, dtype=torch.int32),
+            torch.tensor([1], device=self.device, dtype=torch.int32),
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            set(output[0].cpu().tolist()), set(expected_ids[0].cpu().tolist())
+        )
+        retained = set(range(keep_size, pool_capacity))
+        expected_pool = retained | set(expected_ids[0].cpu().tolist())
+        pool_length = int(pool_lengths[0].item())
+        self.assertEqual(pool_length, len(expected_pool))
+        self.assertEqual(
+            set(pool[0, :pool_length].cpu().tolist()), expected_pool
+        )
+        ids = pool[0, :pool_length].to(torch.long)
+        positions = inverse_map[0, ids].to(torch.long) - 1
+        torch.testing.assert_close(
+            pool[0, positions], ids.to(torch.int32), rtol=0, atol=0
         )
 
 

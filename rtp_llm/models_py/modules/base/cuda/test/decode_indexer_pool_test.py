@@ -320,6 +320,43 @@ class DecodeIndexerCudaGraphTest(TestCase):
             raise SkipTest("CUDA is required")
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
+        self.topk_workspace = torch.empty(
+            1 << 20, dtype=torch.uint8, device=self.device
+        )
+
+    def _fused_pool_topk(
+        self,
+        logits,
+        lengths,
+        max_seq_len,
+        lane,
+        pool,
+        pool_lengths,
+        chunk,
+        chunk_lengths,
+        inverse_map,
+        pool_slots,
+        active_mask,
+    ):
+        del lane
+        output = torch.empty(
+            (logits.shape[0], 2048), dtype=torch.int32, device=logits.device
+        )
+        rtp_llm_ops.dsv4_persistent_topk_pool(
+            logits,
+            lengths,
+            output,
+            self.topk_workspace,
+            max_seq_len,
+            pool,
+            pool_lengths,
+            chunk,
+            chunk_lengths,
+            inverse_map,
+            pool_slots,
+            active_mask,
+        )
+        return output
 
     def test_first_graph_call_initializes_slots_and_replays(self):
         config = DecodeIndexerPoolConfig(
@@ -584,10 +621,14 @@ class DecodeIndexerCudaGraphTest(TestCase):
             chunk,
             chunk_lengths,
             slots,
+            candidate_lengths,
         ):
             width = global_pool.shape[1] + chunk.shape[1]
             positions = torch.arange(width, device=self.device).unsqueeze(0)
             current_lengths = global_lengths.index_select(0, slots).unsqueeze(1)
+            candidate_lengths.copy_(
+                global_lengths.index_select(0, slots) + chunk_lengths
+            )
             return -(positions - current_lengths).abs().to(torch.float32)
 
         def unused(*args):
@@ -606,6 +647,7 @@ class DecodeIndexerCudaGraphTest(TestCase):
                 graph_max_seq_len,
                 pool_chunk_score,
                 select_topk,
+                self._fused_pool_topk,
             )
 
         graph = torch.cuda.CUDAGraph()
@@ -714,11 +756,18 @@ class DecodeIndexerCudaGraphTest(TestCase):
             chunk,
             chunk_lengths,
             slots,
+            candidate_lengths,
         ):
             observed_chunk_lengths.append(chunk_lengths)
             width = global_pool.shape[1] + chunk.shape[1]
             positions = torch.arange(width, device=self.device).unsqueeze(0)
             current_lengths = global_lengths.index_select(0, slots).unsqueeze(1)
+            candidate_lengths.copy_(
+                torch.clamp(
+                    global_lengths.index_select(0, slots) + chunk_lengths,
+                    min=1,
+                )
+            )
             return -(positions - current_lengths).abs().to(torch.float32)
 
         def unused(*args):
@@ -742,6 +791,7 @@ class DecodeIndexerCudaGraphTest(TestCase):
                 select_topk,
                 pool_chunk_score,
                 graph_max_seq_len,
+                self._fused_pool_topk,
             )
             assert result is not None
             return result

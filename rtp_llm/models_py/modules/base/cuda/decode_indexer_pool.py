@@ -67,8 +67,49 @@ PoolChunkScoreFn = Callable[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ],
     torch.Tensor,
+]
+PoolChunkTopkFn = Callable[
+    [
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        str,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    torch.Tensor,
+]
+ScheduledPoolChunkScoreFn = Callable[
+    [
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        int,
+        int,
+    ],
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
 ]
 
 
@@ -1039,6 +1080,8 @@ class DecodeIndexerPool:
         select_topk: SelectTopkFn,
         graph_max_seq_len: int,
         active_mask: Optional[torch.Tensor] = None,
+        pool_chunk_topk: Optional[PoolChunkTopkFn] = None,
+        scheduled_pool_chunk_score: Optional[ScheduledPoolChunkScoreFn] = None,
     ) -> torch.Tensor:
         from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_pool_update import (
             append_global_pool_from_pool_chunk_topk,
@@ -1075,25 +1118,70 @@ class DecodeIndexerPool:
         assert self._append_pool_lengths is not None
         assert self._append_inverse_map is not None
 
-        rows = torch.arange(batch_size, device=device, dtype=torch.long)
+        if (
+            active_mask is None
+            and pool_chunk_topk is not None
+            and scheduled_pool_chunk_score is not None
+        ):
+            (
+                logits,
+                topk_lengths,
+                chunk_starts,
+                chunk_lengths,
+                slots,
+                active_mask_i32,
+            ) = scheduled_pool_chunk_score(
+                q_fp8,
+                weights,
+                block_table,
+                self._append_pools,
+                self._append_pool_lengths,
+                slots_input,
+                decode_steps,
+                kv_lengths,
+                self._graph_slot_base,
+                self.config.min_kv_length,
+                self.config.chunks,
+                graph_max_seq_len,
+            )
+            candidate_width = self.config.max_pool_size + (
+                graph_max_seq_len + self.config.chunks - 1
+            ) // self.config.chunks
+            return pool_chunk_topk(
+                logits,
+                topk_lengths,
+                candidate_width,
+                "main",
+                self._append_pools,
+                self._append_pool_lengths,
+                chunk_starts,
+                chunk_lengths,
+                self._append_inverse_map,
+                slots,
+                active_mask_i32,
+            )
+
+        rows = torch.arange(batch_size, device=device, dtype=torch.int32)
         kv_lengths_l = kv_lengths.to(torch.long)
-        slots_l = slots_input.to(torch.long)
-        valid_rows = (kv_lengths_l > self.config.min_kv_length) & slots_l.ge(0)
+        valid_rows = (kv_lengths_l > self.config.min_kv_length) & slots_input.ge(0)
         if active_mask is not None:
             valid_rows = valid_rows & active_mask.ne(0)
         active_mask_i32 = valid_rows.to(torch.int32)
         dummy_slots = rows + self._graph_slot_base
-        slots = torch.where(valid_rows, slots_l, dummy_slots).clamp(
+        slots = torch.where(valid_rows, slots_input, dummy_slots).clamp(
             min=0, max=self._capacity - 1
         )
 
-        compact_append_pool_if_full(
-            self._append_pools,
-            self._append_pool_lengths,
-            self._append_inverse_map,
-            slots,
-            active_mask_i32,
-        )
+        # The fused TopK path compacts a full pool after selecting from it. The
+        # fallback path retains the original pre-score two-kernel compaction.
+        if pool_chunk_topk is None:
+            compact_append_pool_if_full(
+                self._append_pools,
+                self._append_pool_lengths,
+                self._append_inverse_map,
+                slots,
+                active_mask_i32,
+            )
 
         safe_kv_lengths = torch.where(
             valid_rows,
@@ -1124,6 +1212,7 @@ class DecodeIndexerPool:
         chunk_indices = starts.unsqueeze(1) + offsets.unsqueeze(0)
         chunk_indices = chunk_indices.clamp(max=graph_max_seq_len - 1).to(torch.int32)
 
+        topk_lengths = torch.empty_like(chunk_lengths)
         logits = pool_chunk_score(
             q_fp8,
             weights,
@@ -1133,13 +1222,23 @@ class DecodeIndexerPool:
             chunk_indices,
             chunk_lengths,
             slots,
+            topk_lengths,
         )
         candidate_width = self.config.max_pool_size + max_chunk_width
-        topk_lengths = torch.where(
-            valid_rows,
-            torch.full_like(kv_lengths, candidate_width),
-            torch.ones_like(kv_lengths),
-        ).to(torch.int32)
+        if pool_chunk_topk is not None:
+            return pool_chunk_topk(
+                logits,
+                topk_lengths,
+                candidate_width,
+                "main",
+                self._append_pools,
+                self._append_pool_lengths,
+                chunk_indices,
+                chunk_lengths,
+                self._append_inverse_map,
+                slots,
+                active_mask_i32,
+            )
         local_topk = select_topk(
             logits,
             topk_lengths,
@@ -1167,6 +1266,7 @@ class DecodeIndexerPool:
         pool_chunk_score: PoolChunkScoreFn,
         select_topk: SelectTopkFn,
         graph_max_seq_len: int,
+        pool_chunk_topk: Optional[PoolChunkTopkFn] = None,
     ) -> torch.Tensor:
         """Run per-row exact/bootstrap and sparse pool work in one fixed graph."""
         batch_size = block_table.shape[0]
@@ -1220,6 +1320,7 @@ class DecodeIndexerPool:
             select_topk,
             graph_max_seq_len,
             sparse_rows.to(torch.int32),
+            pool_chunk_topk,
         )
         return torch.where(sparse_rows.unsqueeze(1), sparse_topk, exact_topk)
 
@@ -1236,6 +1337,8 @@ class DecodeIndexerPool:
         graph_max_seq_len: Optional[int],
         pool_chunk_score: Optional[PoolChunkScoreFn] = None,
         select_topk: Optional[SelectTopkFn] = None,
+        pool_chunk_topk: Optional[PoolChunkTopkFn] = None,
+        scheduled_pool_chunk_score: Optional[ScheduledPoolChunkScoreFn] = None,
     ) -> torch.Tensor:
         """Emit the fixed-shape steady-state data path during graph capture.
 
@@ -1257,6 +1360,8 @@ class DecodeIndexerPool:
                 pool_chunk_score,
                 select_topk,
                 graph_max_seq_len,
+                pool_chunk_topk=pool_chunk_topk,
+                scheduled_pool_chunk_score=scheduled_pool_chunk_score,
             )
         slots_input = getattr(attention_inputs, "decode_indexer_pool_slot", None)
         decode_steps = getattr(attention_inputs, "decode_step", None)
@@ -1445,6 +1550,8 @@ class DecodeIndexerPool:
         select_topk: SelectTopkFn,
         pool_chunk_score: Optional[PoolChunkScoreFn] = None,
         graph_max_seq_len: Optional[int] = None,
+        pool_chunk_topk: Optional[PoolChunkTopkFn] = None,
+        scheduled_pool_chunk_score: Optional[ScheduledPoolChunkScoreFn] = None,
     ) -> Optional[torch.Tensor]:
         batch_size = block_table.shape[0]
         if bool(getattr(attention_inputs, "is_cuda_graph", False)):
@@ -1480,6 +1587,7 @@ class DecodeIndexerPool:
                     pool_chunk_score,
                     select_topk,
                     graph_max_seq_len,
+                    pool_chunk_topk,
                 )
             if not pool_graph_mode:
                 return None
@@ -1495,6 +1603,8 @@ class DecodeIndexerPool:
                 graph_max_seq_len,
                 pool_chunk_score,
                 select_topk,
+                pool_chunk_topk,
+                scheduled_pool_chunk_score,
             )
         if self.config.profile == "APPEND":
             return None

@@ -706,6 +706,39 @@ class IndexerOp(nn.Module):
         )
         return topk_result
 
+    def _select_persistent_topk_pool(
+        self,
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        max_seq_len: int,
+        lane: str,
+        pool: torch.Tensor,
+        pool_lengths: torch.Tensor,
+        chunk: torch.Tensor,
+        chunk_lengths: torch.Tensor,
+        inverse_map: torch.Tensor,
+        pool_slots: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_result = logits.new_empty(
+            (logits.shape[0], self.index_topk), dtype=torch.int32
+        )
+        rtp_llm_ops.dsv4_persistent_topk_pool(
+            logits,
+            lengths,
+            topk_result,
+            _get_topk_workspace(logits.device, lane),
+            max_seq_len,
+            pool,
+            pool_lengths,
+            chunk,
+            chunk_lengths,
+            inverse_map,
+            pool_slots,
+            active_mask,
+        )
+        return topk_result
+
     def _paged_score_logits(
         self,
         q_fp8: torch.Tensor,
@@ -998,6 +1031,7 @@ class IndexerOp(nn.Module):
         chunk_indices: torch.Tensor,
         chunk_lengths: torch.Tensor,
         pool_slots: torch.Tensor,
+        candidate_lengths_out: torch.Tensor,
     ) -> torch.Tensor:
         if not (
             self.blocksize == 64
@@ -1025,6 +1059,43 @@ class IndexerOp(nn.Module):
             chunk_indices,
             chunk_lengths,
             pool_slots=pool_slots,
+            candidate_lengths_out=candidate_lengths_out,
+        )
+
+    def _score_paged_append_logits(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        block_table: torch.Tensor,
+        pool: torch.Tensor,
+        pool_lengths: torch.Tensor,
+        pool_slots: torch.Tensor,
+        decode_steps: torch.Tensor,
+        kv_lengths: torch.Tensor,
+        dummy_slot_base: int,
+        min_kv_length: int,
+        source_chunks: int,
+        graph_max_seq_len: int,
+    ):
+        from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_score import (
+            sparse_fp8_mqa_append_logits,
+        )
+
+        return sparse_fp8_mqa_append_logits(
+            q_fp8,
+            weights,
+            kv_cache_fp8,
+            block_table,
+            pool,
+            pool_lengths,
+            pool_slots,
+            decode_steps,
+            kv_lengths,
+            min_kv_length=min_kv_length,
+            source_chunks=source_chunks,
+            graph_max_seq_len=graph_max_seq_len,
+            dummy_slot_base=dummy_slot_base,
         )
 
     def _get_topk_paged(
@@ -1126,7 +1197,7 @@ class IndexerOp(nn.Module):
                     ),
                     score_materialized=self._score_materialized_candidates,
                     select_topk=self._select_persistent_topk,
-                    pool_chunk_score=lambda q, w, table, pool, pool_lens, chunk, chunk_lens, slots: (
+                    pool_chunk_score=lambda q, w, table, pool, pool_lens, chunk, chunk_lens, slots, candidate_lens: (
                         self._score_paged_pool_chunk_logits(
                             q,
                             w,
@@ -1137,9 +1208,28 @@ class IndexerOp(nn.Module):
                             chunk,
                             chunk_lens,
                             slots,
+                            candidate_lens,
                         )
                     ),
                     graph_max_seq_len=block_table.shape[1] * self.blocksize,
+                    pool_chunk_topk=self._select_persistent_topk_pool,
+                    scheduled_pool_chunk_score=lambda q, w, table, pool, pool_lens, slots, steps, kv_lens, dummy_base, min_kv, chunks, max_seq: (
+                        self._score_paged_append_logits(
+                            q,
+                            w,
+                            kv_cache_fp8,
+                            table,
+                            pool,
+                            pool_lens,
+                            slots,
+                            steps,
+                            kv_lens,
+                            dummy_base,
+                            min_kv,
+                            chunks,
+                            max_seq,
+                        )
+                    ),
                 )
                 if pooled_topk is not None:
                     return pooled_topk

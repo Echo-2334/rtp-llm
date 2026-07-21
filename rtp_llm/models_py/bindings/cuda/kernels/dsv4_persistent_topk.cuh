@@ -126,6 +126,19 @@ struct PersistentTopKParams {
     uint32_t       chunk_size;      // large path: elements per CTA
     uint32_t       ctas_per_group;  // 1=medium, >1=large
     uint32_t       max_seq_len;     // max seq_len across all rows (for early CTA exit)
+    int32_t*        pool;
+    int32_t*        pool_lengths;
+    const int32_t*  chunk;
+    const int32_t*  chunk_lengths;
+    int32_t*        inverse_map;
+    const int32_t*  pool_slots;
+    const int32_t*  active_mask;
+    uint32_t        pool_stride;
+    uint32_t        chunk_stride;
+    uint32_t        inverse_map_stride;
+    uint32_t        pool_capacity;
+    bool            chunk_is_range;
+    bool            fuse_pool_postprocess;
 };
 
 // ============================================================================
@@ -846,6 +859,101 @@ __device__ void radix_topk(const float* __restrict__ row_input,
 // see filtered_topk.cuh)
 // ============================================================================
 
+template<int TopK>
+__device__ void pool_topk_postprocess(const PersistentTopKParams& params,
+                                      uint32_t                    row_idx,
+                                      int32_t*                    row_output,
+                                      uint32_t*                   local_histogram,
+                                      uint32_t*                   shared_scalars,
+                                      uint32_t                    tx) {
+    static_assert(TopK == 2048, "pool postprocess is specialized for TopK=2048");
+    if (params.active_mask[row_idx] == 0) {
+        for (uint32_t i = tx; i < TopK; i += kThreadsPerBlock) {
+            row_output[i] = -1;
+        }
+        return;
+    }
+
+    if (tx == 0) {
+        shared_scalars[0] = static_cast<uint32_t>(params.pool_slots[row_idx]);
+        shared_scalars[1] = static_cast<uint32_t>(params.chunk_lengths[row_idx]);
+        shared_scalars[2] = 0;
+    }
+    __syncthreads();
+    const uint32_t pool_slot    = shared_scalars[0];
+    const uint32_t chunk_length = shared_scalars[1];
+    if (tx == 0) {
+        shared_scalars[2] = static_cast<uint32_t>(params.pool_lengths[pool_slot]);
+        local_histogram[0] = 0;
+    }
+    __syncthreads();
+    const uint32_t old_pool_length = shared_scalars[2];
+
+    // Resolve local pool/chunk positions before an optional in-kernel
+    // compaction changes the physical pool layout.
+    for (uint32_t i = tx; i < TopK; i += kThreadsPerBlock) {
+        const int32_t local_position = row_output[i];
+        const bool    from_pool      =
+            local_position >= 0 && static_cast<uint32_t>(local_position) < old_pool_length;
+        int32_t selected_id = -1;
+        if (from_pool) {
+            selected_id = params.pool[pool_slot * params.pool_stride + static_cast<uint32_t>(local_position)];
+        } else {
+            const int32_t chunk_position = local_position - static_cast<int32_t>(old_pool_length);
+            if (chunk_position >= 0 && static_cast<uint32_t>(chunk_position) < chunk_length) {
+                selected_id = params.chunk_is_range ?
+                                  params.chunk[row_idx] + chunk_position :
+                                  params.chunk[row_idx * params.chunk_stride + static_cast<uint32_t>(chunk_position)];
+            }
+        }
+        row_output[i] = selected_id;
+    }
+    __syncthreads();
+
+    // A full 16K pool is compacted only on the low-frequency full step. Keep
+    // its newest half, then append every selected ID that the compaction
+    // evicted (plus new chunk selections). This avoids two pre-score graph
+    // nodes on every steady decode step.
+    if (old_pool_length >= params.pool_capacity) {
+        const uint32_t keep_size   = params.pool_capacity / 2;
+        const uint32_t keep_offset = params.pool_capacity - keep_size;
+        for (uint32_t i = tx; i < keep_size; i += kThreadsPerBlock) {
+            const int32_t evicted_id = params.pool[pool_slot * params.pool_stride + i];
+            const int32_t kept_id    = params.pool[pool_slot * params.pool_stride + keep_offset + i];
+            params.inverse_map[pool_slot * params.inverse_map_stride + evicted_id] = 0;
+            params.pool[pool_slot * params.pool_stride + i]                        = kept_id;
+            params.inverse_map[pool_slot * params.inverse_map_stride + kept_id] = static_cast<int32_t>(i + 1);
+        }
+        __syncthreads();
+        if (tx == 0) {
+            shared_scalars[2] = keep_size;
+        }
+    }
+    if (tx == 0) {
+        local_histogram[0] = 0;
+    }
+    __syncthreads();
+    const uint32_t pool_length = shared_scalars[2];
+
+    for (uint32_t i = tx; i < TopK; i += kThreadsPerBlock) {
+        const int32_t selected_id = row_output[i];
+        if (selected_id >= 0 && params.inverse_map[pool_slot * params.inverse_map_stride + selected_id] == 0) {
+            const uint32_t append_rank = atomicAdd(&local_histogram[0], 1u);
+            if (pool_length + append_rank < params.pool_capacity) {
+                const uint32_t append_slot = pool_length + append_rank;
+                params.pool[pool_slot * params.pool_stride + append_slot] = selected_id;
+                params.inverse_map[pool_slot * params.inverse_map_stride + selected_id] =
+                    static_cast<int32_t>(append_slot + 1);
+            }
+        }
+    }
+    __syncthreads();
+    if (tx == 0) {
+        const uint32_t appended = min(local_histogram[0], params.pool_capacity - pool_length);
+        params.pool_lengths[pool_slot] = static_cast<int32_t>(pool_length + appended);
+    }
+}
+
 template<int TopK = 2048, uint32_t VEC_SIZE = 1>
 __global__ void __launch_bounds__(kThreadsPerBlock, 2) persistent_topk_kernel(PersistentTopKParams params) {
     const uint32_t            tx = threadIdx.x;
@@ -905,6 +1013,16 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2) persistent_topk_kernel(Pe
                 } else {
                     histogram_256_topk<TopK>(row_input, row_output, 0, seq_len);
                 }
+                if constexpr (TopK == 2048) {
+                    if (params.fuse_pool_postprocess) {
+                        // The APPEND path selects from pool+chunk candidates (normally
+                        // 16K), so it stays on this single-CTA TopK path. Reuse the
+                        // TopK shared memory after every producer thread has finished.
+                        __syncthreads();
+                        pool_topk_postprocess<TopK>(
+                            params, row_idx, row_output, local_histogram, shared_scalars, tx);
+                    }
+                }
             }
             continue;
         }
@@ -925,6 +1043,31 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2) persistent_topk_kernel(Pe
                                    barrier_phase,
                                    iter,
                                    tx);
+        if constexpr (TopK == 2048) {
+            if (params.fuse_pool_postprocess) {
+                __syncthreads();
+                if (tx == 0) {
+                    red_release(&state->arrival_counter, 1);
+                }
+                wait_ge(&state->arrival_counter,
+                        (barrier_phase + 1) * static_cast<int>(ctas_per_group),
+                        tx);
+                barrier_phase++;
+                __syncthreads();
+                if (cta_in_group == 0) {
+                    pool_topk_postprocess<TopK>(
+                        params, row_idx, row_output, local_histogram, shared_scalars, tx);
+                }
+                __syncthreads();
+                if (tx == 0) {
+                    red_release(&state->arrival_counter, 1);
+                }
+                wait_ge(&state->arrival_counter,
+                        (barrier_phase + 1) * static_cast<int>(ctas_per_group),
+                        tx);
+                barrier_phase++;
+            }
+        }
     }
 }
 

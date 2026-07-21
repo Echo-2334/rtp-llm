@@ -924,6 +924,9 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
             int64_t                     exact_rows       = 0;
             int64_t                     sparse_rows      = 0;
             int64_t                     bootstrap_rows   = 0;
+            int64_t                     invalid_slots    = 0;
+            int32_t                     min_kv            = std::numeric_limits<int32_t>::max();
+            int32_t                     max_kv            = 0;
             std::unordered_set<int64_t> unique_ids;
             const auto* request_ptr = request_ids.data_ptr<int64_t>();
             const auto* kv_ptr      = kv_lengths.data_ptr<int32_t>();
@@ -940,6 +943,9 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
                 exact_rows += !eligible;
                 sparse_rows += row_sparse;
                 bootstrap_rows += row_bootstrap;
+                invalid_slots += slot_ptr[row] < 0;
+                min_kv = std::min(min_kv, kv_ptr[row]);
+                max_kv = std::max(max_kv, kv_ptr[row]);
             }
             state.use_decode_indexer_pool_graph      = unique && any_sparse && !any_exact;
             state.use_decode_indexer_bootstrap_graph =
@@ -951,11 +957,16 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
                                          : state.use_decode_indexer_bootstrap_graph ? "hybrid"
                                                                                     : "exact";
                 RTP_LLM_LOG_INFO(
-                    "decode indexer batch: real_bs=%ld bootstrap=%ld sparse=%ld exact=%ld cuda_graph_path=%s",
+                    "decode indexer batch: real_bs=%ld bootstrap=%ld sparse=%ld exact=%ld "
+                    "kv_min=%d kv_max=%d min_kv=%d invalid_slots=%ld cuda_graph_path=%s",
                     request_ids.numel(),
                     bootstrap_rows,
                     sparse_rows,
                     exact_rows,
+                    min_kv,
+                    max_kv,
+                    kDecodeIndexerPoolMinKvLength,
+                    invalid_slots,
                     graph_path);
             }
         }

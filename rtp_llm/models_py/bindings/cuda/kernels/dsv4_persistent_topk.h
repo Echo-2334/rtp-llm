@@ -34,4 +34,17 @@ void dsv4_persistent_topk(const torch::Tensor& logits,
                           int64_t              k,
                           int64_t              max_seq_len);
 
+void dsv4_persistent_topk_pool(const torch::Tensor& logits,
+                               const torch::Tensor& lengths,
+                               torch::Tensor&       output,
+                               torch::Tensor&       workspace,
+                               int64_t              max_seq_len,
+                               torch::Tensor&       pool,
+                               torch::Tensor&       pool_lengths,
+                               const torch::Tensor& chunk,
+                               const torch::Tensor& chunk_lengths,
+                               torch::Tensor&       inverse_map,
+                               const torch::Tensor& pool_slots,
+                               const torch::Tensor& active_mask);
+
 }  // namespace torch_ext

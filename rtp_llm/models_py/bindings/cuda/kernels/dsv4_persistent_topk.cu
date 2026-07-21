@@ -19,12 +19,28 @@ namespace torch_ext {
 namespace {
 
 #ifndef USE_ROCM
+struct PoolPostprocessArgs {
+    int32_t*       pool;
+    int32_t*       pool_lengths;
+    const int32_t* chunk;
+    const int32_t* chunk_lengths;
+    int32_t*       inverse_map;
+    const int32_t* pool_slots;
+    const int32_t* active_mask;
+    uint32_t       pool_stride;
+    uint32_t       chunk_stride;
+    uint32_t       inverse_map_stride;
+    uint32_t       pool_capacity;
+    bool           chunk_is_range;
+};
+
 template<int TopK>
 void launch_persistent_topk(const torch::Tensor& logits,
                             const torch::Tensor& lengths,
                             torch::Tensor&       output,
                             torch::Tensor&       workspace,
-                            int64_t              max_seq_len) {
+                            int64_t              max_seq_len,
+                            const PoolPostprocessArgs* pool_args = nullptr) {
     namespace P = vllm::persistent;
 
     const int64_t num_rows = logits.size(0);
@@ -40,6 +56,7 @@ void launch_persistent_topk(const torch::Tensor& logits,
         cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     }
 
+    TORCH_CHECK(pool_args == nullptr || num_rows <= 32, "fused pool TopK supports at most 32 rows");
     if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
         cudaError_t status = vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(logits.data_ptr<float>(),
                                                                                      output.data_ptr<int32_t>(),
@@ -161,7 +178,7 @@ void launch_persistent_topk(const torch::Tensor& logits,
                         cudaGetErrorString(mz_err));
         }
 
-        P::PersistentTopKParams params;
+        P::PersistentTopKParams params{};
         params.input          = logits.data_ptr<float>();
         params.output         = output.data_ptr<int32_t>();
         params.lengths        = lengths.data_ptr<int32_t>();
@@ -172,6 +189,21 @@ void launch_persistent_topk(const torch::Tensor& logits,
         params.row_states     = reinterpret_cast<P::RadixRowState*>(workspace.data_ptr<uint8_t>());
         params.ctas_per_group = ctas_per_group;
         params.max_seq_len    = static_cast<uint32_t>(max_seq_len);
+        if (pool_args != nullptr) {
+            params.pool                    = pool_args->pool;
+            params.pool_lengths            = pool_args->pool_lengths;
+            params.chunk                   = pool_args->chunk;
+            params.chunk_lengths           = pool_args->chunk_lengths;
+            params.inverse_map             = pool_args->inverse_map;
+            params.pool_slots              = pool_args->pool_slots;
+            params.active_mask             = pool_args->active_mask;
+            params.pool_stride             = pool_args->pool_stride;
+            params.chunk_stride            = pool_args->chunk_stride;
+            params.inverse_map_stride      = pool_args->inverse_map_stride;
+            params.pool_capacity           = pool_args->pool_capacity;
+            params.chunk_is_range           = pool_args->chunk_is_range;
+            params.fuse_pool_postprocess   = true;
+        }
 
 #define LAUNCH_PERSISTENT(TOPK_VAL, VS)                                                                                \
     do {                                                                                                               \
@@ -233,6 +265,64 @@ void dsv4_persistent_topk(const torch::Tensor& logits,
     }
 #else
     TORCH_CHECK(false, "dsv4_persistent_topk is not supported on ROCm");
+#endif
+}
+
+void dsv4_persistent_topk_pool(const torch::Tensor& logits,
+                               const torch::Tensor& lengths,
+                               torch::Tensor&       output,
+                               torch::Tensor&       workspace,
+                               int64_t              max_seq_len,
+                               torch::Tensor&       pool,
+                               torch::Tensor&       pool_lengths,
+                               const torch::Tensor& chunk,
+                               const torch::Tensor& chunk_lengths,
+                               torch::Tensor&       inverse_map,
+                               const torch::Tensor& pool_slots,
+                               const torch::Tensor& active_mask) {
+#ifndef USE_ROCM
+    TORCH_CHECK(logits.is_cuda() && lengths.is_cuda() && output.is_cuda() && workspace.is_cuda()
+                    && pool.is_cuda() && pool_lengths.is_cuda() && chunk.is_cuda() && chunk_lengths.is_cuda()
+                    && inverse_map.is_cuda() && pool_slots.is_cuda() && active_mask.is_cuda(),
+                "fused pool TopK tensors must be CUDA tensors");
+    TORCH_CHECK(logits.dtype() == torch::kFloat32 && lengths.dtype() == torch::kInt32
+                    && output.dtype() == torch::kInt32 && workspace.dtype() == torch::kUInt8,
+                "invalid fused pool TopK score tensors");
+    TORCH_CHECK(pool.dtype() == torch::kInt32 && pool_lengths.dtype() == torch::kInt32
+                    && chunk.dtype() == torch::kInt32 && chunk_lengths.dtype() == torch::kInt32
+                    && inverse_map.dtype() == torch::kInt32 && pool_slots.dtype() == torch::kInt32
+                    && active_mask.dtype() == torch::kInt32,
+                "fused pool TopK state tensors must be int32");
+    TORCH_CHECK(logits.dim() == 2 && lengths.numel() == logits.size(0), "invalid logits or lengths shape");
+    TORCH_CHECK(output.size(0) == logits.size(0) && output.size(1) == 2048,
+                "fused pool TopK output must be [B,2048]");
+    TORCH_CHECK(pool.dim() == 2 && pool_lengths.dim() == 1 && inverse_map.dim() == 2,
+                "invalid fused pool state dimensions");
+    TORCH_CHECK((chunk.dim() == 1 || chunk.dim() == 2) && chunk.size(0) == logits.size(0)
+                    && chunk_lengths.numel() == logits.size(0) && pool_slots.numel() == logits.size(0)
+                    && active_mask.numel() == logits.size(0),
+                "fused pool TopK batch mismatch");
+    TORCH_CHECK(logits.stride(1) == 1 && output.is_contiguous() && pool.stride(1) == 1
+                    && (chunk.dim() == 1 || chunk.stride(1) == 1) && inverse_map.stride(1) == 1,
+                "fused pool TopK rows must be contiguous");
+
+    PoolPostprocessArgs pool_args{
+        pool.data_ptr<int32_t>(),
+        pool_lengths.data_ptr<int32_t>(),
+        chunk.data_ptr<int32_t>(),
+        chunk_lengths.data_ptr<int32_t>(),
+        inverse_map.data_ptr<int32_t>(),
+        pool_slots.data_ptr<int32_t>(),
+        active_mask.data_ptr<int32_t>(),
+        static_cast<uint32_t>(pool.stride(0)),
+        static_cast<uint32_t>(chunk.dim() == 1 ? 0 : chunk.stride(0)),
+        static_cast<uint32_t>(inverse_map.stride(0)),
+        static_cast<uint32_t>(pool.size(1)),
+        chunk.dim() == 1,
+    };
+    launch_persistent_topk<2048>(logits, lengths, output, workspace, max_seq_len, &pool_args);
+#else
+    TORCH_CHECK(false, "dsv4_persistent_topk_pool is not supported on ROCm");
 #endif
 }
 

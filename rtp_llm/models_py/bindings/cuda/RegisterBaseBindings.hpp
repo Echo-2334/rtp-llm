@@ -265,6 +265,22 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("k"),
                   py::arg("max_seq_len"));
 
+    rtp_ops_m.def("dsv4_persistent_topk_pool",
+                  &dsv4_persistent_topk_pool,
+                  "Persistent Top2K fused with APPEND pool postprocessing",
+                  py::arg("logits"),
+                  py::arg("lengths"),
+                  py::arg("output"),
+                  py::arg("workspace"),
+                  py::arg("max_seq_len"),
+                  py::arg("pool"),
+                  py::arg("pool_lengths"),
+                  py::arg("chunk"),
+                  py::arg("chunk_lengths"),
+                  py::arg("inverse_map"),
+                  py::arg("pool_slots"),
+                  py::arg("active_mask"));
+
     // Vendored from vLLM (csrc/sampler.cu::top_k_per_row_prefill).
     // Per-row TopK over [row_starts[r], row_ends[r]); returned indices
     // are relative to row_starts[r], padded with -1 past the per-row
