@@ -1077,6 +1077,7 @@ class IndexerOp(nn.Module):
         min_kv_length: int,
         source_chunks: int,
         graph_max_seq_len: int,
+        external_active: Optional[torch.Tensor] = None,
     ):
         from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_score import (
             sparse_fp8_mqa_append_logits,
@@ -1096,7 +1097,275 @@ class IndexerOp(nn.Module):
             source_chunks=source_chunks,
             graph_max_seq_len=graph_max_seq_len,
             dummy_slot_base=dummy_slot_base,
+            external_active=external_active,
         )
+
+    def _score_paged_packed_pool_step(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        block_table: torch.Tensor,
+        pool_ids: torch.Tensor,
+        inverse_map: torch.Tensor,
+        packed_kv: torch.Tensor,
+        packed_ready: torch.Tensor,
+        protected: torch.Tensor,
+        cursor: torch.Tensor,
+        pool_slots_input: torch.Tensor,
+        decode_steps: torch.Tensor,
+        kv_lengths: torch.Tensor,
+        dummy_slot_base: int,
+        min_kv_length: int,
+        source_chunks: int,
+        graph_max_seq_len: int,
+        external_active: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the fixed materialized 8K pool plus contiguous-chunk path."""
+        from rtp_llm.models_py.triton_kernels.sparse_mla.packed_indexer_pool import (
+            PACKED_POOL_SIZE,
+            combine_pool_chunk_logits,
+            gather_packed_pool_kv_persistent,
+            initialize_missing_packed_pool,
+            prepare_packed_pool_metadata,
+            update_fixed_packed_pool,
+        )
+
+        (
+            rows,
+            pool_slots,
+            active_mask,
+            initialize_mask,
+            pool_lengths,
+            packed_block_table,
+            chunk_starts,
+            chunk_lengths,
+            chunk_offsets,
+            window_lengths,
+            window_block_table,
+        ) = prepare_packed_pool_metadata(
+            block_table,
+            pool_slots_input,
+            decode_steps,
+            kv_lengths,
+            packed_ready,
+            dummy_slot_base=dummy_slot_base,
+            min_kv_length=min_kv_length,
+            source_chunks=source_chunks,
+            graph_max_seq_len=graph_max_seq_len,
+            external_active=external_active,
+        )
+        fixed_pool_ids = pool_ids[:, :PACKED_POOL_SIZE]
+
+        initialize_missing_packed_pool(
+            kv_cache_fp8,
+            block_table,
+            fixed_pool_ids,
+            pool_slots,
+            initialize_mask,
+            pool_lengths,
+            packed_ready,
+            packed_kv,
+        )
+
+        pool_logits = self._paged_score_logits(
+            q_fp8,
+            weights,
+            packed_kv,
+            packed_block_table,
+            pool_lengths,
+            PACKED_POOL_SIZE,
+        )
+
+        chunk_capacity = (graph_max_seq_len + source_chunks - 1) // source_chunks
+        window_width = (
+            (chunk_capacity + 2 * self.blocksize - 2) // self.blocksize
+        ) * self.blocksize
+        chunk_logits = self._paged_score_logits(
+            q_fp8,
+            weights,
+            kv_cache_fp8,
+            window_block_table,
+            window_lengths,
+            window_width,
+        )
+
+        combined_logits, candidate_lengths = combine_pool_chunk_logits(
+            pool_logits,
+            chunk_logits,
+            fixed_pool_ids,
+            pool_slots,
+            chunk_starts,
+            chunk_lengths,
+            chunk_offsets,
+            active_mask,
+            chunk_capacity,
+        )
+        local_topk = self._select_persistent_topk(
+            combined_logits,
+            candidate_lengths,
+            combined_logits.shape[1],
+            "main",
+        )
+        result, changed_ids, changed_positions, changed_counts = (
+            update_fixed_packed_pool(
+                local_topk,
+                fixed_pool_ids,
+                inverse_map,
+                pool_slots,
+                chunk_starts,
+                decode_steps,
+                active_mask,
+                protected,
+                cursor,
+            )
+        )
+        gather_packed_pool_kv_persistent(
+            kv_cache_fp8,
+            block_table,
+            changed_ids,
+            rows,
+            changed_positions,
+            changed_counts,
+            pool_slots,
+            active_mask,
+            packed_kv,
+        )
+        return result
+
+    def _score_paged_packed_append_pool_step(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        block_table: torch.Tensor,
+        pool_ids: torch.Tensor,
+        pool_lengths: torch.Tensor,
+        inverse_map: torch.Tensor,
+        packed_kv: torch.Tensor,
+        packed_ready: torch.Tensor,
+        packed_base_offsets: torch.Tensor,
+        pool_slots_input: torch.Tensor,
+        decode_steps: torch.Tensor,
+        kv_lengths: torch.Tensor,
+        dummy_slot_base: int,
+        min_kv_length: int,
+        source_chunks: int,
+        graph_max_seq_len: int,
+        external_active: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run V1 append semantics with a ring-backed materialized K pool."""
+        from rtp_llm.models_py.triton_kernels.sparse_mla.packed_indexer_pool import (
+            PACKED_APPEND_POOL_SIZE,
+            combine_append_pool_chunk_logits,
+            gather_packed_pool_kv_persistent,
+            initialize_missing_packed_append_pool,
+            prepare_packed_append_pool_metadata,
+            update_materialized_append_pool,
+        )
+
+        (
+            rows,
+            pool_slots,
+            active_mask,
+            initialize_mask,
+            score_pool_lengths,
+            packed_block_table,
+            chunk_starts,
+            chunk_lengths,
+            chunk_offsets,
+            window_lengths,
+            window_block_table,
+        ) = prepare_packed_append_pool_metadata(
+            block_table,
+            pool_slots_input,
+            decode_steps,
+            kv_lengths,
+            pool_lengths,
+            packed_ready,
+            packed_base_offsets,
+            dummy_slot_base=dummy_slot_base,
+            min_kv_length=min_kv_length,
+            source_chunks=source_chunks,
+            graph_max_seq_len=graph_max_seq_len,
+            external_active=external_active,
+        )
+        initialize_missing_packed_append_pool(
+            kv_cache_fp8,
+            block_table,
+            pool_ids,
+            pool_slots,
+            initialize_mask,
+            score_pool_lengths,
+            packed_ready,
+            packed_base_offsets,
+            packed_kv,
+        )
+
+        pool_logits = self._paged_score_logits(
+            q_fp8,
+            weights,
+            packed_kv,
+            packed_block_table,
+            score_pool_lengths,
+            PACKED_APPEND_POOL_SIZE,
+        )
+        chunk_capacity = (graph_max_seq_len + source_chunks - 1) // source_chunks
+        window_width = (
+            (chunk_capacity + 2 * self.blocksize - 2) // self.blocksize
+        ) * self.blocksize
+        chunk_logits = self._paged_score_logits(
+            q_fp8,
+            weights,
+            kv_cache_fp8,
+            window_block_table,
+            window_lengths,
+            window_width,
+        )
+        combined_logits, candidate_lengths = combine_append_pool_chunk_logits(
+            pool_logits,
+            chunk_logits,
+            pool_ids,
+            pool_slots,
+            score_pool_lengths,
+            chunk_starts,
+            chunk_lengths,
+            chunk_offsets,
+            active_mask,
+            chunk_capacity,
+        )
+        local_topk = self._select_persistent_topk(
+            combined_logits,
+            candidate_lengths,
+            combined_logits.shape[1],
+            "main",
+        )
+        result, changed_ids, changed_positions, changed_counts = (
+            update_materialized_append_pool(
+                local_topk,
+                pool_ids,
+                pool_lengths,
+                inverse_map,
+                pool_slots,
+                chunk_starts,
+                active_mask,
+                packed_base_offsets,
+            )
+        )
+        gather_packed_pool_kv_persistent(
+            kv_cache_fp8,
+            block_table,
+            changed_ids,
+            rows,
+            changed_positions,
+            changed_counts,
+            pool_slots,
+            active_mask,
+            packed_kv,
+            destination_base_offsets=packed_base_offsets,
+            pool_capacity=PACKED_APPEND_POOL_SIZE,
+        )
+        return result
 
     def _get_topk_paged(
         self,
@@ -1213,7 +1482,7 @@ class IndexerOp(nn.Module):
                     ),
                     graph_max_seq_len=block_table.shape[1] * self.blocksize,
                     pool_chunk_topk=self._select_persistent_topk_pool,
-                    scheduled_pool_chunk_score=lambda q, w, table, pool, pool_lens, slots, steps, kv_lens, dummy_base, min_kv, chunks, max_seq: (
+                    scheduled_pool_chunk_score=lambda q, w, table, pool, pool_lens, slots, steps, kv_lens, dummy_base, min_kv, chunks, max_seq, active: (
                         self._score_paged_append_logits(
                             q,
                             w,
@@ -1228,8 +1497,54 @@ class IndexerOp(nn.Module):
                             min_kv,
                             chunks,
                             max_seq,
+                            active,
                         )
                     ),
+                    packed_pool_step=lambda q, w, table, pool, inverse, packed_kv, ready, protected, cursor, slots, steps, kv_lens, dummy_base, min_kv, chunks, max_seq, active: (
+                        self._score_paged_packed_pool_step(
+                            q,
+                            w,
+                            kv_cache_fp8,
+                            table,
+                            pool,
+                            inverse,
+                            packed_kv,
+                            ready,
+                            protected,
+                            cursor,
+                            slots,
+                            steps,
+                            kv_lens,
+                            dummy_base,
+                            min_kv,
+                            chunks,
+                            max_seq,
+                            active,
+                        )
+                    ),
+                    packed_append_pool_step=lambda q, w, table, pool, pool_lens, inverse, packed_kv, ready, base_offsets, slots, steps, kv_lens, dummy_base, min_kv, chunks, max_seq, active: (
+                        self._score_paged_packed_append_pool_step(
+                            q,
+                            w,
+                            kv_cache_fp8,
+                            table,
+                            pool,
+                            pool_lens,
+                            inverse,
+                            packed_kv,
+                            ready,
+                            base_offsets,
+                            slots,
+                            steps,
+                            kv_lens,
+                            dummy_base,
+                            min_kv,
+                            chunks,
+                            max_seq,
+                            active,
+                        )
+                    ),
+                    dump_kv_cache_fp8=kv_cache_fp8,
                 )
                 if pooled_topk is not None:
                     return pooled_topk

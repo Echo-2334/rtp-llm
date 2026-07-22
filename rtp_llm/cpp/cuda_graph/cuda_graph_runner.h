@@ -76,7 +76,10 @@ public:
     }
     void           captureDecode();
     void           capturePrefill();
-    void           captureDecodeOneBatchSize(int bs, bool pool_mode = false, bool bootstrap_mode = false);
+    void           captureDecodeOneBatchSize(int  bs,
+                                             bool pool_mode      = false,
+                                             bool bootstrap_mode = false,
+                                             bool mixed_mode     = false);
     void           capturePrefillOneSeqLen(int seq_len);
     void           prepareInputs(const PyModelInputs& inputs, CudaGraphState& state);
     void           prepareInputData(const PyModelInputs& inputs, CudaGraphState& state);
@@ -121,7 +124,10 @@ private:
     void                    initCaptureAttentionInputs(PyModelInputs& inputs, int max_bs, int num_tokens_per_bs);
     void                    initCaptureBertEmbeddingInputs(PyModelInputs& inputs, int max_bs, int max_num_token);
     void                    initCaptureAttentionInputsPost();
-    int                     decodeGraphKey(int batch_size, bool pool_mode, bool bootstrap_mode = false) const;
+    int                     decodeGraphKey(int  batch_size,
+                                           bool pool_mode,
+                                           bool bootstrap_mode = false,
+                                           bool mixed_mode     = false) const;
     bool                    decodeIndexerPoolEnabled() const;
     int32_t                 decodeIndexerPoolMinKvLength() const;
     py::object              py_forward_method_;

@@ -146,6 +146,7 @@ void registerPyOpDefs(pybind11::module& m) {
         .def_readwrite("indexer_pool_graph_mode", &PyAttentionInputs::indexer_pool_graph_mode)
         .def_readwrite("indexer_pool_bootstrap_graph_mode",
                        &PyAttentionInputs::indexer_pool_bootstrap_graph_mode)
+        .def_readwrite("indexer_pool_mixed_graph_mode", &PyAttentionInputs::indexer_pool_mixed_graph_mode)
         .def_readwrite("indexer_pool_bootstrap", &PyAttentionInputs::indexer_pool_bootstrap)
         .def_readwrite("is_target_verify", &PyAttentionInputs::is_target_verify)
         .def_readwrite("is_speculative", &PyAttentionInputs::is_speculative)

@@ -365,8 +365,10 @@ def append_global_pool_from_pool_chunk_topk(
 def _validate_pool(pool: torch.Tensor, pool_lengths: torch.Tensor) -> None:
     if pool.dtype != torch.int32 or pool.ndim != 2:
         raise ValueError("pool must be a rank-2 int32 tensor")
-    if pool.shape[1] != MAX_POOL_SIZE:
-        raise ValueError(f"pool capacity must be {MAX_POOL_SIZE}")
+    if pool.shape[1] not in (INITIAL_POOL_SIZE, MAX_POOL_SIZE):
+        raise ValueError(
+            f"pool capacity must be {INITIAL_POOL_SIZE} or {MAX_POOL_SIZE}"
+        )
     if pool_lengths.dtype != torch.int32 or pool_lengths.shape != (pool.shape[0],):
         raise ValueError("pool_lengths must be int32 [B]")
 

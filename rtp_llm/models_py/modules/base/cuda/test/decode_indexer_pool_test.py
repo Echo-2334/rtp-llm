@@ -22,6 +22,9 @@ POOL_ENV = {
     "RTP_LLM_DECODE_INDEXER_POOL_MAX_SIZE": None,
     "RTP_LLM_DECODE_INDEXER_SOURCE_CHUNKS": None,
     "RTP_LLM_DECODE_INDEXER_POOL_MIN_KV_LENGTH": None,
+    "RTP_LLM_DECODE_INDEXER_PACKED_POOL": None,
+    "RTP_LLM_DECODE_INDEXER_PACKED_POOL_UPDATE": None,
+    "RTP_LLM_DECODE_INDEXER_PACKED_POOL_MIN_BATCH": None,
 }
 
 
@@ -104,6 +107,34 @@ class DecodeIndexerPoolConfigTest(TestCase):
         self.assertEqual(config.interval, 16)
         self.assertEqual(config.chunks, 16)
         self.assertFalse(config.async_refresh)
+
+    def test_append_profile_can_enable_fixed_materialized_pool(self):
+        with _pool_env(
+            RTP_LLM_DECODE_INDEXER_POOL_PROFILE="APPEND",
+            RTP_LLM_DECODE_INDEXER_POOL_SIZE="8192",
+            RTP_LLM_DECODE_INDEXER_PACKED_POOL="1",
+        ):
+            config = DecodeIndexerPoolConfig.from_env()
+
+        self.assertTrue(config.packed_pool)
+        self.assertEqual(config.pool_size, 8192)
+        self.assertEqual(config.max_pool_size, 8192)
+        self.assertEqual(config.chunks, 16)
+
+    def test_append_profile_can_materialize_v1_append_pool_for_large_batches(self):
+        with _pool_env(
+            RTP_LLM_DECODE_INDEXER_POOL_PROFILE="APPEND",
+            RTP_LLM_DECODE_INDEXER_POOL_SIZE="8192",
+            RTP_LLM_DECODE_INDEXER_PACKED_POOL="1",
+            RTP_LLM_DECODE_INDEXER_PACKED_POOL_UPDATE="APPEND",
+            RTP_LLM_DECODE_INDEXER_PACKED_POOL_MIN_BATCH="32",
+        ):
+            config = DecodeIndexerPoolConfig.from_env()
+
+        self.assertTrue(config.packed_pool)
+        self.assertEqual(config.packed_pool_update, "APPEND")
+        self.assertEqual(config.packed_pool_min_batch, 32)
+        self.assertEqual(config.max_pool_size, 16384)
 
     def test_q_mode_can_override_a_profile(self):
         with _pool_env(
@@ -535,6 +566,180 @@ class DecodeIndexerCudaGraphTest(TestCase):
 
         self.assertIsNone(pool._pools)
 
+    def test_materialized_append_routes_to_packed_callback(self):
+        config = DecodeIndexerPoolConfig(
+            profile="APPEND",
+            min_kv_length=4096,
+            interval=16,
+            pool_size=8 * 1024,
+            max_pool_size=8 * 1024,
+            chunks=16,
+            async_refresh=False,
+            packed_pool=True,
+        )
+        pool = DecodeIndexerPool(
+            config,
+            index_topk=2048,
+            index_n_heads=32,
+            index_head_dim=128,
+        )
+        q_fp8 = torch.zeros(
+            (1, 32, 128), dtype=torch.float8_e4m3fn, device=self.device
+        )
+        weights = torch.ones((1, 32), dtype=torch.float32, device=self.device)
+        block_table = torch.zeros((1, 128), dtype=torch.int32, device=self.device)
+        lengths = torch.tensor([8192], dtype=torch.int32, device=self.device)
+        attention_inputs = SimpleNamespace(
+            is_cuda_graph=True,
+            indexer_pool_graph_mode=True,
+            is_speculative=False,
+            is_target_verify=False,
+            decode_indexer_pool_slot=torch.tensor(
+                [0], dtype=torch.int32, device=self.device
+            ),
+            decode_step=torch.tensor([1], dtype=torch.int32, device=self.device),
+            decode_kv_length=lengths.clone(),
+        )
+        observed = []
+
+        def packed_step(*args):
+            observed.append(args)
+            return torch.full(
+                (1, 2048), 17, dtype=torch.int32, device=self.device
+            )
+
+        def unused(*args):
+            raise AssertionError("legacy APPEND callback was used")
+
+        result = pool._try_compute_cuda_graph(
+            q_fp8,
+            weights,
+            block_table,
+            lengths,
+            attention_inputs,
+            unused,
+            unused,
+            unused,
+            8192,
+            unused,
+            unused,
+            packed_pool_step=packed_step,
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(result.unique().item(), 17)
+        self.assertEqual(len(observed), 1)
+        self.assertIsNotNone(pool._packed_pool_kv)
+        self.assertIsNotNone(pool._packed_ready)
+        self.assertEqual(pool._packed_pool_kv.dtype, torch.uint8)
+
+    def test_materialized_v1_routes_small_batch_sparse_and_large_batch_packed(self):
+        config = DecodeIndexerPoolConfig(
+            profile="APPEND",
+            min_kv_length=4096,
+            interval=16,
+            pool_size=8 * 1024,
+            max_pool_size=16 * 1024,
+            chunks=16,
+            async_refresh=False,
+            packed_pool=True,
+            packed_pool_update="APPEND",
+            packed_pool_min_batch=32,
+        )
+
+        def run(batch):
+            pool = DecodeIndexerPool(
+                config,
+                index_topk=2048,
+                index_n_heads=32,
+                index_head_dim=128,
+            )
+            q_fp8 = torch.zeros(
+                (batch, 32, 128), dtype=torch.float8_e4m3fn, device=self.device
+            )
+            weights = torch.ones(
+                (batch, 32), dtype=torch.float32, device=self.device
+            )
+            block_table = torch.zeros(
+                (batch, 128), dtype=torch.int32, device=self.device
+            )
+            lengths = torch.full(
+                (batch,), 8192, dtype=torch.int32, device=self.device
+            )
+            attention_inputs = SimpleNamespace(
+                decode_indexer_pool_slot=torch.arange(
+                    batch, dtype=torch.int32, device=self.device
+                ),
+                decode_step=torch.ones(
+                    batch, dtype=torch.int32, device=self.device
+                ),
+                decode_kv_length=lengths,
+            )
+            observed = []
+
+            def scheduled(*args):
+                observed.append("sparse")
+                candidate_width = 16 * 1024 + 512
+                return (
+                    torch.zeros(
+                        (batch, candidate_width),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    torch.full(
+                        (batch,), 8 * 1024 + 512, dtype=torch.int32, device=self.device
+                    ),
+                    torch.zeros(batch, dtype=torch.int32, device=self.device),
+                    torch.full(
+                        (batch,), 512, dtype=torch.int32, device=self.device
+                    ),
+                    torch.arange(batch, dtype=torch.int32, device=self.device),
+                    torch.ones(batch, dtype=torch.int32, device=self.device),
+                )
+
+            def sparse_topk(*args):
+                return torch.full(
+                    (batch, 2048), 11, dtype=torch.int32, device=self.device
+                )
+
+            def packed_append(*args):
+                observed.append("packed")
+                return torch.full(
+                    (batch, 2048), 29, dtype=torch.int32, device=self.device
+                )
+
+            result = pool._try_compute_append_cuda_graph(
+                q_fp8,
+                weights,
+                block_table,
+                attention_inputs,
+                lambda *args: (_ for _ in ()).throw(
+                    AssertionError("unscheduled sparse callback was used")
+                ),
+                lambda *args: None,
+                8192,
+                pool_chunk_topk=sparse_topk,
+                scheduled_pool_chunk_score=scheduled,
+                packed_append_pool_step=packed_append,
+            )
+            torch.cuda.synchronize()
+            return observed, result, pool
+
+        small_observed, small_result, small_pool = run(1)
+        self.assertEqual(small_observed, ["sparse"])
+        self.assertEqual(small_result.unique().item(), 11)
+        assert small_pool._packed_ready is not None
+        self.assertEqual(small_pool._packed_ready[0].item(), 0)
+
+        large_observed, large_result, large_pool = run(32)
+        self.assertEqual(large_observed, ["packed"])
+        self.assertEqual(large_result.unique().item(), 29)
+        assert large_pool._packed_pool_kv is not None
+        self.assertEqual(
+            large_pool._packed_pool_kv.shape[0],
+            large_pool._capacity * (16 * 1024 // 64),
+        )
+
     def test_append_profile_bootstrap_and_steady_graph_replay(self):
         config = DecodeIndexerPoolConfig(
             profile="APPEND",
@@ -817,6 +1022,37 @@ class DecodeIndexerCudaGraphTest(TestCase):
         self.assertEqual(observed_chunk_lengths[-1].tolist(), [1024, 0])
         self.assertGreater(pool._append_pool_lengths[0].item(), 8192)
         self.assertEqual(pool._append_pool_lengths[1].item(), 8192)
+
+        attention_inputs.indexer_pool_bootstrap_graph_mode = False
+        attention_inputs.indexer_pool_mixed_graph_mode = True
+        attention_inputs.decode_indexer_pool_bootstrap_mask.zero_()
+        attention_inputs.decode_indexer_pool_slot.copy_(
+            torch.tensor([0, -1], dtype=torch.int32, device=self.device)
+        )
+        attention_inputs.decode_kv_length.copy_(
+            torch.tensor(
+                [graph_max_seq_len, config.min_kv_length],
+                dtype=torch.int32,
+                device=self.device,
+            )
+        )
+        with patch.object(
+            pool,
+            "_bootstrap_append_cuda_graph",
+            side_effect=AssertionError("mixed graph must not bootstrap"),
+        ):
+            mixed_result = hybrid()
+        torch.cuda.synchronize()
+        expected_exact = torch.topk(
+            base_logits[1], 2048, sorted=True
+        ).indices.to(torch.int32)
+        torch.testing.assert_close(
+            mixed_result[1], expected_exact, rtol=0, atol=0
+        )
+        self.assertEqual(
+            observed_exact_lengths[-1].tolist(),
+            [1, config.min_kv_length],
+        )
 
 
 if __name__ == "__main__":

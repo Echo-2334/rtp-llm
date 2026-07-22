@@ -218,6 +218,20 @@ def test_long_seq_radix_path():
     _assert_equiv(out, logits, lengths, k=2048, tag="radix L=64K")
 
 
+def test_medium_pool_candidate_lengths():
+    """APPEND pool+chunk widths use the medium single-CTA TopK path."""
+    for length in (16 * 1024, 24 * 1024):
+        logits, lengths = _make(8, length, seed=70 + length, lengths_mode="full")
+        out = _run(logits, lengths, k=2048, max_seq_len=length)
+        _assert_equiv(
+            out,
+            logits,
+            lengths,
+            k=2048,
+            tag=f"medium APPEND L={length}",
+        )
+
+
 def test_zero_length_row():
     """lengths[r] == 0 must yield an all-(-1) row."""
     logits, lengths = _make(2, 1024, seed=8, lengths_mode="full")
@@ -310,6 +324,7 @@ if __name__ == "__main__":
     test_mtp_batched_decode_flattened_bs_rows()
     test_filtered_path_b64()
     test_long_seq_radix_path()
+    test_medium_pool_candidate_lengths()
     test_zero_length_row()
     test_lengths_2d_accepted()
     print("\n== Benchmark ==")

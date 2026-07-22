@@ -65,6 +65,8 @@ public:
         py_model_inputs_.attention_inputs.indexer_pool_graph_mode    = inputs.attention_inputs.indexer_pool_graph_mode;
         py_model_inputs_.attention_inputs.indexer_pool_bootstrap_graph_mode =
             inputs.attention_inputs.indexer_pool_bootstrap_graph_mode;
+        py_model_inputs_.attention_inputs.indexer_pool_mixed_graph_mode =
+            inputs.attention_inputs.indexer_pool_mixed_graph_mode;
     }
 
 public:

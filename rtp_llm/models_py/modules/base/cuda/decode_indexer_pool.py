@@ -11,6 +11,13 @@ Pool reuse starts strictly above
 ``RTP_LLM_DECODE_INDEXER_POOL_MIN_KV_LENGTH`` (64K by default). APPEND requires
 an initial 8K pool, a 16K maximum pool, and 16 source chunks. Profiles A and B
 default to a 16K fixed-size pool.
+
+Set ``RTP_LLM_DECODE_INDEXER_PACKED_POOL=1`` with APPEND to keep a fixed,
+materialized 8K KV pool. Its steady path scores the pool and current contiguous
+source chunk through paged MQA, then updates the pool only from the final Top2K.
+Set ``RTP_LLM_DECODE_INDEXER_PACKED_POOL_UPDATE=APPEND`` to retain V1 append
+semantics with a ring-backed 16K materialized K pool. Graph buckets below
+``RTP_LLM_DECODE_INDEXER_PACKED_POOL_MIN_BATCH`` keep the fused sparse path.
 """
 
 import logging
@@ -101,6 +108,7 @@ ScheduledPoolChunkScoreFn = Callable[
         int,
         int,
         int,
+        Optional[torch.Tensor],
     ],
     Tuple[
         torch.Tensor,
@@ -110,6 +118,53 @@ ScheduledPoolChunkScoreFn = Callable[
         torch.Tensor,
         torch.Tensor,
     ],
+]
+PackedPoolStepFn = Callable[
+    [
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        int,
+        int,
+        Optional[torch.Tensor],
+    ],
+    torch.Tensor,
+]
+PackedAppendPoolStepFn = Callable[
+    [
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        int,
+        int,
+        Optional[torch.Tensor],
+    ],
+    torch.Tensor,
 ]
 
 
@@ -136,6 +191,48 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean, got {raw!r}")
 
 
+def _copy_kernel_k_for_dump(
+    kv_cache_fp8: torch.Tensor,
+    block_table_row: torch.Tensor,
+    length: int,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Copy one request's K pages into a self-contained kernel-ready cache."""
+    if kv_cache_fp8.dtype != torch.uint8 or kv_cache_fp8.ndim != 4:
+        raise ValueError("indexer K dump expects uint8 [pages, page_size, 1, stride]")
+    if kv_cache_fp8.shape[2] != 1:
+        raise ValueError("indexer K dump expects one KV head")
+
+    page_size = int(kv_cache_fp8.shape[1])
+    cache_stride = int(kv_cache_fp8.shape[3])
+    if length <= 0 or head_dim <= 0 or cache_stride != head_dim + 4:
+        raise ValueError(
+            f"invalid indexer K dump shape: length={length} head_dim={head_dim} "
+            f"cache_stride={cache_stride}"
+        )
+
+    page_count = (length + page_size - 1) // page_size
+    if page_count > block_table_row.numel():
+        raise ValueError(
+            f"indexer K dump needs {page_count} pages, block table has "
+            f"{block_table_row.numel()}"
+        )
+    physical_pages = block_table_row[:page_count].to(dtype=torch.long)
+    if bool((physical_pages < 0).any()) or bool(
+        (physical_pages >= kv_cache_fp8.shape[0]).any()
+    ):
+        raise ValueError("indexer K dump block table contains an invalid physical page")
+
+    # Preserve DeepGEMM's physical page layout: each page contains all token K
+    # bytes followed by all token fp32 scale bytes. Renumber pages locally so
+    # the dumped cache and block table can be passed to the kernel as-is.
+    kernel_cache = kv_cache_fp8.index_select(0, physical_pages).contiguous()
+    kernel_block_table = torch.arange(
+        page_count, dtype=torch.int32, device=kv_cache_fp8.device
+    ).reshape(1, page_count)
+    return kernel_cache, kernel_block_table
+
+
 def _get_refresh_stream(device: torch.device) -> torch.cuda.Stream:
     stream = _REFRESH_STREAMS.get(device)
     if stream is None:
@@ -159,6 +256,9 @@ class DecodeIndexerPoolConfig:
     anchor_phase: int = 0
     async_refresh: bool = True
     state_ttl_steps: int = 64
+    packed_pool: bool = False
+    packed_pool_update: str = "REPLACE"
+    packed_pool_min_batch: int = 32
 
     @property
     def enabled(self) -> bool:
@@ -198,12 +298,27 @@ class DecodeIndexerPoolConfig:
                 "RTP_LLM_DECODE_INDEXER_POOL_SIZE must be a positive multiple of 2048"
             )
         if profile == "APPEND":
+            packed_pool = _env_bool(
+                "RTP_LLM_DECODE_INDEXER_PACKED_POOL", False
+            )
+            packed_pool_update = os.environ.get(
+                "RTP_LLM_DECODE_INDEXER_PACKED_POOL_UPDATE", "REPLACE"
+            ).strip().upper()
+            if packed_pool_update not in ("REPLACE", "APPEND"):
+                raise ValueError(
+                    "RTP_LLM_DECODE_INDEXER_PACKED_POOL_UPDATE must be REPLACE or APPEND"
+                )
             source_chunks = int(
                 os.environ.get("RTP_LLM_DECODE_INDEXER_SOURCE_CHUNKS", "16")
             )
             max_pool_size = int(
                 os.environ.get(
-                    "RTP_LLM_DECODE_INDEXER_POOL_MAX_SIZE", str(16 * 1024)
+                    "RTP_LLM_DECODE_INDEXER_POOL_MAX_SIZE",
+                    str(
+                        pool_size
+                        if packed_pool and packed_pool_update == "REPLACE"
+                        else 16 * 1024
+                    ),
                 )
             )
             config = cls(
@@ -223,11 +338,30 @@ class DecodeIndexerPoolConfig:
                 state_ttl_steps=int(
                     os.environ.get("RTP_LLM_DECODE_INDEXER_POOL_STATE_TTL", "64")
                 ),
+                packed_pool=packed_pool,
+                packed_pool_update=packed_pool_update,
+                packed_pool_min_batch=int(
+                    os.environ.get(
+                        "RTP_LLM_DECODE_INDEXER_PACKED_POOL_MIN_BATCH", "32"
+                    )
+                ),
             )
             if config.pool_size != 8 * 1024:
                 raise ValueError("APPEND profile requires an initial 8192-entry pool")
-            if config.max_pool_size != 16 * 1024:
-                raise ValueError("APPEND profile requires a maximum 16384-entry pool")
+            expected_max_pool_size = (
+                config.pool_size
+                if config.packed_pool and config.packed_pool_update == "REPLACE"
+                else 16 * 1024
+            )
+            if config.max_pool_size != expected_max_pool_size:
+                raise ValueError(
+                    "APPEND profile requires max pool size 8192 for packed REPLACE "
+                    "or 16384 otherwise"
+                )
+            if config.packed_pool_min_batch <= 0:
+                raise ValueError(
+                    "RTP_LLM_DECODE_INDEXER_PACKED_POOL_MIN_BATCH must be positive"
+                )
             if config.chunks != 16:
                 raise ValueError("APPEND profile currently requires 16 source chunks")
             if config.state_ttl_steps < config.interval:
@@ -243,6 +377,18 @@ class DecodeIndexerPoolConfig:
                 config.max_pool_size,
                 config.min_kv_length,
             )
+            if config.packed_pool:
+                _log_once(
+                    "decode-indexer-packed-pool-enabled",
+                    logging.INFO,
+                    "decode indexer materialized pool enabled: update=%s pool=%d max=%d "
+                    "min_batch=%d chunks=%d",
+                    config.packed_pool_update,
+                    config.pool_size,
+                    config.max_pool_size,
+                    config.packed_pool_min_batch,
+                    config.chunks,
+                )
             return config
 
         chunks = pool_size // chunk_topk
@@ -361,6 +507,24 @@ class DecodeIndexerPool:
             )
         if config.profile == "APPEND" and config.pool_size != 4 * index_topk:
             raise ValueError("decode indexer APPEND profile requires initial pool == 4 * TopK")
+        if config.packed_pool and config.profile != "APPEND":
+            raise ValueError("materialized indexer pool requires the APPEND profile")
+        if config.packed_pool and config.pool_size != 8 * 1024:
+            raise ValueError("materialized indexer pool requires a fixed 8192-entry pool")
+        if (
+            config.packed_pool
+            and config.packed_pool_update == "REPLACE"
+            and config.max_pool_size != config.pool_size
+        ):
+            raise ValueError("materialized REPLACE pool max size must remain 8192")
+        if (
+            config.packed_pool
+            and config.packed_pool_update == "APPEND"
+            and config.max_pool_size != 16 * 1024
+        ):
+            raise ValueError("materialized APPEND pool max size must be 16384")
+        if config.packed_pool and (index_head_dim != 128 or index_n_heads != 32):
+            raise ValueError("materialized indexer pool currently requires H32 D128")
         self.config = config
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
@@ -378,6 +542,11 @@ class DecodeIndexerPool:
         self._append_pool_lengths: Optional[torch.Tensor] = None
         self._append_inverse_map: Optional[torch.Tensor] = None
         self._append_graph_max_seq_len = 0
+        self._packed_pool_kv: Optional[torch.Tensor] = None
+        self._packed_ready: Optional[torch.Tensor] = None
+        self._packed_protected: Optional[torch.Tensor] = None
+        self._packed_cursor: Optional[torch.Tensor] = None
+        self._packed_base_offsets: Optional[torch.Tensor] = None
         self._graph_slot_base: Optional[int] = None
         self._device: Optional[torch.device] = None
         self._tick = 0
@@ -447,6 +616,11 @@ class DecodeIndexerPool:
         self._append_pool_lengths = None
         self._append_inverse_map = None
         self._append_graph_max_seq_len = 0
+        self._packed_pool_kv = None
+        self._packed_ready = None
+        self._packed_protected = None
+        self._packed_cursor = None
+        self._packed_base_offsets = None
         self._graph_slot_base = None
         self._device = device
 
@@ -475,6 +649,11 @@ class DecodeIndexerPool:
         new_append_pools: Optional[torch.Tensor] = None
         new_append_pool_lengths: Optional[torch.Tensor] = None
         new_append_inverse_map: Optional[torch.Tensor] = None
+        new_packed_pool_kv: Optional[torch.Tensor] = None
+        new_packed_ready: Optional[torch.Tensor] = None
+        new_packed_protected: Optional[torch.Tensor] = None
+        new_packed_cursor: Optional[torch.Tensor] = None
+        new_packed_base_offsets: Optional[torch.Tensor] = None
         if self.config.profile == "APPEND":
             new_append_pools = torch.zeros(
                 (new_capacity, self.config.max_pool_size),
@@ -499,6 +678,53 @@ class DecodeIndexerPool:
                 new_append_inverse_map[: self._capacity].copy_(
                     self._append_inverse_map
                 )
+            if self.config.packed_pool:
+                packed_pool_capacity = (
+                    self.config.max_pool_size
+                    if self.config.packed_pool_update == "APPEND"
+                    else self.config.pool_size
+                )
+                pages_per_pool = packed_pool_capacity // 64
+                entry_bytes = self.index_head_dim + 4
+                new_packed_pool_kv = torch.zeros(
+                    (new_capacity * pages_per_pool, 64, 1, entry_bytes),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                new_packed_ready = torch.zeros(
+                    new_capacity, dtype=torch.int32, device=device
+                )
+                new_packed_protected = torch.zeros(
+                    (new_capacity, self.config.pool_size),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                new_packed_cursor = torch.zeros(
+                    new_capacity, dtype=torch.int32, device=device
+                )
+                new_packed_base_offsets = torch.zeros(
+                    new_capacity, dtype=torch.int32, device=device
+                )
+                if self._packed_pool_kv is not None:
+                    new_packed_pool_kv.view(
+                        new_capacity, pages_per_pool, 64, 1, entry_bytes
+                    )[: self._capacity].copy_(
+                        self._packed_pool_kv.view(
+                            self._capacity, pages_per_pool, 64, 1, entry_bytes
+                        )
+                    )
+                    assert self._packed_ready is not None
+                    assert self._packed_protected is not None
+                    assert self._packed_cursor is not None
+                    assert self._packed_base_offsets is not None
+                    new_packed_ready[: self._capacity].copy_(self._packed_ready)
+                    new_packed_protected[: self._capacity].copy_(
+                        self._packed_protected
+                    )
+                    new_packed_cursor[: self._capacity].copy_(self._packed_cursor)
+                    new_packed_base_offsets[: self._capacity].copy_(
+                        self._packed_base_offsets
+                    )
         else:
             new_pools = torch.zeros(
                 (
@@ -556,6 +782,11 @@ class DecodeIndexerPool:
         self._append_pools = new_append_pools
         self._append_pool_lengths = new_append_pool_lengths
         self._append_inverse_map = new_append_inverse_map
+        self._packed_pool_kv = new_packed_pool_kv
+        self._packed_ready = new_packed_ready
+        self._packed_protected = new_packed_protected
+        self._packed_cursor = new_packed_cursor
+        self._packed_base_offsets = new_packed_base_offsets
         self._anchor_q = new_anchor_q
         self._anchor_weights = new_anchor_weights
         self._graph_active_parity = new_graph_active_parity
@@ -1069,6 +1300,15 @@ class DecodeIndexerPool:
             self._append_inverse_map,
             slots,
         )
+        if self.config.packed_pool:
+            assert self._packed_ready is not None
+            assert self._packed_protected is not None
+            assert self._packed_cursor is not None
+            assert self._packed_base_offsets is not None
+            self._packed_ready.index_fill_(0, slots, 0)
+            self._packed_protected.index_fill_(0, slots, 0)
+            self._packed_cursor.index_fill_(0, slots, 0)
+            self._packed_base_offsets.index_fill_(0, slots, 0)
 
     def _try_compute_append_cuda_graph(
         self,
@@ -1082,6 +1322,8 @@ class DecodeIndexerPool:
         active_mask: Optional[torch.Tensor] = None,
         pool_chunk_topk: Optional[PoolChunkTopkFn] = None,
         scheduled_pool_chunk_score: Optional[ScheduledPoolChunkScoreFn] = None,
+        packed_pool_step: Optional[PackedPoolStepFn] = None,
+        packed_append_pool_step: Optional[PackedAppendPoolStepFn] = None,
     ) -> torch.Tensor:
         from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_pool_update import (
             append_global_pool_from_pool_chunk_topk,
@@ -1118,11 +1360,63 @@ class DecodeIndexerPool:
         assert self._append_pool_lengths is not None
         assert self._append_inverse_map is not None
 
-        if (
-            active_mask is None
-            and pool_chunk_topk is not None
-            and scheduled_pool_chunk_score is not None
-        ):
+        use_materialized_pool = self.config.packed_pool and (
+            self.config.packed_pool_update == "REPLACE"
+            or batch_size >= self.config.packed_pool_min_batch
+        )
+        if use_materialized_pool:
+            assert self._packed_pool_kv is not None
+            assert self._packed_ready is not None
+            assert self._packed_protected is not None
+            assert self._packed_cursor is not None
+            if self.config.packed_pool_update == "APPEND":
+                if packed_append_pool_step is None:
+                    raise RuntimeError(
+                        "materialized APPEND indexer pool callback is missing"
+                    )
+                assert self._packed_base_offsets is not None
+                return packed_append_pool_step(
+                    q_fp8,
+                    weights,
+                    block_table,
+                    self._append_pools,
+                    self._append_pool_lengths,
+                    self._append_inverse_map,
+                    self._packed_pool_kv,
+                    self._packed_ready,
+                    self._packed_base_offsets,
+                    slots_input,
+                    decode_steps,
+                    kv_lengths,
+                    self._graph_slot_base,
+                    self.config.min_kv_length,
+                    self.config.chunks,
+                    graph_max_seq_len,
+                    active_mask,
+                )
+            if packed_pool_step is None:
+                raise RuntimeError("materialized indexer pool callback is missing")
+            return packed_pool_step(
+                q_fp8,
+                weights,
+                block_table,
+                self._append_pools,
+                self._append_inverse_map,
+                self._packed_pool_kv,
+                self._packed_ready,
+                self._packed_protected,
+                self._packed_cursor,
+                slots_input,
+                decode_steps,
+                kv_lengths,
+                self._graph_slot_base,
+                self.config.min_kv_length,
+                self.config.chunks,
+                graph_max_seq_len,
+                active_mask,
+            )
+
+        if pool_chunk_topk is not None and scheduled_pool_chunk_score is not None:
             (
                 logits,
                 topk_lengths,
@@ -1143,11 +1437,12 @@ class DecodeIndexerPool:
                 self.config.min_kv_length,
                 self.config.chunks,
                 graph_max_seq_len,
+                active_mask,
             )
             candidate_width = self.config.max_pool_size + (
                 graph_max_seq_len + self.config.chunks - 1
             ) // self.config.chunks
-            return pool_chunk_topk(
+            result = pool_chunk_topk(
                 logits,
                 topk_lengths,
                 candidate_width,
@@ -1160,6 +1455,20 @@ class DecodeIndexerPool:
                 slots,
                 active_mask_i32,
             )
+            if (
+                self.config.packed_pool
+                and self.config.packed_pool_update == "APPEND"
+                and not use_materialized_pool
+            ):
+                from rtp_llm.models_py.triton_kernels.sparse_mla.packed_indexer_pool import (
+                    invalidate_packed_pool_slots,
+                )
+
+                assert self._packed_ready is not None
+                invalidate_packed_pool_slots(
+                    slots, active_mask_i32, self._packed_ready
+                )
+            return result
 
         rows = torch.arange(batch_size, device=device, dtype=torch.int32)
         kv_lengths_l = kv_lengths.to(torch.long)
@@ -1267,6 +1576,10 @@ class DecodeIndexerPool:
         select_topk: SelectTopkFn,
         graph_max_seq_len: int,
         pool_chunk_topk: Optional[PoolChunkTopkFn] = None,
+        build_bootstrap_pool: bool = True,
+        scheduled_pool_chunk_score: Optional[ScheduledPoolChunkScoreFn] = None,
+        packed_pool_step: Optional[PackedPoolStepFn] = None,
+        packed_append_pool_step: Optional[PackedAppendPoolStepFn] = None,
     ) -> torch.Tensor:
         """Run per-row exact/bootstrap and sparse pool work in one fixed graph."""
         batch_size = block_table.shape[0]
@@ -1285,32 +1598,36 @@ class DecodeIndexerPool:
                 "decode indexer APPEND hybrid metadata must be fixed CUDA tensors"
             )
 
-        kv_lengths_i32 = kv_lengths.to(torch.int32)
-        eligible_rows = (
-            (kv_lengths_i32 > self.config.min_kv_length)
-            & slots_input.ge(0)
+        from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_score import (
+            prepare_append_hybrid_metadata,
         )
-        bootstrap_rows = eligible_rows & bootstrap_mask.ne(0)
-        sparse_rows = eligible_rows & ~bootstrap_rows
-        exact_rows = ~sparse_rows
-        exact_lengths = torch.where(
-            exact_rows,
-            kv_lengths_i32,
-            torch.ones_like(kv_lengths_i32),
-        ).clamp(min=1, max=graph_max_seq_len)
+
+        (
+            exact_lengths,
+            bootstrap_rows_i32,
+            sparse_rows_i32,
+            sparse_rows_bool,
+        ) = prepare_append_hybrid_metadata(
+            kv_lengths,
+            slots_input,
+            bootstrap_mask,
+            min_kv_length=self.config.min_kv_length,
+            graph_max_seq_len=graph_max_seq_len,
+        )
 
         exact_logits, exact_topk = exact_score(
             q_fp8, weights, block_table, exact_lengths
         )
-        self._bootstrap_append_cuda_graph(
-            exact_logits,
-            exact_topk,
-            slots_input,
-            kv_lengths_i32,
-            bootstrap_rows.to(torch.int32),
-            select_topk,
-            graph_max_seq_len,
-        )
+        if build_bootstrap_pool:
+            self._bootstrap_append_cuda_graph(
+                exact_logits,
+                exact_topk,
+                slots_input,
+                kv_lengths,
+                bootstrap_rows_i32,
+                select_topk,
+                graph_max_seq_len,
+            )
         sparse_topk = self._try_compute_append_cuda_graph(
             q_fp8,
             weights,
@@ -1319,10 +1636,13 @@ class DecodeIndexerPool:
             pool_chunk_score,
             select_topk,
             graph_max_seq_len,
-            sparse_rows.to(torch.int32),
+            sparse_rows_i32,
             pool_chunk_topk,
+            scheduled_pool_chunk_score,
+            packed_pool_step,
+            packed_append_pool_step,
         )
-        return torch.where(sparse_rows.unsqueeze(1), sparse_topk, exact_topk)
+        return torch.where(sparse_rows_bool.unsqueeze(1), sparse_topk, exact_topk)
 
     def _try_compute_cuda_graph(
         self,
@@ -1339,6 +1659,8 @@ class DecodeIndexerPool:
         select_topk: Optional[SelectTopkFn] = None,
         pool_chunk_topk: Optional[PoolChunkTopkFn] = None,
         scheduled_pool_chunk_score: Optional[ScheduledPoolChunkScoreFn] = None,
+        packed_pool_step: Optional[PackedPoolStepFn] = None,
+        packed_append_pool_step: Optional[PackedAppendPoolStepFn] = None,
     ) -> torch.Tensor:
         """Emit the fixed-shape steady-state data path during graph capture.
 
@@ -1362,6 +1684,8 @@ class DecodeIndexerPool:
                 graph_max_seq_len,
                 pool_chunk_topk=pool_chunk_topk,
                 scheduled_pool_chunk_score=scheduled_pool_chunk_score,
+                packed_pool_step=packed_pool_step,
+                packed_append_pool_step=packed_append_pool_step,
             )
         slots_input = getattr(attention_inputs, "decode_indexer_pool_slot", None)
         decode_steps = getattr(attention_inputs, "decode_step", None)
@@ -1552,6 +1876,9 @@ class DecodeIndexerPool:
         graph_max_seq_len: Optional[int] = None,
         pool_chunk_topk: Optional[PoolChunkTopkFn] = None,
         scheduled_pool_chunk_score: Optional[ScheduledPoolChunkScoreFn] = None,
+        packed_pool_step: Optional[PackedPoolStepFn] = None,
+        packed_append_pool_step: Optional[PackedAppendPoolStepFn] = None,
+        dump_kv_cache_fp8: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         batch_size = block_table.shape[0]
         if bool(getattr(attention_inputs, "is_cuda_graph", False)):
@@ -1569,7 +1896,12 @@ class DecodeIndexerPool:
                     False,
                 )
             )
-            if self.config.profile == "APPEND" and hybrid_graph_mode:
+            mixed_graph_mode = bool(
+                getattr(attention_inputs, "indexer_pool_mixed_graph_mode", False)
+            )
+            if self.config.profile == "APPEND" and (
+                hybrid_graph_mode or mixed_graph_mode
+            ):
                 if (
                     graph_max_seq_len is None
                     or graph_max_seq_len <= 0
@@ -1588,6 +1920,10 @@ class DecodeIndexerPool:
                     select_topk,
                     graph_max_seq_len,
                     pool_chunk_topk,
+                    build_bootstrap_pool=hybrid_graph_mode,
+                    scheduled_pool_chunk_score=scheduled_pool_chunk_score,
+                    packed_pool_step=packed_pool_step,
+                    packed_append_pool_step=packed_append_pool_step,
                 )
             if not pool_graph_mode:
                 return None
@@ -1605,6 +1941,8 @@ class DecodeIndexerPool:
                 select_topk,
                 pool_chunk_topk,
                 scheduled_pool_chunk_score,
+                packed_pool_step,
+                packed_append_pool_step,
             )
         if self.config.profile == "APPEND":
             return None
@@ -1730,7 +2068,11 @@ class DecodeIndexerPool:
         dump_dir = os.environ.get("RTP_LLM_DECODE_INDEXER_POOL_DUMP_DIR", "")
         dump_layer = int(os.environ.get("RTP_LLM_DECODE_INDEXER_POOL_DUMP_LAYER", "-1"))
         dump_steps = int(os.environ.get("RTP_LLM_DECODE_INDEXER_POOL_DUMP_STEPS", "0"))
-        dump_active = bool(dump_dir) and self.layer_idx == dump_layer and dump_steps > 0
+        dump_active = (
+            bool(dump_dir)
+            and (dump_layer < 0 or self.layer_idx == dump_layer)
+            and dump_steps > 0
+        )
 
         def dump_step(
             row: int,
@@ -1758,6 +2100,10 @@ class DecodeIndexerPool:
                 "decode_step": step,
                 "kv_length": int(kv_lengths[row]),
                 "score_length": score_length,
+                "q_fp8": q_fp8[row].detach().cpu(),
+                # The per-head Q scale is already folded into these weights.
+                "weights": weights[row].detach().to(torch.float32).cpu(),
+                "weights_are_q_scale_folded": True,
                 "exact_logits": exact_logits_row[:score_length]
                 .detach()
                 .to(torch.float16)
@@ -1774,6 +2120,21 @@ class DecodeIndexerPool:
                     else torch.empty(0, dtype=torch.int32)
                 ),
             }
+            if step == dump_steps - 1:
+                if dump_kv_cache_fp8 is None:
+                    raise RuntimeError("indexer K cache is unavailable for the final dump step")
+                k_cache, k_block_table = _copy_kernel_k_for_dump(
+                    dump_kv_cache_fp8,
+                    block_table[row],
+                    score_length,
+                    self.index_head_dim,
+                )
+                payload["k_cache"] = k_cache.detach().cpu()
+                payload["k_block_table"] = k_block_table.detach().cpu()
+                payload["k_page_size"] = int(k_cache.shape[1])
+                payload["k_head_dim"] = self.index_head_dim
+                payload["k_scale_format"] = "ue8m0_fp32"
+                payload["k_layout"] = "deep_gemm_paged_k_then_scale"
             torch.save(payload, path)
 
         if pool_rows:

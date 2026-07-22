@@ -179,6 +179,7 @@ def _append_fp8_mqa_logits_kernel(
     pool_slots_ptr,
     decode_steps_ptr,
     kv_lengths_ptr,
+    external_active_ptr,
     logits_ptr,
     candidate_lengths_out_ptr,
     chunk_starts_out_ptr,
@@ -201,12 +202,15 @@ def _append_fp8_mqa_logits_kernel(
     MIN_KV_LENGTH: tl.constexpr,
     SOURCE_CHUNKS: tl.constexpr,
     MAX_SEQ_LEN: tl.constexpr,
+    USE_EXTERNAL_ACTIVE: tl.constexpr,
 ):
     batch = tl.program_id(0)
     candidate_block = tl.program_id(1)
     raw_slot = tl.load(pool_slots_ptr + batch).to(tl.int32)
     kv_length = tl.load(kv_lengths_ptr + batch).to(tl.int32)
     active = (kv_length > MIN_KV_LENGTH) & (raw_slot >= 0)
+    if USE_EXTERNAL_ACTIVE:
+        active &= tl.load(external_active_ptr + batch) != 0
     safe_slot = tl.where(active, raw_slot, dummy_slot_base + batch).to(tl.int64)
 
     safe_kv_length = tl.minimum(tl.maximum(kv_length, 1), MAX_SEQ_LEN)
@@ -308,6 +312,82 @@ def _append_fp8_mqa_logits_kernel(
         logits,
         mask=output_mask,
     )
+
+
+@triton.jit
+def _append_hybrid_metadata_kernel(
+    kv_lengths_ptr,
+    pool_slots_ptr,
+    bootstrap_mask_ptr,
+    exact_lengths_out_ptr,
+    bootstrap_out_ptr,
+    sparse_out_ptr,
+    sparse_bool_out_ptr,
+    batch_size,
+    MIN_KV_LENGTH: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.arange(0, BLOCK)
+    mask = rows < batch_size
+    kv_length = tl.load(kv_lengths_ptr + rows, mask=mask, other=1).to(tl.int32)
+    pool_slot = tl.load(pool_slots_ptr + rows, mask=mask, other=-1).to(tl.int32)
+    bootstrap_requested = (
+        tl.load(bootstrap_mask_ptr + rows, mask=mask, other=0) != 0
+    )
+    eligible = (kv_length > MIN_KV_LENGTH) & (pool_slot >= 0)
+    bootstrap = eligible & bootstrap_requested
+    sparse = eligible & ~bootstrap
+    safe_exact_length = tl.minimum(tl.maximum(kv_length, 1), MAX_SEQ_LEN)
+    exact_length = tl.where(sparse, 1, safe_exact_length)
+    tl.store(exact_lengths_out_ptr + rows, exact_length, mask=mask)
+    tl.store(bootstrap_out_ptr + rows, bootstrap.to(tl.int32), mask=mask)
+    tl.store(sparse_out_ptr + rows, sparse.to(tl.int32), mask=mask)
+    tl.store(sparse_bool_out_ptr + rows, sparse, mask=mask)
+
+
+def prepare_append_hybrid_metadata(
+    kv_lengths: torch.Tensor,
+    pool_slots: torch.Tensor,
+    bootstrap_mask: torch.Tensor,
+    *,
+    min_kv_length: int,
+    graph_max_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build fixed-graph exact/bootstrap/sparse row metadata in one launch."""
+    batch = kv_lengths.numel()
+    metadata = (kv_lengths, pool_slots, bootstrap_mask)
+    if any(
+        tensor.dtype != torch.int32
+        or tensor.shape != (batch,)
+        or not tensor.is_cuda
+        for tensor in metadata
+    ):
+        raise ValueError("APPEND hybrid metadata must be CUDA int32 [B]")
+    if min_kv_length <= 0 or graph_max_seq_len <= 0:
+        raise ValueError("invalid APPEND hybrid length configuration")
+    exact_lengths = torch.empty_like(kv_lengths)
+    bootstrap_rows = torch.empty_like(kv_lengths)
+    sparse_rows = torch.empty_like(kv_lengths)
+    sparse_rows_bool = torch.empty(batch, dtype=torch.bool, device=kv_lengths.device)
+    if batch == 0:
+        return exact_lengths, bootstrap_rows, sparse_rows, sparse_rows_bool
+    block = max(16, triton.next_power_of_2(batch))
+    _append_hybrid_metadata_kernel[(1,)](
+        kv_lengths,
+        pool_slots,
+        bootstrap_mask,
+        exact_lengths,
+        bootstrap_rows,
+        sparse_rows,
+        sparse_rows_bool,
+        batch,
+        MIN_KV_LENGTH=min_kv_length,
+        MAX_SEQ_LEN=graph_max_seq_len,
+        BLOCK=block,
+        num_warps=1,
+    )
+    return exact_lengths, bootstrap_rows, sparse_rows, sparse_rows_bool
 
 
 def sparse_fp8_mqa_logits(
@@ -530,6 +610,7 @@ def sparse_fp8_mqa_append_logits(
     source_chunks: int,
     graph_max_seq_len: int,
     dummy_slot_base: int,
+    external_active: Optional[torch.Tensor] = None,
     block_n: int = 64,
     num_warps: int = 8,
 ) -> tuple[
@@ -551,6 +632,12 @@ def sparse_fp8_mqa_append_logits(
     metadata = (pool_slots, decode_steps, kv_lengths)
     if any(tensor.dtype != torch.int32 or tensor.shape != (batch,) for tensor in metadata):
         raise ValueError("APPEND graph metadata must be int32 [B]")
+    if external_active is not None and (
+        external_active.dtype != torch.int32
+        or external_active.shape != (batch,)
+        or external_active.device != q_fp8.device
+    ):
+        raise ValueError("APPEND external_active must be int32 [B] on the query device")
     if block_table.shape[0] != batch or weights.shape != (batch, heads):
         raise ValueError("APPEND score batch size mismatch")
     if heads != 32 or head_dim != 128:
@@ -600,6 +687,7 @@ def sparse_fp8_mqa_append_logits(
         pool_slots,
         decode_steps,
         kv_lengths,
+        external_active if external_active is not None else kv_lengths,
         logits,
         candidate_lengths,
         chunk_starts,
@@ -622,6 +710,7 @@ def sparse_fp8_mqa_append_logits(
         MIN_KV_LENGTH=min_kv_length,
         SOURCE_CHUNKS=source_chunks,
         MAX_SEQ_LEN=graph_max_seq_len,
+        USE_EXTERNAL_ACTIVE=external_active is not None,
         num_warps=num_warps,
         num_stages=2,
     )

@@ -849,7 +849,8 @@ bool CudaGraphRunner::tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs
     state.current_real_graph_bs = *it;
     state.current_graph_key = decodeGraphKey(state.current_real_graph_bs,
                                              state.use_decode_indexer_pool_graph,
-                                             state.use_decode_indexer_bootstrap_graph);
+                                             state.use_decode_indexer_bootstrap_graph,
+                                             state.use_decode_indexer_mixed_graph);
     RTP_LLM_LOG_DEBUG(
         "batch size used in replay: %d (capacity %d, graph key %d)",
         state.current_batch_size,
@@ -898,6 +899,7 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
 
     state.use_decode_indexer_pool_graph       = false;
     state.use_decode_indexer_bootstrap_graph  = false;
+    state.use_decode_indexer_mixed_graph      = false;
     state.allow_decode_indexer_pool_bootstrap = false;
     if (kDecodeIndexerPoolEnabled && !is_prefill_cuda_graph_mode_ && !target_verify_decode
         && !inputs.attention_inputs.is_prefill && !inputs.attention_inputs.is_speculative) {
@@ -949,12 +951,16 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
             }
             state.use_decode_indexer_pool_graph      = unique && any_sparse && !any_exact;
             state.use_decode_indexer_bootstrap_graph =
-                unique && any_exact && (any_sparse || any_bootstrap);
+                unique && any_bootstrap;
+            state.use_decode_indexer_mixed_graph =
+                unique && any_sparse && any_exact && !any_bootstrap;
             state.allow_decode_indexer_pool_bootstrap =
-                state.use_decode_indexer_pool_graph || state.use_decode_indexer_bootstrap_graph;
+                state.use_decode_indexer_pool_graph || state.use_decode_indexer_bootstrap_graph
+                || state.use_decode_indexer_mixed_graph;
             if (kDecodeIndexerPoolLogBatch) {
                 const char* graph_path = state.use_decode_indexer_pool_graph       ? "steady"
                                          : state.use_decode_indexer_bootstrap_graph ? "hybrid"
+                                         : state.use_decode_indexer_mixed_graph ? "mixed"
                                                                                     : "exact";
                 RTP_LLM_LOG_INFO(
                     "decode indexer batch: real_bs=%ld bootstrap=%ld sparse=%ld exact=%ld "
@@ -980,6 +986,12 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
             static std::once_flag hybrid_graph_admission_log;
             std::call_once(hybrid_graph_admission_log, []() {
                 std::cout << "decode indexer mixed batch admitted to hybrid CUDA graph replay" << std::endl;
+            });
+        }
+        if (state.use_decode_indexer_mixed_graph) {
+            static std::once_flag mixed_graph_admission_log;
+            std::call_once(mixed_graph_admission_log, []() {
+                std::cout << "decode indexer exact+sparse batch admitted to mixed CUDA graph replay" << std::endl;
             });
         }
     }
@@ -1035,14 +1047,19 @@ int CudaGraphRunner::getCurrentRealGraphBs(const CudaGraphState& state) const {
     return state.current_real_graph_bs;
 }
 
-int CudaGraphRunner::decodeGraphKey(int batch_size, bool pool_mode, bool bootstrap_mode) const {
-    RTP_LLM_CHECK_WITH_INFO(!(pool_mode && bootstrap_mode),
-                            "decode indexer graph cannot be pool and bootstrap mode simultaneously");
+int CudaGraphRunner::decodeGraphKey(int batch_size, bool pool_mode, bool bootstrap_mode, bool mixed_mode) const {
+    RTP_LLM_CHECK_WITH_INFO(static_cast<int>(pool_mode) + static_cast<int>(bootstrap_mode)
+                                + static_cast<int>(mixed_mode)
+                                <= 1,
+                            "decode indexer graph modes are mutually exclusive");
     if (pool_mode) {
         return -batch_size;
     }
     if (bootstrap_mode) {
         return static_cast<int>(max_bs_) + batch_size;
+    }
+    if (mixed_mode) {
+        return 2 * static_cast<int>(max_bs_) + batch_size;
     }
     return batch_size;
 }
@@ -1502,6 +1519,7 @@ void CudaGraphRunner::prepareCaptureInputs(PyModelInputs& inputs, int batch_size
         inputs.attention_inputs.indexer_pool_graph_mode = cap_attn.indexer_pool_graph_mode;
         inputs.attention_inputs.indexer_pool_bootstrap_graph_mode =
             cap_attn.indexer_pool_bootstrap_graph_mode;
+        inputs.attention_inputs.indexer_pool_mixed_graph_mode = cap_attn.indexer_pool_mixed_graph_mode;
     }
     inputs.attention_inputs.kv_cache_kernel_block_id_device_by_group.clear();
     if (!cap_attn.kv_cache_kernel_block_id_device_by_group.empty()) {

@@ -2,12 +2,23 @@ from unittest import SkipTest, TestCase, main
 
 import torch
 
+from rtp_llm.models_py.modules.base.cuda.indexer_op import IndexerOp
+from rtp_llm.models_py.triton_kernels.sparse_mla.packed_indexer_pool import (
+    PACKED_APPEND_POOL_SIZE,
+    PACKED_POOL_SIZE,
+    gather_packed_pool_kv,
+    gather_packed_pool_kv_persistent,
+    initialize_missing_packed_pool,
+    update_materialized_append_pool,
+    update_fixed_packed_pool,
+)
 from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_pool_update import (
     append_global_pool_from_pool_chunk_topk,
     compact_append_pool_if_full,
     initialize_global_pool_inverse_map,
 )
 from rtp_llm.models_py.triton_kernels.sparse_mla.sparse_indexer_score import (
+    prepare_append_hybrid_metadata,
     sparse_fp8_mqa_append_logits,
     sparse_fp8_mqa_logits,
     sparse_fp8_mqa_pool_chunk_logits,
@@ -22,6 +33,426 @@ class SparseIndexerPoolKernelsTest(TestCase):
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
         torch.manual_seed(20260721)
+
+    def test_append_hybrid_metadata_matches_row_routing(self):
+        kv_lengths = torch.tensor(
+            [1, 4096, 4097, 8192, 10000, -5],
+            device=self.device,
+            dtype=torch.int32,
+        )
+        slots = torch.tensor(
+            [-1, 0, 1, 2, 3, 4], device=self.device, dtype=torch.int32
+        )
+        bootstrap_mask = torch.tensor(
+            [0, 0, 1, 0, 1, 0], device=self.device, dtype=torch.int32
+        )
+        exact, bootstrap, sparse, sparse_bool = prepare_append_hybrid_metadata(
+            kv_lengths,
+            slots,
+            bootstrap_mask,
+            min_kv_length=4096,
+            graph_max_seq_len=8192,
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(exact.tolist(), [1, 4096, 4097, 1, 8192, 1])
+        self.assertEqual(bootstrap.tolist(), [0, 0, 1, 0, 1, 0])
+        self.assertEqual(sparse.tolist(), [0, 0, 0, 1, 0, 0])
+        self.assertEqual(
+            sparse_bool.tolist(), [False, False, False, True, False, False]
+        )
+
+    def test_fixed_packed_pool_initializes_and_replaces_only_new_topk(self):
+        batch = 1
+        seq_len = 16 * 1024
+        page_size = 64
+        head_dim = 128
+        entry_bytes = head_dim + 4
+        pages_per_row = seq_len // page_size
+        raw_cache = torch.empty(
+            pages_per_row,
+            page_size * entry_bytes,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        source_k = torch.arange(
+            pages_per_row * page_size * head_dim,
+            dtype=torch.int64,
+            device=self.device,
+        ).remainder(251).to(torch.uint8).view(pages_per_row, page_size, head_dim)
+        source_scales = torch.arange(
+            pages_per_row * page_size,
+            dtype=torch.float32,
+            device=self.device,
+        ).view(pages_per_row, page_size)
+        raw_cache[:, : page_size * head_dim].copy_(source_k.reshape(pages_per_row, -1))
+        raw_cache[:, page_size * head_dim :].copy_(
+            source_scales.view(torch.uint8).reshape(pages_per_row, -1)
+        )
+        kv_cache = raw_cache.view(pages_per_row, page_size, 1, entry_bytes)
+        block_table = torch.arange(
+            pages_per_row, dtype=torch.int32, device=self.device
+        ).view(batch, -1)
+
+        state_capacity = 2
+        pool = torch.zeros(
+            state_capacity, 16 * 1024, dtype=torch.int32, device=self.device
+        )
+        pool[0, :PACKED_POOL_SIZE] = torch.arange(
+            PACKED_POOL_SIZE, dtype=torch.int32, device=self.device
+        )
+        pool_lengths = torch.tensor(
+            [PACKED_POOL_SIZE, 0], dtype=torch.int32, device=self.device
+        )
+        inverse_map = initialize_global_pool_inverse_map(
+            pool, seq_len, pool_lengths
+        )
+        packed = torch.zeros(
+            state_capacity * (PACKED_POOL_SIZE // page_size),
+            page_size,
+            1,
+            entry_bytes,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        slots = torch.tensor([0], dtype=torch.int32, device=self.device)
+        active = torch.ones(batch, dtype=torch.int32, device=self.device)
+        ready = torch.zeros(state_capacity, dtype=torch.int32, device=self.device)
+        initialize_missing_packed_pool(
+            kv_cache,
+            block_table,
+            pool[:, :PACKED_POOL_SIZE],
+            slots,
+            active,
+            torch.full_like(active, PACKED_POOL_SIZE),
+            ready,
+            packed,
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(ready[0].item(), 1)
+        torch.testing.assert_close(
+            packed[: PACKED_POOL_SIZE // page_size],
+            kv_cache[: PACKED_POOL_SIZE // page_size],
+            rtol=0,
+            atol=0,
+        )
+
+        local_topk = torch.arange(2048, dtype=torch.int32, device=self.device).view(1, -1)
+        local_topk[0, -4:] = PACKED_POOL_SIZE + torch.arange(
+            4, dtype=torch.int32, device=self.device
+        )
+        protected = torch.zeros(
+            state_capacity, PACKED_POOL_SIZE, dtype=torch.int32, device=self.device
+        )
+        cursor = torch.zeros(state_capacity, dtype=torch.int32, device=self.device)
+        chunk_starts = torch.tensor(
+            [PACKED_POOL_SIZE], dtype=torch.int32, device=self.device
+        )
+        result, changed_ids, changed_positions, changed_counts = update_fixed_packed_pool(
+            local_topk,
+            pool[:, :PACKED_POOL_SIZE],
+            inverse_map,
+            slots,
+            chunk_starts,
+            torch.ones(batch, dtype=torch.int32, device=self.device),
+            active,
+            protected,
+            cursor,
+        )
+        gather_packed_pool_kv(
+            kv_cache,
+            block_table,
+            changed_ids,
+            torch.zeros(batch, dtype=torch.int32, device=self.device),
+            changed_counts,
+            slots,
+            active,
+            packed,
+            destination_positions=changed_positions,
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(changed_counts.item(), 4)
+        torch.testing.assert_close(
+            result[0, -4:],
+            torch.arange(
+                PACKED_POOL_SIZE,
+                PACKED_POOL_SIZE + 4,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        )
+        changed = changed_positions[0, :4].long()
+        new_ids = changed_ids[0, :4].long()
+        torch.testing.assert_close(pool[0, changed], new_ids.to(torch.int32))
+        self.assertTrue((inverse_map[0, new_ids] == changed.to(torch.int32) + 1).all())
+
+        packed_raw = packed.view(state_capacity, PACKED_POOL_SIZE // page_size, page_size * entry_bytes)
+        packed_k = packed_raw[:, :, : page_size * head_dim].reshape(
+            state_capacity, PACKED_POOL_SIZE, head_dim
+        )
+        packed_s = packed_raw[:, :, page_size * head_dim :].reshape(
+            state_capacity, PACKED_POOL_SIZE, 4
+        )
+        expected_blocks = torch.div(new_ids, page_size, rounding_mode="floor")
+        expected_offsets = torch.remainder(new_ids, page_size)
+        torch.testing.assert_close(
+            packed_k[0, changed], source_k[expected_blocks, expected_offsets]
+        )
+        torch.testing.assert_close(
+            packed_s[0, changed],
+            source_scales[expected_blocks, expected_offsets]
+            .view(torch.uint8)
+            .reshape(-1, 4),
+        )
+
+    def test_materialized_append_pool_compacts_with_ring_base(self):
+        batch = 1
+        page_size = 64
+        head_dim = 128
+        entry_bytes = head_dim + 4
+        seq_len = 32 * 1024
+        pages = seq_len // page_size
+        raw_cache = torch.empty(
+            pages, page_size * entry_bytes, dtype=torch.uint8, device=self.device
+        )
+        source_k = torch.arange(
+            pages * page_size * head_dim,
+            dtype=torch.int64,
+            device=self.device,
+        ).remainder(251).to(torch.uint8).view(pages, page_size, head_dim)
+        source_scales = torch.arange(
+            pages * page_size, dtype=torch.float32, device=self.device
+        ).view(pages, page_size)
+        raw_cache[:, : page_size * head_dim].copy_(source_k.reshape(pages, -1))
+        raw_cache[:, page_size * head_dim :].copy_(
+            source_scales.view(torch.uint8).reshape(pages, -1)
+        )
+        kv_cache = raw_cache.view(pages, page_size, 1, entry_bytes)
+        block_table = torch.arange(
+            pages, dtype=torch.int32, device=self.device
+        ).view(batch, -1)
+
+        pool = torch.arange(
+            PACKED_APPEND_POOL_SIZE, dtype=torch.int32, device=self.device
+        ).view(1, -1)
+        pool_lengths = torch.tensor(
+            [PACKED_APPEND_POOL_SIZE], dtype=torch.int32, device=self.device
+        )
+        inverse_map = initialize_global_pool_inverse_map(
+            pool, seq_len, pool_lengths
+        )
+        packed = kv_cache[: PACKED_APPEND_POOL_SIZE // page_size].clone()
+        slots = torch.zeros(batch, dtype=torch.int32, device=self.device)
+        active = torch.ones(batch, dtype=torch.int32, device=self.device)
+        base_offsets = torch.zeros(batch, dtype=torch.int32, device=self.device)
+        local_topk = (
+            PACKED_POOL_SIZE
+            + torch.arange(2048, dtype=torch.int32, device=self.device)
+        ).view(1, -1)
+        local_topk[0, -4:] = PACKED_APPEND_POOL_SIZE + torch.arange(
+            4, dtype=torch.int32, device=self.device
+        )
+        chunk_start = torch.tensor(
+            [PACKED_APPEND_POOL_SIZE], dtype=torch.int32, device=self.device
+        )
+        result, changed_ids, changed_positions, changed_counts = (
+            update_materialized_append_pool(
+                local_topk,
+                pool,
+                pool_lengths,
+                inverse_map,
+                slots,
+                chunk_start,
+                active,
+                base_offsets,
+            )
+        )
+        gather_packed_pool_kv_persistent(
+            kv_cache,
+            block_table,
+            changed_ids,
+            torch.zeros_like(slots),
+            changed_positions,
+            changed_counts,
+            slots,
+            active,
+            packed,
+            destination_base_offsets=base_offsets,
+            pool_capacity=PACKED_APPEND_POOL_SIZE,
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(base_offsets.item(), PACKED_POOL_SIZE)
+        self.assertEqual(pool_lengths.item(), PACKED_POOL_SIZE + 4)
+        self.assertEqual(changed_counts.item(), 4)
+        torch.testing.assert_close(
+            pool[0, :PACKED_POOL_SIZE],
+            torch.arange(
+                PACKED_POOL_SIZE,
+                PACKED_APPEND_POOL_SIZE,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        )
+        torch.testing.assert_close(
+            pool[0, PACKED_POOL_SIZE : PACKED_POOL_SIZE + 4],
+            torch.arange(
+                PACKED_APPEND_POOL_SIZE,
+                PACKED_APPEND_POOL_SIZE + 4,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        )
+        torch.testing.assert_close(
+            result[0, -4:],
+            torch.arange(
+                PACKED_APPEND_POOL_SIZE,
+                PACKED_APPEND_POOL_SIZE + 4,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        )
+
+        packed_raw = packed.view(
+            PACKED_APPEND_POOL_SIZE // page_size, page_size * entry_bytes
+        )
+        packed_k = packed_raw[:, : page_size * head_dim].reshape(
+            PACKED_APPEND_POOL_SIZE, head_dim
+        )
+        logical_positions = torch.arange(
+            PACKED_POOL_SIZE + 4, dtype=torch.long, device=self.device
+        )
+        physical_positions = torch.remainder(
+            logical_positions + base_offsets.item(), PACKED_APPEND_POOL_SIZE
+        )
+        logical_ids = pool[0, : PACKED_POOL_SIZE + 4].long()
+        expected_blocks = torch.div(logical_ids, page_size, rounding_mode="floor")
+        expected_offsets = torch.remainder(logical_ids, page_size)
+        torch.testing.assert_close(
+            packed_k[physical_positions],
+            source_k[expected_blocks, expected_offsets],
+        )
+
+    def test_fixed_packed_dual_paged_matches_unaligned_sparse_candidates(self):
+        seq_len = 70003
+        graph_max_seq_len = ((seq_len + 63) // 64) * 64
+        pages = graph_max_seq_len // 64
+        raw_cache = torch.empty(
+            pages, 64 * 132, dtype=torch.uint8, device=self.device
+        )
+        raw_cache[:, : 64 * 128].copy_(
+            torch.randint(
+                0,
+                120,
+                (pages, 64 * 128),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+        )
+        scales = torch.ones(pages, 64, dtype=torch.float32, device=self.device)
+        raw_cache[:, 64 * 128 :].copy_(
+            scales.view(torch.uint8).reshape(pages, -1)
+        )
+        kv_cache = raw_cache.view(pages, 64, 1, 132)
+        block_table = torch.arange(
+            pages, dtype=torch.int32, device=self.device
+        ).view(1, -1)
+        q = torch.randn(1, 32, 128, device=self.device).clamp_(-3, 3).to(
+            torch.float8_e4m3fn
+        )
+        weights = torch.randn(1, 32, dtype=torch.float32, device=self.device)
+        pool = torch.zeros(2, 16 * 1024, dtype=torch.int32, device=self.device)
+        pool[0, :PACKED_POOL_SIZE] = torch.randperm(
+            seq_len, dtype=torch.int32, device=self.device
+        )[:PACKED_POOL_SIZE]
+        pool_lengths = torch.tensor(
+            [PACKED_POOL_SIZE, 0], dtype=torch.int32, device=self.device
+        )
+        inverse_map = initialize_global_pool_inverse_map(
+            pool, graph_max_seq_len, pool_lengths
+        )
+        packed = torch.zeros(
+            2 * (PACKED_POOL_SIZE // 64),
+            64,
+            1,
+            132,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        ready = torch.zeros(2, dtype=torch.int32, device=self.device)
+        protected = torch.zeros(
+            2, PACKED_POOL_SIZE, dtype=torch.int32, device=self.device
+        )
+        cursor = torch.zeros(2, dtype=torch.int32, device=self.device)
+        slots = torch.zeros(1, dtype=torch.int32, device=self.device)
+        decode_step = torch.tensor([7], dtype=torch.int32, device=self.device)
+        kv_lengths = torch.tensor([seq_len], dtype=torch.int32, device=self.device)
+
+        phase = decode_step.item() - 1
+        chunk_start = seq_len * phase // 16
+        chunk_end = seq_len * (phase + 1) // 16
+        chunk_capacity = (graph_max_seq_len + 15) // 16
+        chunk = (
+            chunk_start
+            + torch.arange(chunk_capacity, dtype=torch.int32, device=self.device)
+        ).view(1, -1)
+        chunk_lengths = torch.tensor(
+            [chunk_end - chunk_start], dtype=torch.int32, device=self.device
+        )
+        old_pool = pool[0, :PACKED_POOL_SIZE].clone().view(1, -1)
+        reference_logits = sparse_fp8_mqa_pool_chunk_logits(
+            q,
+            weights,
+            kv_cache,
+            block_table,
+            pool,
+            pool_lengths,
+            chunk,
+            chunk_lengths,
+            pool_slots=slots,
+        )
+        op = IndexerOp(32, 128, 2048, rope_head_dim=0)
+        candidate_lengths = torch.tensor(
+            [PACKED_POOL_SIZE + chunk_lengths.item()],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        reference_local = op._select_persistent_topk(
+            reference_logits,
+            candidate_lengths,
+            16 * 1024 + chunk_capacity,
+            "reference",
+        )
+        candidate_ids = torch.cat((old_pool, chunk), dim=1)
+        reference_ids = torch.gather(
+            candidate_ids, 1, reference_local.long()
+        ).to(torch.int32)
+
+        actual = op._score_paged_packed_pool_step(
+            q,
+            weights,
+            kv_cache,
+            block_table,
+            pool,
+            inverse_map,
+            packed,
+            ready,
+            protected,
+            cursor,
+            slots,
+            decode_step,
+            kv_lengths,
+            1,
+            64 * 1024,
+            16,
+            graph_max_seq_len,
+        )
+        torch.cuda.synchronize()
+        overlap = len(
+            set(actual[0].cpu().tolist())
+            & set(reference_ids[0].cpu().tolist())
+        )
+        self.assertEqual(overlap, 2048)
 
     def test_pool_chunk_score_matches_explicit_candidates_in_graph(self):
         batch = 2
@@ -236,6 +667,40 @@ class SparseIndexerPoolKernelsTest(TestCase):
             rtol=0,
             atol=0,
         )
+
+        external_active = torch.tensor(
+            [1, 0], device=self.device, dtype=torch.int32
+        )
+        (
+            masked_logits,
+            masked_topk_lengths,
+            _,
+            masked_chunk_lengths,
+            masked_slots,
+            masked_active,
+        ) = sparse_fp8_mqa_append_logits(
+            q,
+            weights,
+            kv_cache,
+            block_table,
+            scheduled_pool,
+            scheduled_lengths,
+            scheduled_slots,
+            decode_steps,
+            kv_lengths,
+            min_kv_length=4096,
+            source_chunks=16,
+            graph_max_seq_len=seq_len,
+            dummy_slot_base=2,
+            external_active=external_active,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(masked_logits[0], scheduled_logits[0])
+        self.assertTrue(torch.isneginf(masked_logits[1]).all())
+        self.assertEqual(masked_topk_lengths.tolist(), [5120, 1])
+        self.assertEqual(masked_chunk_lengths.tolist(), [1024, 0])
+        self.assertEqual(masked_slots.tolist(), [0, 3])
+        self.assertEqual(masked_active.tolist(), [1, 0])
 
     def test_append_and_compact_preserve_inverse_map(self):
         seq_len = 32 * 1024

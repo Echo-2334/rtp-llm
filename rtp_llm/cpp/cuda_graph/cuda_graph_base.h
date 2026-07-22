@@ -18,6 +18,7 @@ struct CudaGraphState {
     int seq_len_sum{0};
     bool use_decode_indexer_pool_graph{false};
     bool use_decode_indexer_bootstrap_graph{false};
+    bool use_decode_indexer_mixed_graph{false};
     bool allow_decode_indexer_pool_bootstrap{false};
 };
 

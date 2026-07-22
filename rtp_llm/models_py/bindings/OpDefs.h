@@ -342,10 +342,11 @@ struct PyAttentionInputs {
 
     // CUDA Graph mode flags
     bool is_cuda_graph = false;  // True when running in CUDA graph mode (capture or replay)
-    // Static per-graph variants for the steady candidate-pool path and the
-    // one-step exact bootstrap path.
+    // Static per-graph variants for steady pool, bootstrap hybrid, and
+    // exact+sparse hybrid work without bootstrap.
     bool indexer_pool_graph_mode = false;
     bool indexer_pool_bootstrap_graph_mode = false;
+    bool indexer_pool_mixed_graph_mode = false;
     // Host-side batch admission signal retained for non-graph/eager callers.
     bool indexer_pool_bootstrap = false;
 

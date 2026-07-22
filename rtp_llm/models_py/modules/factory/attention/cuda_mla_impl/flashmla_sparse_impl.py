@@ -796,6 +796,96 @@ class SparseMlaImpl(MlaImplBase):
         torch.bmm(attn_output.transpose(0, 1), v_weight, out=output.transpose(0, 1))
         return output
 
+    def _maybe_dump_decode_qk(
+        self,
+        q: torch.Tensor,
+        kv_cache: KVCache,
+        topk_indices: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        dump_dir = os.environ.get("RTP_LLM_MLA_QK_DUMP_DIR", "")
+        dump_layer = int(os.environ.get("RTP_LLM_MLA_QK_DUMP_LAYER", "-1"))
+        dump_steps = int(os.environ.get("RTP_LLM_MLA_QK_DUMP_STEPS", "0"))
+        if (
+            not dump_dir
+            or dump_steps <= 0
+            or (dump_layer >= 0 and layer_id != dump_layer)
+            or self.is_prefill
+            or bool(getattr(self.attn_inputs, "is_cuda_graph", False))
+        ):
+            return
+
+        request_ids = getattr(self.attn_inputs, "decode_request_id", None)
+        decode_steps = getattr(self.attn_inputs, "decode_step", None)
+        kv_lengths = getattr(self.attn_inputs, "decode_kv_length", None)
+        score_lengths = getattr(self.fmha_params, "expanded_seq_lens", None)
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (request_ids, decode_steps, kv_lengths, score_lengths)
+        ):
+            return
+        batch_size = int(request_ids.numel())
+        if q.shape[0] != batch_size or topk_indices.shape[0] != batch_size:
+            return
+        if request_ids.is_cuda or decode_steps.is_cuda or kv_lengths.is_cuda:
+            return
+        if self.fmha_impl.block_table is None:
+            return
+
+        os.makedirs(dump_dir, exist_ok=True)
+        block_table = self.fmha_impl.block_table
+        cache_u8 = _as_uint8(kv_cache.kv_cache_base)
+        if cache_u8.ndim == 4:
+            cache_u8 = cache_u8.squeeze(2)
+        if cache_u8.ndim != 3 or cache_u8.shape[-1] != 656:
+            raise RuntimeError(
+                f"MLA QK dump expects FP8 [pages, page_size, 656], got {cache_u8.shape}"
+            )
+
+        for row in range(batch_size):
+            step = int(decode_steps[row])
+            if step < 0 or step >= dump_steps:
+                continue
+            request_id = int(request_ids[row])
+            path = os.path.join(
+                dump_dir,
+                f"mla_layer_{layer_id:02d}_request_{request_id}_step_{step:03d}.pt",
+            )
+            if os.path.exists(path):
+                continue
+            score_length = int(score_lengths[row])
+            payload = {
+                "layer_idx": layer_id,
+                "request_id": request_id,
+                "decode_step": step,
+                "kv_length": int(kv_lengths[row]),
+                "score_length": score_length,
+                "q": q[row].detach().to(torch.bfloat16).cpu(),
+                "topk_indices": topk_indices[row].detach().to(torch.int32).cpu(),
+                "attention_scale": float(self.fmha_impl.scale),
+                "kv_lora_rank": self.kv_lora_rank,
+                "rope_head_dim": self.rope_head_dim,
+            }
+            if step == dump_steps - 1:
+                page_size = int(cache_u8.shape[1])
+                page_count = (score_length + page_size - 1) // page_size
+                physical_pages = (
+                    block_table[row, :page_count].to(torch.long).contiguous()
+                )
+                if physical_pages.numel() != page_count or bool(
+                    torch.any(physical_pages < 0).item()
+                ):
+                    raise RuntimeError(
+                        f"invalid MLA block table for {score_length} tokens: "
+                        f"expected {page_count} pages"
+                    )
+                payload["k_cache_pages"] = (
+                    cache_u8.index_select(0, physical_pages).detach().cpu()
+                )
+                payload["k_page_size"] = page_size
+                payload["k_layout"] = "fp8_ds_mla_logical_pages_uint8"
+            torch.save(payload, path)
+
     # -- Main forward --------------------------------------------------------
 
     def forward(
@@ -838,6 +928,9 @@ class SparseMlaImpl(MlaImplBase):
 
         # 2. Project q via W_kc into the absorbed kv_lora_rank space
         q_transformed = self._apply_input_bmm(q, layer_id)
+        self._maybe_dump_decode_qk(
+            q_transformed, kv_cache, topk_indices, layer_id
+        )
 
         # 3. Sparse attention. FP8 op consumes paged shape; BF16 op wants flat.
         if self.fmha_impl.expects_paged_kv:

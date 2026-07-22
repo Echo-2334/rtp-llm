@@ -37,11 +37,12 @@ std::vector<int> CudaGraphRunner::getDecodeBatchSizesToCapture() {
     return capture_bs;
 }
 
-void CudaGraphRunner::captureDecodeOneBatchSize(int bs, bool pool_mode, bool bootstrap_mode) {
+void CudaGraphRunner::captureDecodeOneBatchSize(int bs, bool pool_mode, bool bootstrap_mode, bool mixed_mode) {
     const char* key_type = pool_mode ? "pool batch size" :
                            bootstrap_mode ? "bootstrap batch size" :
+                           mixed_mode ? "mixed batch size" :
                                             "exact batch size";
-    captureOneGraphInstance(decodeGraphKey(bs, pool_mode, bootstrap_mode), key_type);
+    captureOneGraphInstance(decodeGraphKey(bs, pool_mode, bootstrap_mode, mixed_mode), key_type);
 }
 
 void CudaGraphRunner::captureDecode() {
@@ -53,14 +54,16 @@ void CudaGraphRunner::captureDecode() {
         if (capture_pool_variant) {
             graph_instances_.try_emplace(decodeGraphKey(bs, false, true), enable_cuda_graph_debug_mode_);
             graph_instances_.try_emplace(decodeGraphKey(bs, true, false), enable_cuda_graph_debug_mode_);
+            graph_instances_.try_emplace(decodeGraphKey(bs, false, false, true), enable_cuda_graph_debug_mode_);
         }
     }
     int capture_range_size = capture_range_.size();
     for (int i = capture_range_size - 1; i >= 0; i--) {
         int bs = capture_range_[i];
-        for (int graph_mode = 0; graph_mode < 3; ++graph_mode) {
+        for (int graph_mode = 0; graph_mode < 4; ++graph_mode) {
             const bool pool_mode      = graph_mode == 2;
             const bool bootstrap_mode = graph_mode == 1;
+            const bool mixed_mode     = graph_mode == 3;
             if (graph_mode != 0 && !capture_pool_variant) {
                 continue;
             }
@@ -69,6 +72,7 @@ void CudaGraphRunner::captureDecode() {
             prepareCaptureInputs(inputs, bs, bs * num_tokens_per_bs_);
             inputs.attention_inputs.indexer_pool_graph_mode           = pool_mode;
             inputs.attention_inputs.indexer_pool_bootstrap_graph_mode = bootstrap_mode;
+            inputs.attention_inputs.indexer_pool_mixed_graph_mode     = mixed_mode;
             if (capture_pool_variant) {
                 inputs.attention_inputs.decode_kv_length.fill_(decodeIndexerPoolMinKvLength() + 1);
             }
@@ -82,26 +86,30 @@ void CudaGraphRunner::captureDecode() {
             }
             inputs.attention_inputs.context_total_kv_length = bs * (max_input_len + max_prefix_len);
 
-            const int graph_key = decodeGraphKey(bs, pool_mode, bootstrap_mode);
+            const int graph_key = decodeGraphKey(bs, pool_mode, bootstrap_mode, mixed_mode);
             graph_instances_[graph_key].mem_hold_ = createCaptureMemoryHold(inputs, bs * num_tokens_per_bs_);
             graph_instances_[graph_key].mem_hold_.attn_pyobj_ =
                 py_attn_pyobj_method_(graph_instances_[graph_key].mem_hold_.py_model_inputs_, true);
             try {
-                captureDecodeOneBatchSize(bs, pool_mode, bootstrap_mode);
+                captureDecodeOneBatchSize(bs, pool_mode, bootstrap_mode, mixed_mode);
                 const char* key_type = pool_mode ? "pool batch size" :
                                        bootstrap_mode ? "bootstrap batch size" :
+                                       mixed_mode ? "mixed batch size" :
                                                         "exact batch size";
                 replayAndSyncCheck(graph_key, key_type);
-                RTP_LLM_LOG_INFO("capture success for batch size: %d, pool mode: %d, bootstrap mode: %d",
+                RTP_LLM_LOG_INFO("capture success for batch size: %d, pool mode: %d, bootstrap mode: %d, "
+                                 "mixed mode: %d",
                                  bs,
                                  pool_mode,
-                                 bootstrap_mode);
+                                 bootstrap_mode,
+                                 mixed_mode);
             } catch (const std::exception& e) {
                 RTP_LLM_LOG_ERROR("CUDA graph capture failed for decode batch size %d, pool mode %d, "
-                                  "bootstrap mode %d: %s",
+                                  "bootstrap mode %d, mixed mode %d: %s",
                                   bs,
                                   pool_mode,
                                   bootstrap_mode,
+                                  mixed_mode,
                                   e.what());
 #if USING_CUDA
                 cudaGetLastError();
