@@ -24,7 +24,7 @@ struct PoolPostprocessArgs {
     int32_t*       pool_lengths;
     const int32_t* chunk;
     const int32_t* chunk_lengths;
-    int32_t*       inverse_map;
+    uint8_t*       inverse_map;
     const int32_t* pool_slots;
     const int32_t* active_mask;
     uint32_t       pool_stride;
@@ -290,9 +290,9 @@ void dsv4_persistent_topk_pool(const torch::Tensor& logits,
                 "invalid fused pool TopK score tensors");
     TORCH_CHECK(pool.dtype() == torch::kInt32 && pool_lengths.dtype() == torch::kInt32
                     && chunk.dtype() == torch::kInt32 && chunk_lengths.dtype() == torch::kInt32
-                    && inverse_map.dtype() == torch::kInt32 && pool_slots.dtype() == torch::kInt32
+                    && inverse_map.dtype() == torch::kUInt8 && pool_slots.dtype() == torch::kInt32
                     && active_mask.dtype() == torch::kInt32,
-                "fused pool TopK state tensors must be int32");
+                "fused pool TopK state tensors have invalid dtypes");
     TORCH_CHECK(logits.dim() == 2 && lengths.numel() == logits.size(0), "invalid logits or lengths shape");
     TORCH_CHECK(output.size(0) == logits.size(0) && output.size(1) == 2048,
                 "fused pool TopK output must be [B,2048]");
@@ -311,7 +311,7 @@ void dsv4_persistent_topk_pool(const torch::Tensor& logits,
         pool_lengths.data_ptr<int32_t>(),
         chunk.data_ptr<int32_t>(),
         chunk_lengths.data_ptr<int32_t>(),
-        inverse_map.data_ptr<int32_t>(),
+        inverse_map.data_ptr<uint8_t>(),
         pool_slots.data_ptr<int32_t>(),
         active_mask.data_ptr<int32_t>(),
         static_cast<uint32_t>(pool.stride(0)),

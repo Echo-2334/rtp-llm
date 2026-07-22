@@ -239,7 +239,7 @@ class SparseIndexerPoolKernelsTest(TestCase):
             [PACKED_APPEND_POOL_SIZE], dtype=torch.int32, device=self.device
         )
         inverse_map = initialize_global_pool_inverse_map(
-            pool, seq_len, pool_lengths
+            pool, seq_len, pool_lengths, membership_only=True
         )
         packed = kv_cache[: PACKED_APPEND_POOL_SIZE // page_size].clone()
         slots = torch.zeros(batch, dtype=torch.int32, device=self.device)
@@ -823,7 +823,7 @@ class SparseIndexerPoolKernelsTest(TestCase):
         reference_pool = initial_pool.clone()
         reference_lengths = initial_lengths.clone()
         reference_inverse = initialize_global_pool_inverse_map(
-            reference_pool, max_seq_len, reference_lengths
+            reference_pool, max_seq_len, reference_lengths, membership_only=True
         )
         local_topk = torch.empty(
             batch, topk, device=self.device, dtype=torch.int32
@@ -853,7 +853,7 @@ class SparseIndexerPoolKernelsTest(TestCase):
         fused_pool = initial_pool.clone()
         fused_lengths = initial_lengths.clone()
         fused_inverse = initialize_global_pool_inverse_map(
-            fused_pool, max_seq_len, fused_lengths
+            fused_pool, max_seq_len, fused_lengths, membership_only=True
         )
         fused_output = torch.empty_like(local_topk)
         fused_workspace = torch.empty_like(reference_workspace)
@@ -881,15 +881,13 @@ class SparseIndexerPoolKernelsTest(TestCase):
             )
         for pool_slot in range(batch):
             pool_length = int(fused_lengths[pool_slot].item())
+            fused_ids = fused_pool[pool_slot, :pool_length].long()
+            reference_ids = reference_pool[pool_slot, :pool_length].long()
             self.assertEqual(
-                set(fused_pool[pool_slot, :pool_length].cpu().tolist()),
-                set(reference_pool[pool_slot, :pool_length].cpu().tolist()),
+                set(fused_ids.cpu().tolist()),
+                set(reference_ids.cpu().tolist()),
             )
-            ids = fused_pool[pool_slot, :pool_length].to(torch.long)
-            positions = fused_inverse[pool_slot, ids].to(torch.long) - 1
-            torch.testing.assert_close(
-                fused_pool[pool_slot, positions], ids.to(torch.int32), rtol=0, atol=0
-            )
+            self.assertTrue((fused_inverse[pool_slot, fused_ids] == 1).all())
 
     def test_fused_topk_compacts_full_pool_after_selection(self):
         topk = 2048
@@ -907,7 +905,7 @@ class SparseIndexerPoolKernelsTest(TestCase):
             [pool_capacity], device=self.device, dtype=torch.int32
         )
         inverse_map = initialize_global_pool_inverse_map(
-            pool, max_seq_len, pool_lengths
+            pool, max_seq_len, pool_lengths, membership_only=True
         )
         chunk = torch.arange(
             pool_capacity,
@@ -962,14 +960,11 @@ class SparseIndexerPoolKernelsTest(TestCase):
         expected_pool = retained | set(expected_ids[0].cpu().tolist())
         pool_length = int(pool_lengths[0].item())
         self.assertEqual(pool_length, len(expected_pool))
+        ids = pool[0, :pool_length].long()
         self.assertEqual(
-            set(pool[0, :pool_length].cpu().tolist()), expected_pool
+            set(ids.cpu().tolist()), expected_pool
         )
-        ids = pool[0, :pool_length].to(torch.long)
-        positions = inverse_map[0, ids].to(torch.long) - 1
-        torch.testing.assert_close(
-            pool[0, positions], ids.to(torch.int32), rtol=0, atol=0
-        )
+        self.assertTrue((inverse_map[0, ids] == 1).all())
 
 
 if __name__ == "__main__":

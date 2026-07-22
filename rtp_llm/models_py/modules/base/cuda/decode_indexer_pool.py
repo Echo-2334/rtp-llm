@@ -672,7 +672,12 @@ class DecodeIndexerPool:
             if self._append_inverse_map is not None:
                 new_append_inverse_map = torch.zeros(
                     (new_capacity, self._append_graph_max_seq_len),
-                    dtype=torch.int32,
+                    dtype=(
+                        torch.int32
+                        if self.config.packed_pool
+                        and self.config.packed_pool_update == "REPLACE"
+                        else torch.uint8
+                    ),
                     device=device,
                 )
                 new_append_inverse_map[: self._capacity].copy_(
@@ -808,7 +813,12 @@ class DecodeIndexerPool:
         assert self._device is not None
         self._append_inverse_map = torch.zeros(
             (self._capacity, graph_max_seq_len),
-            dtype=torch.int32,
+            dtype=(
+                torch.int32
+                if self.config.packed_pool
+                and self.config.packed_pool_update == "REPLACE"
+                else torch.uint8
+            ),
             device=self._device,
         )
         self._append_graph_max_seq_len = graph_max_seq_len

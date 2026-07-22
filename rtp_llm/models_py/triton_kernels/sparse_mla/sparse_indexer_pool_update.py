@@ -29,6 +29,7 @@ def _append_pool_from_pool_chunk_topk_kernel(
     TOPK: tl.constexpr,
     USE_POOL_SLOTS: tl.constexpr,
     USE_ACTIVE_MASK: tl.constexpr,
+    MEMBERSHIP_ONLY: tl.constexpr,
 ):
     batch = tl.program_id(0)
     offsets = tl.arange(0, TOPK)
@@ -79,7 +80,7 @@ def _append_pool_from_pool_chunk_topk_kernel(
         inverse_map_ptr
         + pool_batch * inverse_map_stride_b
         + selected_ids.to(tl.int64),
-        append_slots + 1,
+        tl.where(MEMBERSHIP_ONLY, 1, append_slots + 1),
         mask=append,
     )
     appended = tl.minimum(
@@ -103,6 +104,7 @@ def _compact_append_pool_kernel(
     BLOCK_SIZE: tl.constexpr,
     USE_POOL_SLOTS: tl.constexpr,
     USE_ACTIVE_MASK: tl.constexpr,
+    MEMBERSHIP_ONLY: tl.constexpr,
 ):
     batch = tl.program_id(0)
     block = tl.program_id(1)
@@ -125,26 +127,27 @@ def _compact_append_pool_kernel(
         mask=valid,
         other=0,
     ).to(tl.int64)
+    tl.store(
+        inverse_map_ptr + pool_batch * inverse_map_stride_b + evicted_ids,
+        0,
+        mask=valid,
+    )
     kept_ids = tl.load(
         pool_ptr + pool_batch * pool_stride_b + KEEP_SIZE + offsets,
         mask=valid,
         other=0,
     ).to(tl.int64)
     tl.store(
-        inverse_map_ptr + pool_batch * inverse_map_stride_b + evicted_ids,
-        0,
-        mask=valid,
-    )
-    tl.store(
         pool_ptr + pool_batch * pool_stride_b + offsets,
         kept_ids.to(tl.int32),
         mask=valid,
     )
-    tl.store(
-        inverse_map_ptr + pool_batch * inverse_map_stride_b + kept_ids,
-        offsets + 1,
-        mask=valid,
-    )
+    if not MEMBERSHIP_ONLY:
+        tl.store(
+            inverse_map_ptr + pool_batch * inverse_map_stride_b + kept_ids,
+            offsets + 1,
+            mask=valid,
+        )
 
 
 @triton.jit
@@ -183,6 +186,7 @@ def _scatter_pool_inverse_map_kernel(
     inverse_map_stride_b,
     POOL_CAPACITY: tl.constexpr,
     USE_POOL_SLOTS: tl.constexpr,
+    MEMBERSHIP_ONLY: tl.constexpr,
 ):
     batch = tl.program_id(0)
     if USE_POOL_SLOTS:
@@ -199,7 +203,7 @@ def _scatter_pool_inverse_map_kernel(
     ).to(tl.int64)
     tl.store(
         inverse_map_ptr + pool_batch * inverse_map_stride_b + pool_ids,
-        offsets + 1,
+        tl.where(MEMBERSHIP_ONLY, 1, offsets + 1),
         mask=valid,
     )
 
@@ -208,12 +212,14 @@ def initialize_global_pool_inverse_map(
     pool: torch.Tensor,
     max_seq_len: int,
     pool_lengths: torch.Tensor,
+    *,
+    membership_only: bool = False,
 ) -> torch.Tensor:
     """Build logical-token to pool-slot mapping for an initialized pool."""
     _validate_pool(pool, pool_lengths)
     inverse_map = torch.zeros(
         (pool.shape[0], max_seq_len),
-        dtype=torch.int32,
+        dtype=torch.uint8 if membership_only else torch.int32,
         device=pool.device,
     )
     _scatter_pool_inverse_map_kernel[(pool.shape[0],)](
@@ -225,6 +231,7 @@ def initialize_global_pool_inverse_map(
         inverse_map.stride(0),
         POOL_CAPACITY=pool.shape[1],
         USE_POOL_SLOTS=False,
+        MEMBERSHIP_ONLY=membership_only,
         num_warps=8,
         num_stages=1,
     )
@@ -250,6 +257,7 @@ def initialize_global_pool_rows_inverse_map(
         inverse_map.stride(0),
         POOL_CAPACITY=pool.shape[1],
         USE_POOL_SLOTS=True,
+        MEMBERSHIP_ONLY=inverse_map.dtype == torch.uint8,
         num_warps=8,
         num_stages=1,
     )
@@ -289,6 +297,7 @@ def compact_append_pool_if_full(
         BLOCK_SIZE=block_size,
         USE_POOL_SLOTS=pool_slots is not None,
         USE_ACTIVE_MASK=active_mask is not None,
+        MEMBERSHIP_ONLY=inverse_map.dtype == torch.uint8,
         num_warps=4,
         num_stages=1,
     )
@@ -356,6 +365,7 @@ def append_global_pool_from_pool_chunk_topk(
         TOPK=topk,
         USE_POOL_SLOTS=pool_slots is not None,
         USE_ACTIVE_MASK=active_mask is not None,
+        MEMBERSHIP_ONLY=inverse_map.dtype == torch.uint8,
         num_warps=8,
         num_stages=1,
     )
@@ -379,5 +389,8 @@ def _validate_pool_state(
     inverse_map: torch.Tensor,
 ) -> None:
     _validate_pool(pool, pool_lengths)
-    if inverse_map.dtype != torch.int32 or inverse_map.shape[0] != pool.shape[0]:
-        raise ValueError("inverse_map must be int32 with matching batch size")
+    if (
+        inverse_map.dtype not in (torch.int32, torch.uint8)
+        or inverse_map.shape[0] != pool.shape[0]
+    ):
+        raise ValueError("inverse_map must be int32/uint8 with matching batch size")

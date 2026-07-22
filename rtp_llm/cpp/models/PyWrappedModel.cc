@@ -328,6 +328,19 @@ void PyWrappedModel::assignDecodeIndexerPoolSlots(torch_ext::PyAttentionInputs& 
         const bool    eligible   = kv_length > kDecodeIndexerPoolMinKvLength;
         auto          it         = decode_indexer_pool_slots_.find(request_id);
 
+        // Exact-only requests do not need device pool state. Holding slots for
+        // them can evict a long-running sparse request before it is scheduled
+        // again and force an avoidable full-KV bootstrap.
+        if (!eligible) {
+            if (it != decode_indexer_pool_slots_.end()) {
+                decode_indexer_pool_free_slots_.push_back(it->second.slot);
+                decode_indexer_pool_slots_.erase(it);
+            }
+            slot_ptr[row]           = -1;
+            bootstrap_mask_ptr[row] = 0;
+            continue;
+        }
+
         bool needs_bootstrap = false;
         if (it == decode_indexer_pool_slots_.end()) {
             int32_t slot = -1;

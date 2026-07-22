@@ -593,6 +593,11 @@ def _combine_append_pool_chunk_logits_kernel(
     chunk_start = tl.load(chunk_starts_ptr + batch).to(tl.int64)
     chunk_length = tl.load(chunk_lengths_ptr + batch).to(tl.int32)
     chunk_offset = tl.load(chunk_offsets_ptr + batch).to(tl.int64)
+    candidate_length = tl.where(active, pool_length + chunk_length, 1)
+    if block == 0:
+        tl.store(candidate_lengths_ptr + batch, candidate_length)
+    if block * BLOCK_SIZE >= candidate_length:
+        return
 
     from_pool = offsets < pool_length
     pool_positions = tl.minimum(offsets, POOL_CAPACITY - 1)
@@ -635,11 +640,6 @@ def _combine_append_pool_chunk_logits_kernel(
         active, values, tl.where(offsets == 0, 0.0, -float("inf"))
     )
     tl.store(output_ptr + batch * output_stride_b + offsets, values, mask=output_mask)
-    if block == 0:
-        tl.store(
-            candidate_lengths_ptr + batch,
-            tl.where(active, pool_length + chunk_length, 1),
-        )
 
 
 @triton.jit
@@ -711,12 +711,6 @@ def _append_materialized_pool_topk_kernel(
                 pool_ids_ptr + pool_slot * pool_ids_stride_b + offsets,
                 kept_ids.to(tl.int32),
             )
-            tl.store(
-                inverse_map_ptr
-                + pool_slot * inverse_map_stride_b
-                + kept_ids,
-                offsets + 1,
-            )
         old_base = tl.load(base_offsets_ptr + pool_slot).to(tl.int32)
         tl.store(
             base_offsets_ptr + pool_slot,
@@ -746,7 +740,7 @@ def _append_materialized_pool_topk_kernel(
         inverse_map_ptr
         + pool_slot * inverse_map_stride_b
         + selected_ids.to(tl.int64),
-        append_positions + 1,
+        1,
         mask=append,
     )
     tl.store(
@@ -1643,6 +1637,8 @@ def update_materialized_append_pool(
         or pool_ids.shape[1] != PACKED_APPEND_POOL_SIZE
     ):
         raise ValueError("pool_ids must be int32 [slots,16384]")
+    if inverse_map.dtype != torch.uint8 or inverse_map.ndim != 2:
+        raise ValueError("APPEND inverse map must be uint8 [slots,max_seq_len]")
     state = (pool_lengths, base_offsets)
     if any(
         tensor.dtype != torch.int32 or tensor.shape != (pool_ids.shape[0],)

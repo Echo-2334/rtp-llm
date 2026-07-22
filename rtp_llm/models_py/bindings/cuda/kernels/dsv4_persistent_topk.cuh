@@ -130,7 +130,7 @@ struct PersistentTopKParams {
     int32_t*        pool_lengths;
     const int32_t*  chunk;
     const int32_t*  chunk_lengths;
-    int32_t*        inverse_map;
+    uint8_t*        inverse_map;
     const int32_t*  pool_slots;
     const int32_t*  active_mask;
     uint32_t        pool_stride;
@@ -910,19 +910,15 @@ __device__ void pool_topk_postprocess(const PersistentTopKParams& params,
     }
     __syncthreads();
 
-    // A full 16K pool is compacted only on the low-frequency full step. Keep
-    // its newest half, then append every selected ID that the compaction
-    // evicted (plus new chunk selections). This avoids two pre-score graph
-    // nodes on every steady decode step.
+    // Compact logical IDs only on the low-frequency full-pool step. Membership
+    // is boolean, so retained IDs do not need an inverse-map rewrite.
     if (old_pool_length >= params.pool_capacity) {
         const uint32_t keep_size   = params.pool_capacity / 2;
-        const uint32_t keep_offset = params.pool_capacity - keep_size;
         for (uint32_t i = tx; i < keep_size; i += kThreadsPerBlock) {
             const int32_t evicted_id = params.pool[pool_slot * params.pool_stride + i];
-            const int32_t kept_id    = params.pool[pool_slot * params.pool_stride + keep_offset + i];
+            const int32_t kept_id    = params.pool[pool_slot * params.pool_stride + keep_size + i];
             params.inverse_map[pool_slot * params.inverse_map_stride + evicted_id] = 0;
-            params.pool[pool_slot * params.pool_stride + i]                        = kept_id;
-            params.inverse_map[pool_slot * params.inverse_map_stride + kept_id] = static_cast<int32_t>(i + 1);
+            params.pool[pool_slot * params.pool_stride + i] = kept_id;
         }
         __syncthreads();
         if (tx == 0) {
@@ -942,8 +938,7 @@ __device__ void pool_topk_postprocess(const PersistentTopKParams& params,
             if (pool_length + append_rank < params.pool_capacity) {
                 const uint32_t append_slot = pool_length + append_rank;
                 params.pool[pool_slot * params.pool_stride + append_slot] = selected_id;
-                params.inverse_map[pool_slot * params.inverse_map_stride + selected_id] =
-                    static_cast<int32_t>(append_slot + 1);
+                params.inverse_map[pool_slot * params.inverse_map_stride + selected_id] = 1;
             }
         }
     }
