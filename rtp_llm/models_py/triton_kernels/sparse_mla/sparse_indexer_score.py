@@ -220,7 +220,10 @@ def _append_fp8_mqa_logits_kernel(
     chunk_end = (safe_kv_length * (phase + 1)) // SOURCE_CHUNKS
     chunk_length = tl.where(active, chunk_end - chunk_start, 0).to(tl.int32)
     pool_length = tl.load(pool_lengths_ptr + safe_slot).to(tl.int32)
-    candidate_length = pool_length + chunk_length
+    # Keep one canonical candidate for the K generated at this decode step.
+    # It may sit outside the rotating source chunk, and is retained by the
+    # fused TopK postprocess regardless of whether TopK selects it.
+    candidate_length = tl.where(active, pool_length + chunk_length + 1, 0)
 
     if candidate_block == 0:
         tl.store(candidate_lengths_out_ptr + batch, tl.maximum(candidate_length, 1))
@@ -246,9 +249,15 @@ def _append_fp8_mqa_logits_kernel(
         mask=candidate_mask & from_pool,
         other=0,
     ).to(tl.int32)
-    chunk_offsets = candidate_offsets - pool_length
-    chunk_ids = chunk_start + chunk_offsets
-    logical_slots = tl.where(from_pool, pool_ids, chunk_ids)
+    tail_offsets = candidate_offsets - pool_length
+    from_chunk = (~from_pool) & (tail_offsets < chunk_length)
+    chunk_ids = chunk_start + tail_offsets
+    latest_id = safe_kv_length - 1
+    logical_slots = tl.where(
+        from_pool,
+        pool_ids,
+        tl.where(from_chunk, chunk_ids, latest_id),
+    )
     logical_blocks = logical_slots // PAGE_SIZE
     page_offsets = logical_slots % PAGE_SIZE
     physical_blocks = tl.load(
@@ -301,11 +310,12 @@ def _append_fp8_mqa_logits_kernel(
 
     # The source range is already present in the candidate tail. Mask the
     # same logical IDs in the pool so TopK output stays duplicate-free.
-    duplicate = (
-        from_pool
-        & (logical_slots >= chunk_start)
-        & (logical_slots < chunk_end)
+    duplicate_pool = from_pool & (
+        ((logical_slots >= chunk_start) & (logical_slots < chunk_end))
+        | (logical_slots == latest_id)
     )
+    duplicate_chunk = from_chunk & (logical_slots == latest_id)
+    duplicate = duplicate_pool | duplicate_chunk
     logits = tl.where(candidate_mask & ~duplicate, logits, -float("inf"))
     tl.store(
         logits_ptr + batch * logits_stride_b + candidate_offsets,
@@ -621,7 +631,7 @@ def sparse_fp8_mqa_append_logits(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Score APPEND pool+range candidates and build its graph metadata."""
+    """Score APPEND pool+range+latest-K candidates and build graph metadata."""
     batch, heads, head_dim = q_fp8.shape
     if q_fp8.dtype != torch.float8_e4m3fn or weights.dtype != torch.float32:
         raise ValueError("APPEND score requires FP8 query and FP32 weights")
@@ -650,7 +660,7 @@ def sparse_fp8_mqa_append_logits(
         raise ValueError("block_n must be one of 16,32,64,128")
 
     chunk_capacity = (graph_max_seq_len + source_chunks - 1) // source_chunks
-    candidate_count = pool_indices.shape[1] + chunk_capacity
+    candidate_count = pool_indices.shape[1] + chunk_capacity + 1
     logits = torch.empty(
         (batch, candidate_count), dtype=torch.float32, device=q_fp8.device
     )

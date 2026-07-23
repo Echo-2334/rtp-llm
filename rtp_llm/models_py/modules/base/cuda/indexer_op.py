@@ -719,6 +719,7 @@ class IndexerOp(nn.Module):
         inverse_map: torch.Tensor,
         pool_slots: torch.Tensor,
         active_mask: torch.Tensor,
+        kv_lengths: torch.Tensor,
     ) -> torch.Tensor:
         topk_result = logits.new_empty(
             (logits.shape[0], self.index_topk), dtype=torch.int32
@@ -733,6 +734,7 @@ class IndexerOp(nn.Module):
             pool_lengths,
             chunk,
             chunk_lengths,
+            kv_lengths,
             inverse_map,
             pool_slots,
             active_mask,
@@ -1257,11 +1259,28 @@ class IndexerOp(nn.Module):
         """Run V1 append semantics with a ring-backed materialized K pool."""
         from rtp_llm.models_py.triton_kernels.sparse_mla.packed_indexer_pool import (
             PACKED_APPEND_POOL_SIZE,
+            append_latest_to_materialized_pool,
             combine_append_pool_chunk_logits,
             gather_packed_pool_kv_persistent,
             initialize_missing_packed_append_pool,
             prepare_packed_append_pool_metadata,
             update_materialized_append_pool,
+        )
+
+        append_latest_to_materialized_pool(
+            kv_cache_fp8,
+            block_table,
+            pool_slots_input,
+            kv_lengths,
+            pool_ids,
+            pool_lengths,
+            inverse_map,
+            packed_base_offsets,
+            packed_kv,
+            dummy_slot_base=dummy_slot_base,
+            min_kv_length=min_kv_length,
+            graph_max_seq_len=graph_max_seq_len,
+            external_active=external_active,
         )
 
         (

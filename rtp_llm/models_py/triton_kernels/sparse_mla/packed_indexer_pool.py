@@ -455,6 +455,142 @@ def _gather_packed_kv_persistent_kernel(
 
 
 @triton.jit
+def _append_latest_materialized_pool_kernel(
+    kv_ptr,
+    block_table_ptr,
+    pool_slots_input_ptr,
+    kv_lengths_ptr,
+    external_active_ptr,
+    pool_ids_ptr,
+    pool_lengths_ptr,
+    inverse_map_ptr,
+    base_offsets_ptr,
+    packed_kv_ptr,
+    block_table_stride_b,
+    pool_ids_stride_b,
+    inverse_map_stride_b,
+    packed_slot_stride,
+    CAPACITY: tl.constexpr,
+    DUMMY_SLOT_BASE: tl.constexpr,
+    MIN_KV_LENGTH: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    POOL_CAPACITY: tl.constexpr,
+    KEEP_SIZE: tl.constexpr,
+    COMPACT_BLOCK: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    ENTRY_BYTES: tl.constexpr,
+    USE_EXTERNAL_ACTIVE: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    raw_slot = tl.load(pool_slots_input_ptr + batch).to(tl.int32)
+    kv_length = tl.load(kv_lengths_ptr + batch).to(tl.int32)
+    active = (kv_length > MIN_KV_LENGTH) & (raw_slot >= 0)
+    if USE_EXTERNAL_ACTIVE:
+        active &= tl.load(external_active_ptr + batch) != 0
+    if not active:
+        return
+
+    pool_slot = tl.minimum(tl.maximum(raw_slot, 0), CAPACITY - 1).to(tl.int64)
+    old_pool_length = tl.load(pool_lengths_ptr + pool_slot).to(tl.int32)
+    full = old_pool_length >= POOL_CAPACITY
+    if full:
+        for start in tl.static_range(0, KEEP_SIZE, COMPACT_BLOCK):
+            offsets = start + tl.arange(0, COMPACT_BLOCK)
+            evicted_ids = tl.load(
+                pool_ids_ptr + pool_slot * pool_ids_stride_b + offsets
+            ).to(tl.int64)
+            kept_ids = tl.load(
+                pool_ids_ptr
+                + pool_slot * pool_ids_stride_b
+                + KEEP_SIZE
+                + offsets
+            ).to(tl.int64)
+            tl.store(
+                inverse_map_ptr
+                + pool_slot * inverse_map_stride_b
+                + evicted_ids,
+                0,
+            )
+            tl.store(
+                pool_ids_ptr + pool_slot * pool_ids_stride_b + offsets,
+                kept_ids.to(tl.int32),
+            )
+        old_base = tl.load(base_offsets_ptr + pool_slot).to(tl.int32)
+        tl.store(
+            base_offsets_ptr + pool_slot,
+            (old_base + KEEP_SIZE) % POOL_CAPACITY,
+        )
+    tl.debug_barrier()
+
+    pool_length = tl.where(full, KEEP_SIZE, old_pool_length)
+    latest_id = tl.minimum(tl.maximum(kv_length, 1), MAX_SEQ_LEN) - 1
+    exists = tl.load(
+        inverse_map_ptr + pool_slot * inverse_map_stride_b + latest_id
+    ).to(tl.int32) != 0
+    append = (~exists) & (pool_length < POOL_CAPACITY)
+    if not append:
+        if full:
+            tl.store(pool_lengths_ptr + pool_slot, pool_length)
+        return
+
+    tl.store(
+        pool_ids_ptr + pool_slot * pool_ids_stride_b + pool_length,
+        latest_id,
+    )
+    tl.store(
+        inverse_map_ptr + pool_slot * inverse_map_stride_b + latest_id,
+        1,
+    )
+    tl.store(pool_lengths_ptr + pool_slot, pool_length + 1)
+
+    logical_block = latest_id // PAGE_SIZE
+    page_offset = latest_id % PAGE_SIZE
+    physical_block = tl.load(
+        block_table_ptr + batch * block_table_stride_b + logical_block
+    ).to(tl.int64)
+    base_offset = tl.load(base_offsets_ptr + pool_slot).to(tl.int64)
+    destination_position = (base_offset + pool_length) % POOL_CAPACITY
+    source_page_base = physical_block * (PAGE_SIZE * ENTRY_BYTES)
+    destination_page_base = (
+        pool_slot * packed_slot_stride
+        + (destination_position // PAGE_SIZE) * (PAGE_SIZE * ENTRY_BYTES)
+    )
+    destination_page_offset = destination_position % PAGE_SIZE
+
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    k_bytes = tl.load(
+        kv_ptr
+        + source_page_base
+        + page_offset * HEAD_DIM
+        + dim_offsets
+    )
+    tl.store(
+        packed_kv_ptr
+        + destination_page_base
+        + destination_page_offset * HEAD_DIM
+        + dim_offsets,
+        k_bytes,
+    )
+    scale_offsets = tl.arange(0, 4)
+    scale_bytes = tl.load(
+        kv_ptr
+        + source_page_base
+        + PAGE_SIZE * HEAD_DIM
+        + page_offset * 4
+        + scale_offsets
+    )
+    tl.store(
+        packed_kv_ptr
+        + destination_page_base
+        + PAGE_SIZE * HEAD_DIM
+        + destination_page_offset * 4
+        + scale_offsets,
+        scale_bytes,
+    )
+
+
+@triton.jit
 def _prepare_packed_append_metadata_kernel(
     block_table_ptr,
     pool_slots_input_ptr,
@@ -990,7 +1126,10 @@ def gather_packed_pool_kv(
     """Copy selected paged FP8 K/scale entries into packed-pool slots."""
     batch = block_table.shape[0]
     metadata = (source_rows, item_counts, pool_slots, active_mask)
-    if any(tensor.dtype != torch.int32 or tensor.shape != (batch,) for tensor in metadata):
+    if any(
+        tensor.dtype != torch.int32 or tensor.shape != (batch,)
+        for tensor in metadata
+    ):
         raise ValueError("packed gather metadata must be int32 [B]")
     if source_ids.dtype != torch.int32 or source_ids.ndim != 2:
         raise ValueError("source_ids must be rank-2 int32")
@@ -1410,6 +1549,78 @@ def update_fixed_packed_pool(
         num_stages=1,
     )
     return result, changed_ids, changed_positions, new_counts
+
+
+def append_latest_to_materialized_pool(
+    kv_cache_u8: torch.Tensor,
+    block_table: torch.Tensor,
+    pool_slots_input: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    pool_ids: torch.Tensor,
+    pool_lengths: torch.Tensor,
+    inverse_map: torch.Tensor,
+    base_offsets: torch.Tensor,
+    packed_kv: torch.Tensor,
+    *,
+    dummy_slot_base: int,
+    min_kv_length: int,
+    graph_max_seq_len: int,
+    external_active: Optional[torch.Tensor] = None,
+) -> None:
+    """Append and materialize this step's newest K before pool scoring."""
+    batch = block_table.shape[0]
+    metadata = (pool_slots_input, kv_lengths)
+    if any(tensor.dtype != torch.int32 or tensor.shape != (batch,) for tensor in metadata):
+        raise ValueError("latest-K metadata must be int32 [B]")
+    if external_active is not None and (
+        external_active.dtype != torch.int32
+        or external_active.shape != (batch,)
+    ):
+        raise ValueError("external_active must be int32 [B]")
+    if pool_ids.dtype != torch.int32 or pool_ids.ndim != 2:
+        raise ValueError("pool_ids must be rank-2 int32")
+    if pool_ids.shape[1] != PACKED_APPEND_POOL_SIZE:
+        raise ValueError("materialized APPEND pool must have capacity 16384")
+    if inverse_map.dtype != torch.uint8 or inverse_map.ndim != 2:
+        raise ValueError("APPEND inverse map must be rank-2 uint8")
+    state = (pool_lengths, base_offsets)
+    if any(
+        tensor.dtype != torch.int32 or tensor.shape != (pool_ids.shape[0],)
+        for tensor in state
+    ):
+        raise ValueError("APPEND state must be int32 [slots]")
+    if dummy_slot_base < batch or dummy_slot_base + batch > pool_ids.shape[0]:
+        raise ValueError("latest-K dummy slots exceed pool capacity")
+
+    _append_latest_materialized_pool_kernel[(batch,)](
+        kv_cache_u8,
+        block_table,
+        pool_slots_input,
+        kv_lengths,
+        external_active if external_active is not None else kv_lengths,
+        pool_ids,
+        pool_lengths,
+        inverse_map,
+        base_offsets,
+        packed_kv,
+        block_table.stride(0),
+        pool_ids.stride(0),
+        inverse_map.stride(0),
+        PACKED_APPEND_POOL_SIZE * kv_cache_u8.shape[-1],
+        CAPACITY=pool_ids.shape[0],
+        DUMMY_SLOT_BASE=dummy_slot_base,
+        MIN_KV_LENGTH=min_kv_length,
+        MAX_SEQ_LEN=graph_max_seq_len,
+        POOL_CAPACITY=PACKED_APPEND_POOL_SIZE,
+        KEEP_SIZE=PACKED_POOL_SIZE,
+        COMPACT_BLOCK=256,
+        HEAD_DIM=128,
+        PAGE_SIZE=64,
+        ENTRY_BYTES=132,
+        USE_EXTERNAL_ACTIVE=external_active is not None,
+        num_warps=8,
+        num_stages=1,
+    )
 
 
 def prepare_packed_append_pool_metadata(

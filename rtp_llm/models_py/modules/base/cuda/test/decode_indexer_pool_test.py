@@ -368,6 +368,7 @@ class DecodeIndexerCudaGraphTest(TestCase):
         inverse_map,
         pool_slots,
         active_mask,
+        kv_lengths,
     ):
         del lane
         output = torch.empty(
@@ -383,6 +384,7 @@ class DecodeIndexerCudaGraphTest(TestCase):
             pool_lengths,
             chunk,
             chunk_lengths,
+            kv_lengths,
             inverse_map,
             pool_slots,
             active_mask,
@@ -760,6 +762,7 @@ class DecodeIndexerCudaGraphTest(TestCase):
         base_logits = torch.randn(
             (1, graph_max_seq_len), dtype=torch.float32, device=self.device
         )
+        base_logits[0, -1] = -float("inf")
         logits = torch.empty_like(base_logits)
         q_fp8 = torch.zeros((1, 1, 4), dtype=torch.float16, device=self.device)
         weights = torch.ones((1, 1), dtype=torch.float32, device=self.device)
@@ -807,10 +810,14 @@ class DecodeIndexerCudaGraphTest(TestCase):
         expected_top8k = torch.topk(
             base_logits, 8 * 1024, dim=1, sorted=False
         ).indices
-        self.assertEqual(pool._append_pool_lengths[0].item(), 8 * 1024)
+        latest_id = graph_max_seq_len - 1
+        expected_length = 8 * 1024 + int(
+            not bool(expected_top8k.eq(latest_id).any().item())
+        )
+        self.assertEqual(pool._append_pool_lengths[0].item(), expected_length)
         self.assertEqual(
-            set(pool._append_pools[0, : 8 * 1024].cpu().tolist()),
-            set(expected_top8k[0].cpu().tolist()),
+            set(pool._append_pools[0, :expected_length].cpu().tolist()),
+            set(expected_top8k[0].cpu().tolist()) | {latest_id},
         )
 
         attention_inputs.indexer_pool_graph_mode = True
@@ -888,6 +895,8 @@ class DecodeIndexerCudaGraphTest(TestCase):
             dtype=torch.float32,
             device=self.device,
         )
+        base_logits[0, -1] = -float("inf")
+        base_logits[1, -1] = float("inf")
         q_fp8 = torch.zeros(
             (batch_size, 1, 4), dtype=torch.float16, device=self.device
         )
@@ -930,6 +939,14 @@ class DecodeIndexerCudaGraphTest(TestCase):
         initial_topk = select_topk(
             initial_logits, lengths, graph_max_seq_len, "main"
         )
+        initial_top8k = torch.topk(
+            base_logits, 8 * 1024, dim=1, sorted=False
+        ).indices
+        latest_id = graph_max_seq_len - 1
+        expected_bootstrap_lengths = [
+            8 * 1024 + int(not bool(row.eq(latest_id).any().item()))
+            for row in initial_top8k
+        ]
         pool.bootstrap_cuda_graph_exact(
             initial_logits,
             q_fp8,
@@ -940,7 +957,9 @@ class DecodeIndexerCudaGraphTest(TestCase):
             initial_topk,
         )
         assert pool._append_pool_lengths is not None
-        self.assertEqual(pool._append_pool_lengths[:2].tolist(), [8192, 8192])
+        self.assertEqual(
+            pool._append_pool_lengths[:2].tolist(), expected_bootstrap_lengths
+        )
 
         observed_exact_lengths = []
         observed_chunk_lengths = []
@@ -1021,7 +1040,9 @@ class DecodeIndexerCudaGraphTest(TestCase):
         self.assertEqual(observed_exact_lengths[-1].tolist(), [1, graph_max_seq_len])
         self.assertEqual(observed_chunk_lengths[-1].tolist(), [1024, 0])
         self.assertGreater(pool._append_pool_lengths[0].item(), 8192)
-        self.assertEqual(pool._append_pool_lengths[1].item(), 8192)
+        self.assertEqual(
+            pool._append_pool_lengths[1].item(), expected_bootstrap_lengths[1]
+        )
 
         attention_inputs.indexer_pool_bootstrap_graph_mode = False
         attention_inputs.indexer_pool_mixed_graph_mode = True

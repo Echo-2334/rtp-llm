@@ -6,6 +6,7 @@ from rtp_llm.models_py.modules.base.cuda.indexer_op import IndexerOp
 from rtp_llm.models_py.triton_kernels.sparse_mla.packed_indexer_pool import (
     PACKED_APPEND_POOL_SIZE,
     PACKED_POOL_SIZE,
+    append_latest_to_materialized_pool,
     gather_packed_pool_kv,
     gather_packed_pool_kv_persistent,
     initialize_missing_packed_pool,
@@ -649,7 +650,19 @@ class SparseIndexerPoolKernelsTest(TestCase):
             pool_slots=scheduled_slots,
         )
         torch.cuda.synchronize()
-        torch.testing.assert_close(scheduled_logits, scheduled_reference, rtol=0, atol=0)
+        for row, old_length in enumerate(
+            (scheduled_lengths[:batch] + expected_chunk_lengths).tolist()
+        ):
+            torch.testing.assert_close(
+                scheduled_logits[row, :old_length],
+                scheduled_reference[row, :old_length],
+                rtol=0,
+                atol=0,
+            )
+            self.assertTrue(torch.isfinite(scheduled_logits[row, old_length]))
+            self.assertTrue(
+                torch.isneginf(scheduled_logits[row, old_length + 1 :]).all()
+            )
         torch.testing.assert_close(scheduled_starts, expected_starts, rtol=0, atol=0)
         torch.testing.assert_close(
             scheduled_chunk_lengths, expected_chunk_lengths, rtol=0, atol=0
@@ -663,10 +676,63 @@ class SparseIndexerPoolKernelsTest(TestCase):
         )
         torch.testing.assert_close(
             scheduled_topk_lengths,
-            scheduled_lengths[:batch] + expected_chunk_lengths,
+            scheduled_lengths[:batch] + expected_chunk_lengths + 1,
             rtol=0,
             atol=0,
         )
+
+        latest_positions = (
+            scheduled_lengths.index_select(0, scheduled_slots)
+            + scheduled_chunk_lengths
+        ).long()
+        latest_id = seq_len - 1
+        for forced_value, expect_selected in (
+            (-float("inf"), False),
+            (1e9, True),
+        ):
+            fused_pool = scheduled_pool.clone()
+            fused_lengths = scheduled_lengths.clone()
+            fused_inverse = initialize_global_pool_inverse_map(
+                fused_pool,
+                seq_len,
+                fused_lengths,
+                membership_only=True,
+            )
+            forced_logits = scheduled_logits.clone()
+            forced_logits.scatter_(
+                1,
+                latest_positions.unsqueeze(1),
+                torch.full((batch, 1), forced_value, device=self.device),
+            )
+            fused_output = torch.empty(
+                batch, 2048, dtype=torch.int32, device=self.device
+            )
+            rtp_llm_ops.dsv4_persistent_topk_pool(
+                forced_logits,
+                scheduled_topk_lengths,
+                fused_output,
+                torch.empty(1 << 20, dtype=torch.uint8, device=self.device),
+                forced_logits.shape[1],
+                fused_pool,
+                fused_lengths,
+                scheduled_starts,
+                scheduled_chunk_lengths,
+                kv_lengths,
+                fused_inverse,
+                scheduled_slots,
+                scheduled_active,
+            )
+            torch.cuda.synchronize()
+            for row, slot in enumerate(scheduled_slots.tolist()):
+                self.assertEqual(
+                    latest_id in fused_output[row].tolist(), expect_selected
+                )
+                self.assertEqual(fused_inverse[slot, latest_id].item(), 1)
+                pool_length = int(fused_lengths[slot].item())
+                self.assertIn(
+                    latest_id,
+                    fused_pool[slot, :pool_length].tolist(),
+                )
 
         external_active = torch.tensor(
             [1, 0], device=self.device, dtype=torch.int32
@@ -697,10 +763,96 @@ class SparseIndexerPoolKernelsTest(TestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(masked_logits[0], scheduled_logits[0])
         self.assertTrue(torch.isneginf(masked_logits[1]).all())
-        self.assertEqual(masked_topk_lengths.tolist(), [5120, 1])
+        self.assertEqual(masked_topk_lengths.tolist(), [5121, 1])
         self.assertEqual(masked_chunk_lengths.tolist(), [1024, 0])
         self.assertEqual(masked_slots.tolist(), [0, 3])
         self.assertEqual(masked_active.tolist(), [1, 0])
+
+    def test_materialized_append_scores_each_steps_latest_k(self):
+        seq_len = 16 * 1024
+        page_size = 64
+        entry_bytes = 132
+        pages = seq_len // page_size
+        raw_cache = torch.randint(
+            0,
+            255,
+            (pages, page_size * entry_bytes),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        kv_cache = raw_cache.view(pages, page_size, 1, entry_bytes)
+        block_table = torch.arange(
+            pages, dtype=torch.int32, device=self.device
+        ).view(1, -1)
+        pool = torch.zeros(
+            2, PACKED_APPEND_POOL_SIZE, dtype=torch.int32, device=self.device
+        )
+        pool[0, :PACKED_POOL_SIZE] = torch.arange(
+            PACKED_POOL_SIZE, dtype=torch.int32, device=self.device
+        )
+        pool_lengths = torch.tensor(
+            [PACKED_POOL_SIZE, 0], dtype=torch.int32, device=self.device
+        )
+        inverse_map = initialize_global_pool_inverse_map(
+            pool, seq_len, pool_lengths, membership_only=True
+        )
+        packed = torch.zeros(
+            2 * (PACKED_APPEND_POOL_SIZE // page_size),
+            page_size,
+            1,
+            entry_bytes,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        base_offsets = torch.zeros(2, dtype=torch.int32, device=self.device)
+        kv_lengths = torch.tensor(
+            [seq_len], dtype=torch.int32, device=self.device
+        )
+
+        append_latest_to_materialized_pool(
+            kv_cache,
+            block_table,
+            torch.tensor([0], dtype=torch.int32, device=self.device),
+            kv_lengths,
+            pool,
+            pool_lengths,
+            inverse_map,
+            base_offsets,
+            packed,
+            dummy_slot_base=1,
+            min_kv_length=4 * 1024,
+            graph_max_seq_len=seq_len,
+        )
+        torch.cuda.synchronize()
+
+        latest_id = seq_len - 1
+        self.assertEqual(pool_lengths[0].item(), PACKED_POOL_SIZE + 1)
+        self.assertEqual(pool[0, PACKED_POOL_SIZE].item(), latest_id)
+        self.assertEqual(inverse_map[0, latest_id].item(), 1)
+        source_pages = kv_cache.view(pages, page_size * entry_bytes)
+        packed_pages = packed.view(-1, page_size * entry_bytes)
+        source_page = latest_id // page_size
+        source_offset = latest_id % page_size
+        destination_page = PACKED_POOL_SIZE // page_size
+        torch.testing.assert_close(
+            packed_pages[destination_page, :128],
+            source_pages[
+                source_page,
+                source_offset * 128 : (source_offset + 1) * 128,
+            ],
+        )
+        torch.testing.assert_close(
+            packed_pages[
+                destination_page,
+                page_size * 128 : page_size * 128 + 4,
+            ],
+            source_pages[
+                source_page,
+                page_size * 128
+                + source_offset * 4 : page_size * 128
+                + (source_offset + 1) * 4,
+            ],
+        )
 
     def test_append_and_compact_preserve_inverse_map(self):
         seq_len = 32 * 1024
@@ -867,6 +1019,9 @@ class SparseIndexerPoolKernelsTest(TestCase):
             fused_lengths,
             chunk,
             chunk_lengths,
+            torch.tensor(
+                [24 * 1024, 1], device=self.device, dtype=torch.int32
+            ),
             fused_inverse,
             pool_slots,
             active_mask,
@@ -947,6 +1102,9 @@ class SparseIndexerPoolKernelsTest(TestCase):
             pool_lengths,
             chunk,
             chunk_lengths,
+            torch.tensor(
+                [candidate_width], device=self.device, dtype=torch.int32
+            ),
             inverse_map,
             torch.tensor([0], device=self.device, dtype=torch.int32),
             torch.tensor([1], device=self.device, dtype=torch.int32),
@@ -957,7 +1115,11 @@ class SparseIndexerPoolKernelsTest(TestCase):
             set(output[0].cpu().tolist()), set(expected_ids[0].cpu().tolist())
         )
         retained = set(range(keep_size, pool_capacity))
-        expected_pool = retained | set(expected_ids[0].cpu().tolist())
+        expected_pool = (
+            retained
+            | set(expected_ids[0].cpu().tolist())
+            | {candidate_width - 1}
+        )
         pool_length = int(pool_lengths[0].item())
         self.assertEqual(pool_length, len(expected_pool))
         ids = pool[0, :pool_length].long()

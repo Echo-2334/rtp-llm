@@ -130,6 +130,7 @@ struct PersistentTopKParams {
     int32_t*        pool_lengths;
     const int32_t*  chunk;
     const int32_t*  chunk_lengths;
+    const int32_t*  kv_lengths;
     uint8_t*        inverse_map;
     const int32_t*  pool_slots;
     const int32_t*  active_mask;
@@ -882,6 +883,7 @@ __device__ void pool_topk_postprocess(const PersistentTopKParams& params,
     __syncthreads();
     const uint32_t pool_slot    = shared_scalars[0];
     const uint32_t chunk_length = shared_scalars[1];
+    const int32_t  latest_id    = params.kv_lengths[row_idx] - 1;
     if (tx == 0) {
         shared_scalars[2] = static_cast<uint32_t>(params.pool_lengths[pool_slot]);
         local_histogram[0] = 0;
@@ -904,6 +906,8 @@ __device__ void pool_topk_postprocess(const PersistentTopKParams& params,
                 selected_id = params.chunk_is_range ?
                                   params.chunk[row_idx] + chunk_position :
                                   params.chunk[row_idx * params.chunk_stride + static_cast<uint32_t>(chunk_position)];
+            } else if (chunk_position == static_cast<int32_t>(chunk_length)) {
+                selected_id = latest_id;
             }
         }
         row_output[i] = selected_id;
@@ -931,12 +935,24 @@ __device__ void pool_topk_postprocess(const PersistentTopKParams& params,
     __syncthreads();
     const uint32_t pool_length = shared_scalars[2];
 
+    // Generated K must remain in the APPEND pool even when it is not selected
+    // by this step's TopK. Reserve its slot before appending chunk winners.
+    if (tx == 0 && latest_id >= 0
+        && params.inverse_map[pool_slot * params.inverse_map_stride + latest_id] == 0
+        && pool_length < params.pool_capacity) {
+        params.pool[pool_slot * params.pool_stride + pool_length] = latest_id;
+        params.inverse_map[pool_slot * params.inverse_map_stride + latest_id] = 1;
+        shared_scalars[2] = pool_length + 1;
+    }
+    __syncthreads();
+    const uint32_t pool_length_with_latest = shared_scalars[2];
+
     for (uint32_t i = tx; i < TopK; i += kThreadsPerBlock) {
         const int32_t selected_id = row_output[i];
         if (selected_id >= 0 && params.inverse_map[pool_slot * params.inverse_map_stride + selected_id] == 0) {
             const uint32_t append_rank = atomicAdd(&local_histogram[0], 1u);
-            if (pool_length + append_rank < params.pool_capacity) {
-                const uint32_t append_slot = pool_length + append_rank;
+            if (pool_length_with_latest + append_rank < params.pool_capacity) {
+                const uint32_t append_slot = pool_length_with_latest + append_rank;
                 params.pool[pool_slot * params.pool_stride + append_slot] = selected_id;
                 params.inverse_map[pool_slot * params.inverse_map_stride + selected_id] = 1;
             }
@@ -944,8 +960,8 @@ __device__ void pool_topk_postprocess(const PersistentTopKParams& params,
     }
     __syncthreads();
     if (tx == 0) {
-        const uint32_t appended = min(local_histogram[0], params.pool_capacity - pool_length);
-        params.pool_lengths[pool_slot] = static_cast<int32_t>(pool_length + appended);
+        const uint32_t appended = min(local_histogram[0], params.pool_capacity - pool_length_with_latest);
+        params.pool_lengths[pool_slot] = static_cast<int32_t>(pool_length_with_latest + appended);
     }
 }
 

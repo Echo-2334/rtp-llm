@@ -277,6 +277,7 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("pool_lengths"),
                   py::arg("chunk"),
                   py::arg("chunk_lengths"),
+                  py::arg("kv_lengths"),
                   py::arg("inverse_map"),
                   py::arg("pool_slots"),
                   py::arg("active_mask"));

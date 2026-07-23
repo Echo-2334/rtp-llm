@@ -23,6 +23,10 @@ namespace torch_ext {
 //   max_seq_len: max possible stride across rows; controls cooperative
 //                launch threshold inside the kernel
 //
+// The pool variant additionally maps pool+chunk+latest-K positions back to
+// logical token IDs and retains the latest K in the APPEND pool even when it
+// is not selected by TopK.
+//
 // Notes:
 //   * Only CUDA — ROCm path raises.
 //   * ``num_rows`` corresponds to ``B * S`` after flattening the leading
@@ -43,6 +47,7 @@ void dsv4_persistent_topk_pool(const torch::Tensor& logits,
                                torch::Tensor&       pool_lengths,
                                const torch::Tensor& chunk,
                                const torch::Tensor& chunk_lengths,
+                               const torch::Tensor& kv_lengths,
                                torch::Tensor&       inverse_map,
                                const torch::Tensor& pool_slots,
                                const torch::Tensor& active_mask);

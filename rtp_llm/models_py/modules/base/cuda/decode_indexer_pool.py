@@ -14,7 +14,8 @@ default to a 16K fixed-size pool.
 
 Set ``RTP_LLM_DECODE_INDEXER_PACKED_POOL=1`` with APPEND to keep a fixed,
 materialized 8K KV pool. Its steady path scores the pool and current contiguous
-source chunk through paged MQA, then updates the pool only from the final Top2K.
+source chunk through paged MQA. Every step's newest K is retained unconditionally;
+the remaining pool updates come from the final Top2K.
 Set ``RTP_LLM_DECODE_INDEXER_PACKED_POOL_UPDATE=APPEND`` to retain V1 append
 semantics with a ring-backed 16K materialized K pool. Graph buckets below
 ``RTP_LLM_DECODE_INDEXER_PACKED_POOL_MIN_BATCH`` keep the fused sparse path.
@@ -84,6 +85,7 @@ PoolChunkTopkFn = Callable[
         torch.Tensor,
         int,
         str,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -1297,9 +1299,26 @@ class DecodeIndexerPool:
         self._append_pools[:, : self.config.pool_size].index_copy_(
             0, slots, initial_pool
         )
+        latest_ids = safe_lengths - 1
+        latest_already_selected = initial_pool.eq(latest_ids.unsqueeze(1)).any(
+            dim=1
+        )
+        append_latest = valid_rows & ~latest_already_selected
+        latest_positions = torch.where(
+            append_latest,
+            torch.full_like(slots, self.config.pool_size),
+            torch.zeros_like(slots),
+        )
+        latest_values = torch.where(
+            append_latest,
+            latest_ids.to(torch.int32),
+            self._append_pools[slots, 0],
+        )
+        self._append_pools.index_put_((slots, latest_positions), latest_values)
         initial_lengths = torch.where(
             valid_rows,
-            torch.full_like(slots, self.config.pool_size, dtype=torch.int32),
+            torch.full_like(slots, self.config.pool_size, dtype=torch.int32)
+            + append_latest.to(torch.int32),
             torch.zeros_like(slots, dtype=torch.int32),
         )
         self._append_pool_lengths.index_copy_(0, slots, initial_lengths)
@@ -1449,7 +1468,7 @@ class DecodeIndexerPool:
                 graph_max_seq_len,
                 active_mask,
             )
-            candidate_width = self.config.max_pool_size + (
+            candidate_width = self.config.max_pool_size + 1 + (
                 graph_max_seq_len + self.config.chunks - 1
             ) // self.config.chunks
             result = pool_chunk_topk(
@@ -1464,6 +1483,7 @@ class DecodeIndexerPool:
                 self._append_inverse_map,
                 slots,
                 active_mask_i32,
+                kv_lengths,
             )
             if (
                 self.config.packed_pool
@@ -1500,6 +1520,7 @@ class DecodeIndexerPool:
                 self._append_inverse_map,
                 slots,
                 active_mask_i32,
+                kv_lengths,
             )
 
         safe_kv_lengths = torch.where(
@@ -1557,6 +1578,7 @@ class DecodeIndexerPool:
                 self._append_inverse_map,
                 slots,
                 active_mask_i32,
+                kv_lengths,
             )
         local_topk = select_topk(
             logits,

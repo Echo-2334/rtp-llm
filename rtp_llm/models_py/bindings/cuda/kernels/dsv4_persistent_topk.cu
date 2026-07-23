@@ -24,6 +24,7 @@ struct PoolPostprocessArgs {
     int32_t*       pool_lengths;
     const int32_t* chunk;
     const int32_t* chunk_lengths;
+    const int32_t* kv_lengths;
     uint8_t*       inverse_map;
     const int32_t* pool_slots;
     const int32_t* active_mask;
@@ -194,6 +195,7 @@ void launch_persistent_topk(const torch::Tensor& logits,
             params.pool_lengths            = pool_args->pool_lengths;
             params.chunk                   = pool_args->chunk;
             params.chunk_lengths           = pool_args->chunk_lengths;
+            params.kv_lengths              = pool_args->kv_lengths;
             params.inverse_map             = pool_args->inverse_map;
             params.pool_slots              = pool_args->pool_slots;
             params.active_mask             = pool_args->active_mask;
@@ -277,12 +279,14 @@ void dsv4_persistent_topk_pool(const torch::Tensor& logits,
                                torch::Tensor&       pool_lengths,
                                const torch::Tensor& chunk,
                                const torch::Tensor& chunk_lengths,
+                               const torch::Tensor& kv_lengths,
                                torch::Tensor&       inverse_map,
                                const torch::Tensor& pool_slots,
                                const torch::Tensor& active_mask) {
 #ifndef USE_ROCM
     TORCH_CHECK(logits.is_cuda() && lengths.is_cuda() && output.is_cuda() && workspace.is_cuda()
                     && pool.is_cuda() && pool_lengths.is_cuda() && chunk.is_cuda() && chunk_lengths.is_cuda()
+                    && kv_lengths.is_cuda()
                     && inverse_map.is_cuda() && pool_slots.is_cuda() && active_mask.is_cuda(),
                 "fused pool TopK tensors must be CUDA tensors");
     TORCH_CHECK(logits.dtype() == torch::kFloat32 && lengths.dtype() == torch::kInt32
@@ -290,6 +294,7 @@ void dsv4_persistent_topk_pool(const torch::Tensor& logits,
                 "invalid fused pool TopK score tensors");
     TORCH_CHECK(pool.dtype() == torch::kInt32 && pool_lengths.dtype() == torch::kInt32
                     && chunk.dtype() == torch::kInt32 && chunk_lengths.dtype() == torch::kInt32
+                    && kv_lengths.dtype() == torch::kInt32
                     && inverse_map.dtype() == torch::kUInt8 && pool_slots.dtype() == torch::kInt32
                     && active_mask.dtype() == torch::kInt32,
                 "fused pool TopK state tensors have invalid dtypes");
@@ -299,7 +304,8 @@ void dsv4_persistent_topk_pool(const torch::Tensor& logits,
     TORCH_CHECK(pool.dim() == 2 && pool_lengths.dim() == 1 && inverse_map.dim() == 2,
                 "invalid fused pool state dimensions");
     TORCH_CHECK((chunk.dim() == 1 || chunk.dim() == 2) && chunk.size(0) == logits.size(0)
-                    && chunk_lengths.numel() == logits.size(0) && pool_slots.numel() == logits.size(0)
+                    && chunk_lengths.numel() == logits.size(0) && kv_lengths.numel() == logits.size(0)
+                    && pool_slots.numel() == logits.size(0)
                     && active_mask.numel() == logits.size(0),
                 "fused pool TopK batch mismatch");
     TORCH_CHECK(logits.stride(1) == 1 && output.is_contiguous() && pool.stride(1) == 1
@@ -311,6 +317,7 @@ void dsv4_persistent_topk_pool(const torch::Tensor& logits,
         pool_lengths.data_ptr<int32_t>(),
         chunk.data_ptr<int32_t>(),
         chunk_lengths.data_ptr<int32_t>(),
+        kv_lengths.data_ptr<int32_t>(),
         inverse_map.data_ptr<uint8_t>(),
         pool_slots.data_ptr<int32_t>(),
         active_mask.data_ptr<int32_t>(),
