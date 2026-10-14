@@ -350,6 +350,7 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
         top_k: int,
         parallelism_config: Optional[ParallelismConfig] = None,
         use_cuda_graph: bool = False,
+        nvfp4: bool = False,
     ):
         super().__init__(
             num_heads=num_heads,
@@ -360,6 +361,7 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
             softmax_extra_scale=softmax_extra_scale,
             top_k=top_k,
             use_cuda_graph=use_cuda_graph,
+            nvfp4=nvfp4,
         )
         self.attn_inputs = None
         self.cp_info = None
@@ -416,6 +418,8 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
         self.write_cache_store_impl = None
 
     def _refresh_fp8_kernel_metadata(self, n_q: int) -> None:
+        if self.is_nvfp4:
+            return
         key = (
             int(n_q) * int(self.num_heads),
             int(self.top_k),
@@ -906,7 +910,7 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
                 dtype=fused_kv.dtype,
                 device=fused_kv.device,
             )
-            rtp_llm_ops.cp_gather_and_upconvert_fp8_kv_cache_v2(
+            self._gather_cache(
                 src,
                 actual_fused,
                 self.block_table.to(torch.int32),
@@ -937,6 +941,8 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
         """flash_mla_with_kvcache on FP8 paged cache (CP equivalent of non-CP baseline)."""
         if self.kv_cache_sharded:
             return self._attend_gather(q0, kv_cache, topk)
+        if self.is_nvfp4:
+            return self._forward_with_kvcache(q0, kv_cache.kv_cache_base, topk, layer_id)
         kv_cache_flat = _as_uint8(
             kv_cache.kv_cache_base.view(-1, 1, kv_cache.kv_cache_base.size(-1))
         )
@@ -976,7 +982,7 @@ class SparseMlaFp8CPOp(SparseMlaFp8Op):
             src = _as_uint8(kv_cache.kv_cache_base)
             if src.ndim == 4:
                 src = src.squeeze(2)
-            rtp_llm_ops.cp_gather_and_upconvert_fp8_kv_cache_v2(
+            self._gather_cache(
                 src,
                 fused_kv,
                 self.block_table.to(torch.int32),

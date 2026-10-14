@@ -80,6 +80,7 @@ def get_mla_impl(
         cos_sin_cache = weight.get_global_weight(W.rope_cos_sin_cache)
         use_fast_path = (
             attn_inputs.is_prefill
+            and attn_configs.kv_cache_dtype != KvCacheDataType.NVFP4
             and not use_decode_mla
             and attn_inputs.cu_kv_seqlens.max().item() <= attn_configs.indexer_topk
             and not (
@@ -101,6 +102,9 @@ def get_mla_impl(
             and not impl.is_sparse()
             and not allow_cuda_graph_prefill_absorb
         ):
+            continue
+
+        if attn_configs.kv_cache_dtype == KvCacheDataType.NVFP4 and not impl.is_sparse():
             continue
 
         try:

@@ -45,6 +45,10 @@ from rtp_llm.models_py.triton_kernels.sparse_mla.fused_qk_rope_cat_cache_mla imp
     fused_qk_rope_cat_cache_mla,
 )
 from rtp_llm.models_py.utils.fuse_config import fuse_kernels_enabled
+from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
+    gather_nvfp4_cache,
+    sparse_nvfp4_attention,
+)
 from rtp_llm.ops import (
     AttentionConfigs,
     FMHAConfig,
@@ -216,11 +220,12 @@ class _GatherWorkspace:
 
 
 class SparseMlaFp8Op(SparseMlaOp):
-    """FP8 sparse MLA. See module docstring for path selection."""
+    """Quantized sparse MLA: FP8 FlashMLA or experimental NVFP4 Triton."""
 
     expects_paged_kv = True
 
     def __init__(self, *args, **kwargs):
+        self.is_nvfp4 = bool(kwargs.pop("nvfp4", False))
         self.use_cuda_graph = bool(kwargs.pop("use_cuda_graph", False))
         super().__init__(*args, **kwargs)
         # In CUDA graph mode the captured kernels keep the scheduler storage
@@ -232,6 +237,8 @@ class SparseMlaFp8Op(SparseMlaOp):
         self._gather: Optional[_GatherWorkspace] = None
 
     def _reset_sched_meta(self, num_q_tokens_per_head_k: int) -> None:
+        if self.is_nvfp4:
+            return
         key = (
             int(num_q_tokens_per_head_k),
             int(self.top_k),
@@ -351,7 +358,7 @@ class SparseMlaFp8Op(SparseMlaOp):
             src = src.squeeze(2)
 
         # FP8 paged → BF16 contiguous workspace
-        rtp_llm_ops.cp_gather_and_upconvert_fp8_kv_cache_v2(
+        self._gather_cache(
             src,
             fused_kv,
             self.block_table.to(torch.int32),
@@ -386,6 +393,12 @@ class SparseMlaFp8Op(SparseMlaOp):
         physical_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """flash_mla_with_kvcache directly on FP8 paged cache."""
+        if self.is_nvfp4:
+            indices = (
+                self._convert_topk_indices_to_global(topk_indices)
+                if physical_indices is None else physical_indices
+            )
+            return sparse_nvfp4_attention(q, kv, indices, self.scale)
         assert self._sched_meta is not None
         if layer_id == 0:
             self._sched_meta.tile_scheduler_metadata = None
@@ -414,6 +427,11 @@ class SparseMlaFp8Op(SparseMlaOp):
             softmax_scale=self.scale,
         )
         return attn_out.squeeze(0)
+
+    def _gather_cache(self, *args):
+        if self.is_nvfp4:
+            return gather_nvfp4_cache(*args)
+        return rtp_llm_ops.cp_gather_and_upconvert_fp8_kv_cache_v2(*args)
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +481,7 @@ class SparseMlaImpl(MlaImplBase):
             op_cls = fmha_impl
         elif attn_configs.kv_cache_dtype == KvCacheDataType.BASE:
             op_cls = SparseMlaOp
-        elif attn_configs.kv_cache_dtype == KvCacheDataType.FP8:
+        elif attn_configs.kv_cache_dtype in (KvCacheDataType.FP8, KvCacheDataType.NVFP4):
             op_cls = SparseMlaFp8Op
         else:
             raise ValueError(
@@ -472,6 +490,7 @@ class SparseMlaImpl(MlaImplBase):
         op_kwargs = {"parallelism_config": parallelism_config}
         if issubclass(op_cls, SparseMlaFp8Op):
             op_kwargs["use_cuda_graph"] = is_cuda_graph
+            op_kwargs["nvfp4"] = attn_configs.kv_cache_dtype == KvCacheDataType.NVFP4
         self.fmha_impl: SparseMlaOp = op_cls(
             attn_configs.head_num,
             attn_configs.kv_lora_rank,
@@ -491,7 +510,9 @@ class SparseMlaImpl(MlaImplBase):
             kv_cache_dtype=attn_configs.kv_cache_dtype,
         )
 
-        self._fuse_qk_rope_cat_cache_mla = fuse_kernels_enabled()
+        self._fuse_qk_rope_cat_cache_mla = (
+            fuse_kernels_enabled() and attn_configs.kv_cache_dtype != KvCacheDataType.NVFP4
+        )
         self._kv_cache_type = (
             "fp8_ds_mla"
             if attn_configs.kv_cache_dtype == KvCacheDataType.FP8
@@ -591,7 +612,7 @@ class SparseMlaImpl(MlaImplBase):
             attn_configs.is_sparse
             and attn_configs.use_mla
             and attn_configs.kv_cache_dtype
-            in (KvCacheDataType.BASE, KvCacheDataType.FP8)
+            in (KvCacheDataType.BASE, KvCacheDataType.FP8, KvCacheDataType.NVFP4)
         )
 
     def prepare(

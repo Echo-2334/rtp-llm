@@ -36,6 +36,8 @@ def kv_cache_dtype_to_torch_dtype(
         return torch.int8
     elif kv_cache_dtype == KvCacheDataType.FP8:
         return torch.float8_e4m3fn
+    elif kv_cache_dtype == KvCacheDataType.NVFP4:
+        return torch.uint8
     else:  # BASE
         return data_type.to_torch_dtype()
 
@@ -258,6 +260,9 @@ class ModelConfig(CppModelConfig):
         """Evaluate KV cache memory size."""
         if self.task_type != TaskType.LANGUAGE_MODEL:
             return 0
+        if self.attn_config.kv_cache_dtype == KvCacheDataType.NVFP4:
+            indexer_bytes = self.attn_config.indexer_head_dim + self.attn_config.indexer_head_dim // 128 * 4
+            return self.num_layers * self.max_seq_len * (432 + indexer_bytes)
         # Get kv_cache_dtype from attn_config
         kv_cache_dtype_enum = self.attn_config.kv_cache_dtype
         kv_cache_bytes = (
@@ -686,6 +691,18 @@ class ModelConfig(CppModelConfig):
                 data_type.to_torch_dtype(), kv_cache_torch_dtype
             )
             logging.info("Precision configuration validation passed")
+
+        if os.environ.get("RTP_MLA_NVFP4", "0") == "1":
+            if not (
+                self.attn_config.use_mla
+                and self.attn_config.is_sparse
+                and self.attn_config.kv_lora_rank == 512
+                and self.attn_config.rope_head_dim == 64
+                and data_type == WEIGHT_TYPE.BF16
+            ):
+                raise ValueError("RTP_MLA_NVFP4 requires BF16 sparse MLA with latent=512 and RoPE=64")
+            self.attn_config.kv_cache_dtype = KvCacheDataType.NVFP4
+            logging.info("Using experimental MLA NVFP4 cache v1: 432 bytes/token, BF16 RoPE")
 
         # Set final data_type
         # This uses ModelConfig's __setattr__ which handles string-to-enum conversion

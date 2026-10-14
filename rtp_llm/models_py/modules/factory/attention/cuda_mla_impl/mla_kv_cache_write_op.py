@@ -11,6 +11,7 @@ import torch
 
 from rtp_llm.ops import KvCacheDataType, compute_ops
 from rtp_llm.ops.compute_ops import LayerKVCache, rtp_llm_ops
+from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import write_nvfp4_cache
 
 
 class MlaKVCacheWriteOp:
@@ -20,6 +21,7 @@ class MlaKVCacheWriteOp:
         self,
         kv_cache_dtype: KvCacheDataType,
     ) -> None:
+        self.is_nvfp4 = kv_cache_dtype == KvCacheDataType.NVFP4
         self.kv_cache_type = (
             "fp8_ds_mla" if kv_cache_dtype == KvCacheDataType.FP8 else "auto"
         )
@@ -49,6 +51,9 @@ class MlaKVCacheWriteOp:
                 slot_mapping = fmha_params.slot_mapping
             else:
                 slot_mapping = fmha_params.slot_mapping[total_global_ids]
+            if self.is_nvfp4:
+                write_nvfp4_cache(append_ckv_t, key_pe, kv_cache.kv_cache_base, slot_mapping)
+                return
             compute_ops.concat_and_cache_mla(
                 append_ckv_t,
                 key_pe,

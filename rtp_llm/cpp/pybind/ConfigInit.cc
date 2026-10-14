@@ -1405,7 +1405,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
     py::enum_<KvCacheDataType>(m, "KvCacheDataType")
         .value("BASE", KvCacheDataType::BASE)
         .value("INT8", KvCacheDataType::INT8)
-        .value("FP8", KvCacheDataType::FP8);
+        .value("FP8", KvCacheDataType::FP8)
+        .value("NVFP4", KvCacheDataType::NVFP4);
 
     // Register RopeStyle enum
     py::enum_<RopeStyle>(m, "RopeStyle")

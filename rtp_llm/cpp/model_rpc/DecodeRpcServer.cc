@@ -114,6 +114,13 @@ void DecodeRpcServer::prepareGenerateContext(DecodeGenerateContext& decode_conte
                       "message first status != RemoteStage::ALLOCATE");
     decode_context.request_id  = allocate_request.request_id();
     decode_context.request_key = makeRequestKey(allocate_request.client_id(), allocate_request.request_id());
+    const std::string expected_mla_cache_format =
+        maga_init_params_.model_config_.attn_config.kv_cache_dtype == KvCacheDataType::NVFP4 ?
+            "nvfp4_mla_v1_432" : "";
+    GRPC_RET_IF_ERROR(decode_context,
+                      allocate_request.mla_cache_format() == expected_mla_cache_format,
+                      grpc::StatusCode::INVALID_ARGUMENT,
+                      "prefill/decode MLA KV cache format mismatch");
 
     for (auto& addr : allocate_request.peer_addrs()) {
         decode_context.peer_addrs.push_back(addr);
