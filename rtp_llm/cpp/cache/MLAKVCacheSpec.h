@@ -25,6 +25,7 @@ struct MLAKVCacheSpec: public KVCacheSpec {
     bool     is_sparse        = false;
     uint32_t indexer_head_dim = 0;
     bool     is_nvfp4         = false;
+    size_t   nvfp4_token_bytes = 432;
 
     MLAKVCacheSpec() = default;
 
@@ -38,13 +39,20 @@ struct MLAKVCacheSpec: public KVCacheSpec {
         is_sparse          = attn_config.is_sparse;
         indexer_head_dim   = static_cast<uint32_t>(attn_config.indexer_head_dim);
         is_nvfp4          = attn_config.kv_cache_dtype == KvCacheDataType::NVFP4;
+        nvfp4_token_bytes   = attn_config.nvfp4CacheBytesPerToken();
+        const auto centers = attn_config.mla_nvfp4_cluster_centers;
+        RTP_LLM_CHECK_WITH_INFO(
+            centers == 0
+                || (is_nvfp4 && (centers == 1 || centers == 2 || centers == 4) && seq_size_per_block == 64
+                    && (attn_config.kernel_tokens_per_block == 0 || attn_config.kernel_tokens_per_block == 64)),
+            "Clustered MLA NVFP4 requires 1/2/4 centers and 64-token physical/kernel blocks");
         RTP_LLM_CHECK_WITH_INFO(!is_nvfp4 || (kv_lora_rank == 512 && rope_head_dim == 64 && is_sparse),
                                "NVFP4 cache requires sparse MLA with latent=512 and RoPE=64");
     }
 
     size_t block_size() const override {
         if (is_nvfp4) {
-            return static_cast<size_t>(432) * seq_size_per_block;
+            return nvfp4_token_bytes * seq_size_per_block;
         }
         auto is_fp8      = (dtype == DataType::TYPE_FP8_E4M3 || dtype == DataType::TYPE_FP8_E8M0);
         auto single_size = local_head_num_kv * (kv_lora_rank + rope_head_dim);

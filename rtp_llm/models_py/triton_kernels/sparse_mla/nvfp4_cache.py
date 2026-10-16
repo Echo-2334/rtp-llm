@@ -1,12 +1,18 @@
-"""MLA NVFP4 v1: 256B E2M1, 32B E4M3, 4B FP32, 128B BF16, 12B padding.
+"""MLA NVFP4: 256B E2M1, 32B E4M3, 4B FP32, 128B BF16, 12B metadata.
 
 The FP32 scale is per token; E4M3 scales cover 16 latent elements each.
-All scale metadata travels with the cache row during PD transfer.
+Clustered layouts append stripes of the block center table to each row.
+All metadata travels with the complete physical block during PD transfer.
 """
 
 import torch
 import triton
 import triton.language as tl
+
+from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cluster import (
+    _center_offsets,
+    initialize_block_centers,
+)
 
 CACHE_BYTES = 432
 
@@ -60,6 +66,8 @@ def _write_kernel(
     LATENT_STRIDE: tl.constexpr,
     ROPE_STRIDE: tl.constexpr,
     CAPACITY: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    CENTERS: tl.constexpr,
 ):
     token = tl.program_id(0)
     slot = tl.load(Slots + token).to(tl.int64)
@@ -69,6 +77,25 @@ def _write_kernel(
         values = tl.load(
             Latent + token * LATENT_STRIDE + groups[:, None] * 16 + lanes[None, :]
         ).to(tl.float32)
+        center_id = tl.full((), 0, tl.int32)
+        if CENTERS:
+            best_distance = tl.full((), float("inf"), tl.float32)
+            best_center = tl.full((32, 16), 0.0, tl.float32)
+            features = groups[:, None] * 16 + lanes[None, :]
+            for cluster in tl.static_range(CENTERS):
+                offsets = _center_offsets(
+                    slot // 64, cluster, features, ROW_BYTES, CENTERS
+                )
+                center = tl.load((Cache + offsets).to(tl.pointer_type(tl.bfloat16))).to(
+                    tl.float32
+                )
+                difference = values - center
+                distance = tl.sum(tl.sum(difference * difference, 1), 0)
+                better = distance < best_distance
+                best_center = tl.where(better, center, best_center)
+                center_id = tl.where(better, cluster, center_id)
+                best_distance = tl.minimum(best_distance, distance)
+            values -= best_center
         maxima = tl.max(tl.abs(values), 1)
         global_scale = tl.maximum(tl.max(maxima, 0) / (6.0 * 448.0), 1.0e-30)
         scales = tl.maximum(maxima / (6.0 * global_scale), 0.001953125).to(
@@ -85,7 +112,7 @@ def _write_kernel(
             ),
             1,
         )
-        base = Cache + slot * 432
+        base = Cache + slot * ROW_BYTES
         tl.store(base + tl.arange(0, 256), packed.to(tl.uint8))
         tl.store((base + 256).to(tl.pointer_type(tl.float8e4nv)) + groups, scales)
         tl.store((base + 288).to(tl.pointer_type(tl.float32)), global_scale)
@@ -95,13 +122,17 @@ def _write_kernel(
             rope_values,
         )
         padding = tl.arange(0, 16)
-        tl.store(base + 420 + padding, 0, padding < 12)
+        tl.store(
+            base + 420 + padding,
+            tl.where(padding == 0, center_id, 0).to(tl.uint8),
+            padding < 12,
+        )
 
 
 def write_nvfp4_cache(latent, rope, cache, slots):
     if not is_supported(latent, rope):
         raise ValueError("NVFP4 MLA requires CUDA BF16 latent[*,512] and RoPE[*,64]")
-    _validate_cache(cache)
+    centers = _validate_cache(cache)
     if (
         latent.device != cache.device
         or slots.device != cache.device
@@ -119,6 +150,8 @@ def write_nvfp4_cache(latent, rope, cache, slots):
     if latent.shape[0] != rope.shape[0] or slots.numel() != latent.shape[0]:
         raise ValueError("NVFP4 MLA latent, RoPE and slot counts must match")
     if latent.shape[0]:
+        if centers:
+            initialize_block_centers(latent, cache, slots, centers)
         _write_kernel[(latent.shape[0],)](
             latent,
             rope,
@@ -126,7 +159,9 @@ def write_nvfp4_cache(latent, rope, cache, slots):
             slots,
             latent.stride(0),
             rope.stride(0),
-            cache.numel() // CACHE_BYTES,
+            cache.numel() // cache.shape[-1],
+            cache.shape[-1],
+            centers,
             num_warps=4,
         )
 
@@ -136,16 +171,23 @@ def _validate_cache(cache):
         not cache.is_cuda
         or cache.dtype != torch.uint8
         or not cache.is_contiguous()
-        or cache.shape[-1] != CACHE_BYTES
+        or cache.ndim != 3
+        or cache.shape[-1] not in (432, 448, 464, 496)
     ):
         raise ValueError(
-            "NVFP4 MLA v1 cache must be contiguous CUDA uint8 with 432 bytes/token"
+            "NVFP4 MLA cache must be contiguous CUDA uint8 [blocks,page,432/448/464/496]"
         )
+    centers = (cache.shape[-1] - CACHE_BYTES) // 16
+    if centers and cache.shape[1] != 64:
+        raise ValueError("Clustered NVFP4 MLA requires 64-token blocks")
+    return centers
 
 
 @triton.jit
-def _load_latent(Cache, slots, valid, features):
-    base = Cache + slots[:, None].to(tl.int64) * 432
+def _load_latent(
+    Cache, slots, valid, features, ROW_BYTES: tl.constexpr, CENTERS: tl.constexpr
+):
+    base = Cache + slots[:, None].to(tl.int64) * ROW_BYTES
     packed = tl.load(base + features[None, :] // 2, valid[:, None], 0)
     code = (packed >> ((features[None, :] % 2) * 4)) & 15
     block_scale = tl.load(
@@ -154,11 +196,27 @@ def _load_latent(Cache, slots, valid, features):
         0.0,
     ).to(tl.float32)
     global_scale = tl.load(
-        (Cache + slots.to(tl.int64) * 432 + 288).to(tl.pointer_type(tl.float32)),
+        (Cache + slots.to(tl.int64) * ROW_BYTES + 288).to(tl.pointer_type(tl.float32)),
         valid,
         0,
     )
-    return (_decode_fp4(code) * block_scale * global_scale[:, None]).to(tl.bfloat16)
+    values = _decode_fp4(code) * block_scale * global_scale[:, None]
+    if CENTERS:
+        center_ids = tl.load(Cache + slots.to(tl.int64) * ROW_BYTES + 420, valid, 0).to(
+            tl.int32
+        )
+        offsets = _center_offsets(
+            slots[:, None].to(tl.int64) // 64,
+            center_ids[:, None],
+            features[None, :],
+            ROW_BYTES,
+            CENTERS,
+        )
+        centers = tl.load(
+            (Cache + offsets).to(tl.pointer_type(tl.bfloat16)), valid[:, None], 0
+        ).to(tl.float32)
+        values += centers
+    return values.to(tl.bfloat16)
 
 
 @triton.jit
@@ -171,6 +229,8 @@ def _gather_kernel(
     TABLE_STRIDE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     CAPACITY: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    CENTERS: tl.constexpr,
 ):
     position = tl.program_id(0)
     request = tl.program_id(1)
@@ -187,12 +247,15 @@ def _gather_kernel(
             tl.full((1,), slot, tl.int64),
             tl.full((1,), valid, tl.int1),
             features,
+            ROW_BYTES,
+            CENTERS,
         )
         destination = (tl.load(Starts + request).to(tl.int64) + position) * 576
         tl.store(Output + destination + features, tl.reshape(latent, (512,)))
         rope_features = tl.arange(0, 64)
         rope = tl.load(
-            (Cache + slot * 432 + 292).to(tl.pointer_type(tl.bfloat16)) + rope_features,
+            (Cache + slot * ROW_BYTES + 292).to(tl.pointer_type(tl.bfloat16))
+            + rope_features,
             valid,
             0,
         )
@@ -202,7 +265,7 @@ def _gather_kernel(
 def gather_nvfp4_cache(
     cache, output, block_table, seq_lens, starts, batch_size, total_kv_len
 ):
-    _validate_cache(cache)
+    centers = _validate_cache(cache)
     if (
         output.dtype != torch.bfloat16
         or output.shape != (total_kv_len, 576)
@@ -220,7 +283,9 @@ def gather_nvfp4_cache(
             starts,
             block_table.stride(0),
             cache.shape[1],
-            cache.numel() // CACHE_BYTES,
+            cache.numel() // cache.shape[-1],
+            cache.shape[-1],
+            centers,
             num_warps=4,
         )
 
@@ -242,6 +307,8 @@ def _attention_kernel(
     SPLITS: tl.constexpr,
     SPLIT_SIZE: tl.constexpr,
     BLOCK_HEADS: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    CENTERS: tl.constexpr,
 ):
     token = tl.program_id(0)
     head_block = tl.program_id(1)
@@ -272,9 +339,9 @@ def _attention_kernel(
             Indices + token * INDEX_STRIDE + offsets, offsets < TOPK, -1
         ).to(tl.int64)
         valid = (slots >= 0) & (slots < CAPACITY) & (offsets < TOPK)
-        latent = _load_latent(Cache, slots, valid, features)
+        latent = _load_latent(Cache, slots, valid, features, ROW_BYTES, CENTERS)
         rope = tl.load(
-            (Cache + slots[:, None] * 432 + 292).to(tl.pointer_type(tl.bfloat16))
+            (Cache + slots[:, None] * ROW_BYTES + 292).to(tl.pointer_type(tl.bfloat16))
             + rope_features[None, :],
             valid[:, None],
             0,
@@ -327,7 +394,7 @@ def _merge_kernel(Partial, Lse, Output, SPLITS: tl.constexpr):
 
 def sparse_nvfp4_attention(query, cache, physical_indices, scale):
     """Direct paged-cache attention with shape-stable allocations for CUDA graphs."""
-    _validate_cache(cache)
+    centers = _validate_cache(cache)
     if query.device != cache.device or physical_indices.device != cache.device:
         raise ValueError("NVFP4 MLA query, cache and indices must share a CUDA device")
     if query.dtype != torch.bfloat16 or query.shape[-1] != 576 or query.stride(-1) != 1:
@@ -358,11 +425,13 @@ def sparse_nvfp4_attention(query, cache, physical_indices, scale):
             indices.stride(0),
             heads,
             topk,
-            cache.numel() // CACHE_BYTES,
+            cache.numel() // cache.shape[-1],
             scale,
             splits,
             split_size,
             16,
+            cache.shape[-1],
+            centers,
             num_warps=8,
             num_stages=1,
         )

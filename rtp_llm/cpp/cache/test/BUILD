@@ -242,6 +242,13 @@ cc_test(
 )
 
 cc_test(
+    name = "mla_nvfp4_cache_spec_test",
+    srcs = ["MLANvfp4CacheSpecTest.cc"],
+    copts = test_copts,
+    deps = test_deps,
+)
+
+cc_test(
     name = "full_kv_cache_group_test",
     srcs = [
         "FullKVCacheGroupTest.cc",

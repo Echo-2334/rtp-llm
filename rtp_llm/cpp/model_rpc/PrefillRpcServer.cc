@@ -665,9 +665,7 @@ void PrefillRpcServer::remoteAllocateResource(PrefillGenerateContext& prefill_co
 
     // Propagate CP size so decode knows prefill used context-parallel page-RR.
     const auto& cp_cfg = maga_init_params_.parallelism_config.prefill_cp_config;
-    if (maga_init_params_.model_config_.attn_config.kv_cache_dtype == KvCacheDataType::NVFP4) {
-        alloc_request.set_mla_cache_format("nvfp4_mla_v1_432");
-    }
+    alloc_request.set_mla_cache_format(maga_init_params_.model_config_.attn_config.mlaCacheFormat());
     if (cp_cfg.kv_cache_sharded && maga_init_params_.parallelism_config.tp_size > 1) {
         alloc_request.set_prefill_cp_size(static_cast<int32_t>(maga_init_params_.parallelism_config.tp_size));
     }

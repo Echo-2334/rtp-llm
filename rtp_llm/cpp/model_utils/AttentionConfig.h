@@ -55,6 +55,7 @@ struct AttentionConfigs {
     // softmax config
     float           softmax_extra_scale = 1.0f;
     KvCacheDataType kv_cache_dtype      = KvCacheDataType::BASE;
+    size_t          mla_nvfp4_cluster_centers = 0;
     bool            need_rope_kv_cache  = true;
 
     // sparse attention config
@@ -87,6 +88,21 @@ struct AttentionConfigs {
     int64_t gen_num_per_cycle = 0;
 
 public:
+    size_t nvfp4CacheBytesPerToken() const {
+        return 432 + 16 * mla_nvfp4_cluster_centers;
+    }
+
+    std::string mlaCacheFormat() const {
+        if (kv_cache_dtype != KvCacheDataType::NVFP4) {
+            return "";
+        }
+        if (mla_nvfp4_cluster_centers == 0) {
+            return "nvfp4_mla_v1_432";
+        }
+        return "nvfp4_mla_cluster_v1_b64_k" + std::to_string(mla_nvfp4_cluster_centers) + "_"
+               + std::to_string(nvfp4CacheBytesPerToken());
+    }
+
     std::string DebugAttentionConfigStr() const;
 };
 

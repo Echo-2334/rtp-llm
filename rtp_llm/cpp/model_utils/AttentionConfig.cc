@@ -12,6 +12,8 @@ static std::string kvCacheDataTypeToString(KvCacheDataType kv_cache_dtype) {
             return "INT8";
         case KvCacheDataType::FP8:
             return "FP8";
+        case KvCacheDataType::NVFP4:
+            return "NVFP4";
         default:
             return "UNKNOWN(" + std::to_string(static_cast<int>(kv_cache_dtype)) + ")";
     }
@@ -35,6 +37,8 @@ std::string AttentionConfigs::DebugAttentionConfigStr() const {
     oss << "  v_head_dim: " << v_head_dim << std::endl;
     oss << "  softmax_extra_scale: " << softmax_extra_scale << std::endl;
     oss << "  kv_cache_dtype: " << kvCacheDataTypeToString(kv_cache_dtype) << std::endl;
+    oss << "  mla_nvfp4_cluster_centers: " << mla_nvfp4_cluster_centers << std::endl;
+    oss << "  mla_cache_format: " << mlaCacheFormat() << std::endl;
     oss << "  need_rope_kv_cache: " << need_rope_kv_cache << std::endl;
     oss << rope_config.DebugRopeConfigStr();
     return oss.str();

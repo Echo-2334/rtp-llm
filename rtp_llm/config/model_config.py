@@ -262,7 +262,8 @@ class ModelConfig(CppModelConfig):
             return 0
         if self.attn_config.kv_cache_dtype == KvCacheDataType.NVFP4:
             indexer_bytes = self.attn_config.indexer_head_dim + self.attn_config.indexer_head_dim // 128 * 4
-            return self.num_layers * self.max_seq_len * (432 + indexer_bytes)
+            cache_bytes = 432 + 16 * self.attn_config.mla_nvfp4_cluster_centers
+            return self.num_layers * self.max_seq_len * (cache_bytes + indexer_bytes)
         # Get kv_cache_dtype from attn_config
         kv_cache_dtype_enum = self.attn_config.kv_cache_dtype
         kv_cache_bytes = (
@@ -692,6 +693,12 @@ class ModelConfig(CppModelConfig):
             )
             logging.info("Precision configuration validation passed")
 
+        cluster_centers = int(os.environ.get("RTP_MLA_NVFP4_CLUSTER_CENTERS", "0"))
+        if cluster_centers not in (0, 1, 2, 4):
+            raise ValueError("RTP_MLA_NVFP4_CLUSTER_CENTERS must be 0, 1, 2 or 4")
+        if cluster_centers and os.environ.get("RTP_MLA_NVFP4", "0") != "1":
+            raise ValueError("Clustered MLA cache requires RTP_MLA_NVFP4=1")
+        self.attn_config.mla_nvfp4_cluster_centers = cluster_centers
         if os.environ.get("RTP_MLA_NVFP4", "0") == "1":
             if not (
                 self.attn_config.use_mla
@@ -702,7 +709,15 @@ class ModelConfig(CppModelConfig):
             ):
                 raise ValueError("RTP_MLA_NVFP4 requires BF16 sparse MLA with latent=512 and RoPE=64")
             self.attn_config.kv_cache_dtype = KvCacheDataType.NVFP4
-            logging.info("Using experimental MLA NVFP4 cache v1: 432 bytes/token, BF16 RoPE")
+            if cluster_centers:
+                logging.info(
+                    "Using experimental clustered MLA NVFP4 cache v1: "
+                    "%d centers/block, 64 tokens/block, %d bytes/token, BF16 centers/RoPE",
+                    cluster_centers,
+                    432 + 16 * cluster_centers,
+                )
+            else:
+                logging.info("Using experimental MLA NVFP4 cache v1: 432 bytes/token, BF16 RoPE")
 
         # Set final data_type
         # This uses ModelConfig's __setattr__ which handles string-to-enum conversion

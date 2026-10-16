@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+from rtp_llm.ops import KvCacheDataType
 from rtp_llm.utils.model_weight import W
 
 _ENABLE_ENV = "RTP_LLM_GLM5_CMP"
@@ -166,6 +167,8 @@ class Glm5Cmp:
         if str(getattr(self.config, "model_type", "")) not in _SUPPORTED_MODEL_TYPES:
             return "unsupported model type"
         attn = self.config.attn_config
+        if getattr(attn, "kv_cache_dtype", None) == KvCacheDataType.NVFP4:
+            return "GLM5 CMP does not support NVFP4 MLA cache layouts"
         if not bool(getattr(attn, "use_mla", False)):
             return "attention is not MLA"
         if int(getattr(attn, "kernel_tokens_per_block", 0)) != 64:

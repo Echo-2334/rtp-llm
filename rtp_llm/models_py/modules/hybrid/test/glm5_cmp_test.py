@@ -97,6 +97,26 @@ def test_parallelism_ignores_prefill_cp_metadata_on_decode() -> None:
     )
 
 
+@pytest.mark.parametrize("centers", (0, 1, 2, 4))
+def test_cmp_rejects_nvfp4_cache(centers) -> None:
+    cmp = object.__new__(bridge.Glm5Cmp)
+    cmp.parallelism_config = SimpleNamespace(
+        tp_size=1, get_attn_tp_size=lambda: 1, prefill_cp_config=None
+    )
+    cmp.config = SimpleNamespace(
+        model_type="glm_5",
+        attn_config=SimpleNamespace(
+            use_mla=True,
+            kernel_tokens_per_block=64,
+            kv_cache_dtype=bridge.KvCacheDataType.NVFP4,
+            mla_nvfp4_cluster_centers=centers,
+        ),
+    )
+    assert cmp._static_disabled_reason() == (
+        "GLM5 CMP does not support NVFP4 MLA cache layouts"
+    )
+
+
 def test_cmp_constructor_does_not_load_runtime() -> None:
     config = SimpleNamespace(
         model_type="glm_5",

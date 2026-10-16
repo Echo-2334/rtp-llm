@@ -1,6 +1,7 @@
 import unittest
 
 import torch
+
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
     CACHE_BYTES,
     gather_nvfp4_cache,
@@ -10,7 +11,7 @@ from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
 
 
 def reference_decode(cache):
-    rows = cache.reshape(-1, CACHE_BYTES)
+    rows = cache.reshape(-1, cache.shape[-1])
     packed = rows[:, :256].to(torch.long)
     codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(-1, 512)
     lookup = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=cache.device)
@@ -24,7 +25,18 @@ def reference_decode(cache):
     )
     outer = rows[:, 288:292].contiguous().view(torch.float32)
     rope = rows[:, 292:420].contiguous().view(torch.bfloat16)
-    return torch.cat(((values * scales * outer).bfloat16(), rope), -1)
+    latent = values * scales * outer
+    centers = (cache.shape[-1] - CACHE_BYTES) // 16
+    if centers:
+        table = (
+            cache[:, :, 432:]
+            .contiguous()
+            .view(torch.bfloat16)
+            .reshape(-1, centers, 512)
+        )
+        blocks = torch.arange(rows.shape[0], device=cache.device) // 64
+        latent += table[blocks, rows[:, 420].long()].float()
+    return torch.cat((latent.bfloat16(), rope), -1)
 
 
 def reference_attention(query, cache, indices, scale):
@@ -129,6 +141,172 @@ class Nvfp4CacheTest(unittest.TestCase):
             graph.replay()
             expected = reference_attention(query, self.cache, indices, 1 / 16)
             torch.testing.assert_close(output, expected, rtol=0.025, atol=0.012)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class ClusteredNvfp4CacheTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(1729)
+
+    def test_clustering_quality_and_block_transfer(self):
+        for centers in (1, 2, 4):
+            with self.subTest(centers=centers):
+                cache = torch.zeros(
+                    (4, 64, 432 + 16 * centers), device="cuda", dtype=torch.uint8
+                )
+                source_centers = torch.randn((2, centers, 512), device="cuda") * 4
+                assignments = torch.arange(64, device="cuda") % centers
+                latent = (
+                    (
+                        source_centers[:, assignments]
+                        + torch.randn((2, 64, 512), device="cuda") * 0.1
+                    )
+                    .reshape(-1, 512)
+                    .bfloat16()
+                )
+                rope = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16)
+                permutation = torch.randperm(128, device="cuda")
+                joined = torch.cat((latent, rope), -1)[permutation]
+                write_nvfp4_cache(joined[:, :512], joined[:, 512:], cache, permutation)
+                decoded = reference_decode(cache)[:128]
+                torch.testing.assert_close(decoded[:, 512:], rope, atol=0, rtol=0)
+                direct = torch.zeros((2, 64, 432), device="cuda", dtype=torch.uint8)
+                write_nvfp4_cache(
+                    latent, rope, direct, torch.arange(128, device="cuda")
+                )
+                direct_error = (
+                    (reference_decode(direct)[:, :512].float() - latent.float())
+                    .square()
+                    .mean()
+                )
+                residual_error = (
+                    (decoded[:, :512].float() - latent.float()).square().mean()
+                )
+                self.assertLess(residual_error.item(), direct_error.item() * 0.1)
+                if centers == 1:
+                    actual_centers = (
+                        cache[:2, :, 432:]
+                        .contiguous()
+                        .view(torch.bfloat16)
+                        .reshape(2, 512)
+                    )
+                    torch.testing.assert_close(
+                        actual_centers,
+                        latent.reshape(2, 64, 512).float().mean(1).bfloat16(),
+                        atol=0,
+                        rtol=0,
+                    )
+                peer = torch.zeros_like(cache)
+                peer[3].copy_(cache[0])
+                peer[1].copy_(cache[1])
+                output = torch.empty((128, 576), device="cuda", dtype=torch.bfloat16)
+                table = torch.tensor([[3, 1]], device="cuda", dtype=torch.int32)
+                lengths = torch.tensor([128], device="cuda", dtype=torch.int32)
+                starts = torch.tensor([0], device="cuda", dtype=torch.int32)
+                gather_nvfp4_cache(peer, output, table, lengths, starts, 1, 128)
+                torch.testing.assert_close(
+                    output[:, :512], decoded[:, :512], atol=1e-6, rtol=0.008
+                )
+                torch.testing.assert_close(output[:, 512:], rope, atol=0, rtol=0)
+                source_output = torch.empty_like(output)
+                gather_nvfp4_cache(
+                    cache,
+                    source_output,
+                    torch.tensor([[0, 1]], device="cuda", dtype=torch.int32),
+                    lengths,
+                    starts,
+                    1,
+                    128,
+                )
+                torch.testing.assert_close(output, source_output, atol=0, rtol=0)
+                query = torch.randn((3, 16, 576), device="cuda", dtype=torch.bfloat16)
+                indices = torch.randint(0, 128, (3, 256), device="cuda")
+                indices = torch.where(indices < 64, indices + 192, indices)
+                indices[0].fill_(-1)
+                actual = sparse_nvfp4_attention(query, peer, indices, 1 / 32)
+                expected = reference_attention(query, peer, indices, 1 / 32)
+                torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.04)
+
+    def test_partial_block_append_and_recycle(self):
+        cache = torch.zeros((3, 64, 496), device="cuda", dtype=torch.uint8)
+        cache[:, :, 432:].fill_(255)
+        latent = torch.randn((64, 512), device="cuda", dtype=torch.bfloat16)
+        rope = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
+        write_nvfp4_cache(
+            latent[:19], rope[:19], cache, torch.arange(64, 83, device="cuda")
+        )
+        saved_centers = cache[1, :, 432:].clone()
+        prefix = reference_decode(cache[1:2])[:19].clone()
+        peer = cache.clone()
+        write_nvfp4_cache(
+            latent[19:], rope[19:], peer, torch.arange(83, 128, device="cuda")
+        )
+        torch.testing.assert_close(peer[1, :, 432:], saved_centers, atol=0, rtol=0)
+        decoded = reference_decode(peer[1:2])
+        torch.testing.assert_close(decoded[:19], prefix, atol=0, rtol=0)
+        torch.testing.assert_close(decoded[:, 512:], rope, atol=0, rtol=0)
+        self.assertLess(
+            (decoded[:, :512].float() - latent.float()).square().mean().sqrt().item(),
+            0.2,
+        )
+        latent.add_(10)
+        write_nvfp4_cache(latent[:1], rope[:1], peer, torch.tensor([64], device="cuda"))
+        centers = peer[1, :, 432:].contiguous().view(torch.bfloat16).reshape(4, 512)
+        torch.testing.assert_close(centers, latent[:1].expand(4, -1), atol=0, rtol=0)
+        torch.testing.assert_close(peer[0], cache[0], atol=0, rtol=0)
+        torch.testing.assert_close(peer[2], cache[2], atol=0, rtol=0)
+        before = peer.clone()
+        write_nvfp4_cache(
+            latent[:2], rope[:2], peer, torch.tensor([-1, 192], device="cuda")
+        )
+        torch.testing.assert_close(peer, before, atol=0, rtol=0)
+
+    def test_clustered_cuda_graph_replay(self):
+        cache = torch.zeros((8, 64, 496), device="cuda", dtype=torch.uint8)
+        latent = torch.randn((4, 512), device="cuda", dtype=torch.bfloat16)
+        rope = torch.randn((4, 64), device="cuda", dtype=torch.bfloat16)
+        slots = torch.arange(4, device="cuda") * 64
+        query = torch.randn((4, 64, 576), device="cuda", dtype=torch.bfloat16)
+        indices = slots[:, None].expand(4, 2048).contiguous()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                write_nvfp4_cache(latent, rope, cache, slots)
+                sparse_nvfp4_attention(query, cache, indices, 1 / 16)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            write_nvfp4_cache(latent, rope, cache, slots)
+            output = sparse_nvfp4_attention(query, cache, indices, 1 / 16)
+        for offset in (0, 1, 256, 257):
+            latent.normal_()
+            rope.normal_()
+            query.normal_()
+            slots.copy_(torch.arange(4, device="cuda") * 64 + offset)
+            indices.copy_(slots[:, None].expand_as(indices))
+            graph.replay()
+            expected = reference_attention(query, cache, indices, 1 / 16)
+            torch.testing.assert_close(output, expected, rtol=0.025, atol=0.012)
+            decoded = reference_decode(cache)[slots]
+            torch.testing.assert_close(decoded[:, 512:], rope, atol=0, rtol=0)
+            self.assertLess(
+                (decoded[:, :512].float() - latent.float())
+                .square()
+                .mean()
+                .sqrt()
+                .item(),
+                0.2,
+            )
+
+    def test_unsupported_page_size(self):
+        cache = torch.zeros((2, 32, 496), device="cuda", dtype=torch.uint8)
+        latent = torch.zeros((1, 512), device="cuda", dtype=torch.bfloat16)
+        rope = torch.zeros((1, 64), device="cuda", dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "64-token"):
+            write_nvfp4_cache(
+                latent, rope, cache, torch.zeros(1, device="cuda", dtype=torch.int64)
+            )
 
 
 if __name__ == "__main__":
