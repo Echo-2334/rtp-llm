@@ -76,6 +76,14 @@ size_t MemoryEvaluationHelper::getDefaultRuntimeMemorySize(const RuntimeConfig& 
         updateMemoryIfNeeded(reserve_runtime_mem_bytes, minimal_runtime_required, "speculative decoding");
     }
 
+    if (model_config.attn_config.mla_nvfp4_deferred_blocks) {
+        const size_t tail_bytes = model_config.attn_config.mla_nvfp4_tail_blocks
+                                  * 64 * 512 * sizeof(uint16_t) * model_config.num_layers;
+        // BF16 tails are allocated during eager warmup, independently of the
+        // compressed page pool. Keep their bounded footprint out of its budget.
+        reserve_runtime_mem_bytes += tail_bytes;
+        RTP_LLM_LOG_INFO("Deferred NVFP4 BF16 tails reserve %zu MiB", tail_bytes / 1024 / 1024);
+    }
     return reserve_runtime_mem_bytes;
 }
 

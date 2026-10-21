@@ -8,7 +8,6 @@ All metadata travels with the complete physical block during PD transfer.
 import torch
 import triton
 import triton.language as tl
-
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cluster import (
     _center_offsets,
     initialize_block_centers,
@@ -58,27 +57,15 @@ def _decode_fp4(code):
 
 
 @triton.jit
-def _write_kernel(
-    Latent,
-    Rope,
-    Cache,
-    Slots,
-    LATENT_STRIDE: tl.constexpr,
-    ROPE_STRIDE: tl.constexpr,
-    CAPACITY: tl.constexpr,
-    ROW_BYTES: tl.constexpr,
-    CENTERS: tl.constexpr,
+def _store_latent(
+    Cache, slot, values, ROW_BYTES: tl.constexpr, CENTERS: tl.constexpr, CLUSTER, tag
 ):
-    token = tl.program_id(0)
-    slot = tl.load(Slots + token).to(tl.int64)
-    if slot >= 0 and slot < CAPACITY:
-        groups = tl.arange(0, 32)
-        lanes = tl.arange(0, 16)
-        values = tl.load(
-            Latent + token * LATENT_STRIDE + groups[:, None] * 16 + lanes[None, :]
-        ).to(tl.float32)
-        center_id = tl.full((), 0, tl.int32)
-        if CENTERS:
+    groups = tl.arange(0, 32)
+    lanes = tl.arange(0, 16)
+    values = tl.reshape(values, (32, 16)).to(tl.float32)
+    center_id = tl.full((), 255, tl.int32)
+    if CENTERS:
+        if CLUSTER:
             best_distance = tl.full((), float("inf"), tl.float32)
             best_center = tl.full((32, 16), 0.0, tl.float32)
             features = groups[:, None] * 16 + lanes[None, :]
@@ -96,40 +83,58 @@ def _write_kernel(
                 center_id = tl.where(better, cluster, center_id)
                 best_distance = tl.minimum(best_distance, distance)
             values -= best_center
-        maxima = tl.max(tl.abs(values), 1)
-        global_scale = tl.maximum(tl.max(maxima, 0) / (6.0 * 448.0), 1.0e-30)
-        scales = tl.maximum(maxima / (6.0 * global_scale), 0.001953125).to(
-            tl.float8e4nv
+    maxima = tl.max(tl.abs(values), 1)
+    global_scale = tl.maximum(tl.max(maxima, 0) / (6.0 * 448.0), 1.0e-30)
+    scales = tl.maximum(maxima / (6.0 * global_scale), 0.001953125).to(tl.float8e4nv)
+    codes = _encode_fp4(values / (scales.to(tl.float32)[:, None] * global_scale))
+    pairs = tl.reshape(codes, (256, 2))
+    packed = tl.sum(
+        tl.where(
+            tl.arange(0, 2)[None, :] == 0, pairs.to(tl.int32), pairs.to(tl.int32) << 4
+        ),
+        1,
+    )
+    base = Cache + slot * ROW_BYTES
+    tl.store(base + tl.arange(0, 256), packed.to(tl.uint8))
+    tl.store((base + 256).to(tl.pointer_type(tl.float8e4nv)) + groups, scales)
+    tl.store((base + 288).to(tl.pointer_type(tl.float32)), global_scale)
+    padding = tl.arange(0, 16)
+    tl.store(
+        base + 420 + padding,
+        tl.where(padding == 0, center_id, 0).to(tl.uint8),
+        padding < 4,
+    )
+    tl.store((base + 424).to(tl.pointer_type(tl.int64)), tag)
+
+
+@triton.jit
+def _write_kernel(
+    Latent,
+    Rope,
+    Cache,
+    Slots,
+    LATENT_STRIDE: tl.constexpr,
+    ROPE_STRIDE: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    CENTERS: tl.constexpr,
+):
+    token = tl.program_id(0)
+    slot = tl.load(Slots + token).to(tl.int64)
+    if slot >= 0 and slot < CAPACITY:
+        values = tl.load(Latent + token * LATENT_STRIDE + tl.arange(0, 512)).to(
+            tl.float32
         )
-        scaled = values / (scales.to(tl.float32)[:, None] * global_scale)
-        codes = _encode_fp4(scaled)
-        pairs = tl.reshape(codes, (256, 2))
-        packed = tl.sum(
-            tl.where(
-                tl.arange(0, 2)[None, :] == 0,
-                pairs.to(tl.int32),
-                pairs.to(tl.int32) << 4,
-            ),
-            1,
-        )
-        base = Cache + slot * ROW_BYTES
-        tl.store(base + tl.arange(0, 256), packed.to(tl.uint8))
-        tl.store((base + 256).to(tl.pointer_type(tl.float8e4nv)) + groups, scales)
-        tl.store((base + 288).to(tl.pointer_type(tl.float32)), global_scale)
+        _store_latent(Cache, slot, values, ROW_BYTES, CENTERS, True, 0)
         rope_values = tl.load(Rope + token * ROPE_STRIDE + tl.arange(0, 64))
         tl.store(
-            (base + 292).to(tl.pointer_type(tl.bfloat16)) + tl.arange(0, 64),
+            (Cache + slot * ROW_BYTES + 292).to(tl.pointer_type(tl.bfloat16))
+            + tl.arange(0, 64),
             rope_values,
         )
-        padding = tl.arange(0, 16)
-        tl.store(
-            base + 420 + padding,
-            tl.where(padding == 0, center_id, 0).to(tl.uint8),
-            padding < 12,
-        )
 
 
-def write_nvfp4_cache(latent, rope, cache, slots):
+def write_nvfp4_cache(latent, rope, cache, slots, *, deferred_state=None):
     if not is_supported(latent, rope):
         raise ValueError("NVFP4 MLA requires CUDA BF16 latent[*,512] and RoPE[*,64]")
     centers = _validate_cache(cache)
@@ -149,6 +154,9 @@ def write_nvfp4_cache(latent, rope, cache, slots):
         raise ValueError("NVFP4 MLA input rows must have contiguous features")
     if latent.shape[0] != rope.shape[0] or slots.numel() != latent.shape[0]:
         raise ValueError("NVFP4 MLA latent, RoPE and slot counts must match")
+    if deferred_state is not None:
+        deferred_state.write(latent, rope, cache, slots)
+        return
     if latent.shape[0]:
         if centers:
             initialize_block_centers(latent, cache, slots, centers)
@@ -205,22 +213,89 @@ def _load_latent(
         center_ids = tl.load(Cache + slots.to(tl.int64) * ROW_BYTES + 420, valid, 0).to(
             tl.int32
         )
+        has_center = valid & (center_ids < CENTERS)
         offsets = _center_offsets(
             slots[:, None].to(tl.int64) // 64,
-            center_ids[:, None],
+            tl.minimum(center_ids, CENTERS - 1)[:, None],
             features[None, :],
             ROW_BYTES,
             CENTERS,
         )
         centers = tl.load(
-            (Cache + offsets).to(tl.pointer_type(tl.bfloat16)), valid[:, None], 0
+            (Cache + offsets).to(tl.pointer_type(tl.bfloat16)), has_center[:, None], 0
         ).to(tl.float32)
         values += centers
     return values.to(tl.bfloat16)
 
 
 @triton.jit
+def _load_mixed_latent(
+    Cache,
+    slots,
+    valid,
+    features,
+    ROW_BYTES: tl.constexpr,
+    CENTERS: tl.constexpr,
+    Tail,
+    Mapping,
+    Owners,
+    Tags,
+    Counts,
+    USE_TAIL: tl.constexpr,
+):
+    values = _load_latent(Cache, slots, valid, features, ROW_BYTES, CENTERS)
+    if USE_TAIL:
+        blocks = slots.to(tl.int64) // 64
+        mapping = tl.load(Mapping + blocks, valid, -1)
+        safe = tl.maximum(mapping, 0)
+        owner = tl.load(Owners + safe, valid & (mapping >= 0), -1)
+        stored_tag = tl.load(
+            (Cache + slots.to(tl.int64) * ROW_BYTES + 424).to(
+                tl.pointer_type(tl.int64)
+            ),
+            valid,
+            0,
+        )
+        pool_tag = tl.load(Tags + safe, valid & (mapping >= 0), -1)
+        count = tl.load(Counts + safe, valid & (mapping >= 0), 0)
+        marker = tl.load(Cache + slots.to(tl.int64) * ROW_BYTES + 420, valid, 0)
+        raw_valid = (
+            valid
+            & (mapping >= 0)
+            & (owner == blocks)
+            & (stored_tag == pool_tag)
+            & (slots % 64 < count)
+            & (marker == 255)
+        )
+        raw = tl.load(
+            Tail
+            + safe[:, None].to(tl.int64) * 64 * 512
+            + (slots % 64)[:, None] * 512
+            + features[None, :],
+            raw_valid[:, None],
+            0,
+        )
+        values = tl.where(raw_valid[:, None], raw, values)
+    return values
+
+
+def _tail_args(cache):
+    from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_deferred import find_state
+
+    state = find_state(cache)
+    if state is None:
+        return (cache, cache, cache, cache, cache, False)
+    return (state.data, state.mapping, state.owners, state.tags, state.counts, True)
+
+
+@triton.jit
 def _gather_kernel(
+    Tail,
+    Mapping,
+    Owners,
+    Tags,
+    Counts,
+    USE_TAIL: tl.constexpr,
     Cache,
     Output,
     Table,
@@ -242,13 +317,19 @@ def _gather_kernel(
         slot = block * PAGE_SIZE + position % PAGE_SIZE
         valid = (slot >= 0) & (slot < CAPACITY)
         features = tl.arange(0, 512)
-        latent = _load_latent(
+        latent = _load_mixed_latent(
             Cache,
             tl.full((1,), slot, tl.int64),
             tl.full((1,), valid, tl.int1),
             features,
             ROW_BYTES,
             CENTERS,
+            Tail,
+            Mapping,
+            Owners,
+            Tags,
+            Counts,
+            USE_TAIL,
         )
         destination = (tl.load(Starts + request).to(tl.int64) + position) * 576
         tl.store(Output + destination + features, tl.reshape(latent, (512,)))
@@ -276,6 +357,7 @@ def gather_nvfp4_cache(
         )
     if total_kv_len:
         _gather_kernel[(total_kv_len, batch_size)](
+            *_tail_args(cache),
             cache,
             output,
             block_table,
@@ -292,6 +374,12 @@ def gather_nvfp4_cache(
 
 @triton.jit
 def _attention_kernel(
+    Tail,
+    Mapping,
+    Owners,
+    Tags,
+    Counts,
+    USE_TAIL: tl.constexpr,
     Query,
     Cache,
     Indices,
@@ -339,7 +427,20 @@ def _attention_kernel(
             Indices + token * INDEX_STRIDE + offsets, offsets < TOPK, -1
         ).to(tl.int64)
         valid = (slots >= 0) & (slots < CAPACITY) & (offsets < TOPK)
-        latent = _load_latent(Cache, slots, valid, features, ROW_BYTES, CENTERS)
+        latent = _load_mixed_latent(
+            Cache,
+            slots,
+            valid,
+            features,
+            ROW_BYTES,
+            CENTERS,
+            Tail,
+            Mapping,
+            Owners,
+            Tags,
+            Counts,
+            USE_TAIL,
+        )
         rope = tl.load(
             (Cache + slots[:, None] * ROW_BYTES + 292).to(tl.pointer_type(tl.bfloat16))
             + rope_features[None, :],
@@ -415,6 +516,7 @@ def sparse_nvfp4_attention(query, cache, physical_indices, scale):
     output = torch.empty((tokens, heads, 512), dtype=query.dtype, device=query.device)
     if tokens:
         _attention_kernel[(tokens, triton.cdiv(heads, 16), splits)](
+            *_tail_args(cache),
             query,
             cache,
             indices,

@@ -5,7 +5,6 @@ import os
 from typing import Any, Dict, Optional
 
 import torch
-
 from rtp_llm.config.quant_config import (
     Fp8BlockWiseQuantConfig,
     ModelOptFp4Config,
@@ -261,7 +260,10 @@ class ModelConfig(CppModelConfig):
         if self.task_type != TaskType.LANGUAGE_MODEL:
             return 0
         if self.attn_config.kv_cache_dtype == KvCacheDataType.NVFP4:
-            indexer_bytes = self.attn_config.indexer_head_dim + self.attn_config.indexer_head_dim // 128 * 4
+            indexer_bytes = (
+                self.attn_config.indexer_head_dim
+                + self.attn_config.indexer_head_dim // 128 * 4
+            )
             cache_bytes = 432 + 16 * self.attn_config.mla_nvfp4_cluster_centers
             return self.num_layers * self.max_seq_len * (cache_bytes + indexer_bytes)
         # Get kv_cache_dtype from attn_config
@@ -698,6 +700,18 @@ class ModelConfig(CppModelConfig):
             raise ValueError("RTP_MLA_NVFP4_CLUSTER_CENTERS must be 0, 1, 2 or 4")
         if cluster_centers and os.environ.get("RTP_MLA_NVFP4", "0") != "1":
             raise ValueError("Clustered MLA cache requires RTP_MLA_NVFP4=1")
+        deferred = os.environ.get("RTP_MLA_NVFP4_DEFER_BLOCK", "0")
+        if deferred not in ("0", "1"):
+            raise ValueError("RTP_MLA_NVFP4_DEFER_BLOCK must be 0 or 1")
+        if deferred == "1" and not cluster_centers:
+            raise ValueError(
+                "Deferred NVFP4 requires RTP_MLA_NVFP4=1 and 1/2/4 cluster centers"
+            )
+        tail_blocks = int(os.environ.get("RTP_MLA_NVFP4_TAIL_BLOCKS", "256"))
+        if tail_blocks <= 0:
+            raise ValueError("RTP_MLA_NVFP4_TAIL_BLOCKS must be positive")
+        self.attn_config.mla_nvfp4_tail_blocks = tail_blocks
+        self.attn_config.mla_nvfp4_deferred_blocks = deferred == "1"
         self.attn_config.mla_nvfp4_cluster_centers = cluster_centers
         if os.environ.get("RTP_MLA_NVFP4", "0") == "1":
             if not (
@@ -707,7 +721,9 @@ class ModelConfig(CppModelConfig):
                 and self.attn_config.rope_head_dim == 64
                 and data_type == WEIGHT_TYPE.BF16
             ):
-                raise ValueError("RTP_MLA_NVFP4 requires BF16 sparse MLA with latent=512 and RoPE=64")
+                raise ValueError(
+                    "RTP_MLA_NVFP4 requires BF16 sparse MLA with latent=512 and RoPE=64"
+                )
             self.attn_config.kv_cache_dtype = KvCacheDataType.NVFP4
             if cluster_centers:
                 logging.info(
@@ -717,7 +733,9 @@ class ModelConfig(CppModelConfig):
                     432 + 16 * cluster_centers,
                 )
             else:
-                logging.info("Using experimental MLA NVFP4 cache v1: 432 bytes/token, BF16 RoPE")
+                logging.info(
+                    "Using experimental MLA NVFP4 cache v1: 432 bytes/token, BF16 RoPE"
+                )
 
         # Set final data_type
         # This uses ModelConfig's __setattr__ which handles string-to-enum conversion

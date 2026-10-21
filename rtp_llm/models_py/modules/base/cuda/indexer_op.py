@@ -5,13 +5,12 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-from torch import nn
-
 from rtp_llm.models_py.distributed.collective_torch import Group, barrier
 from rtp_llm.models_py.distributed.pynccl_cp import all_gather
 from rtp_llm.models_py.kernels.cuda.fp8_kernel import sgl_per_token_group_quant_fp8
 from rtp_llm.models_py.modules.dsv4.chunk_env import dsv4_chunk_tokens_from_env
 from rtp_llm.ops.compute_ops import KVCache, rtp_llm_ops
+from torch import nn
 
 # Try to import CUDA dependencies, but don't fail if running on CPU
 try:
@@ -25,6 +24,18 @@ try:
 except Exception as e:
     print(f"Warning: Failed to import flashinfer.rope (likely running on CPU): {e}")
     rope = None
+
+
+def _fp8_ragged_logits(q, kv, weights, starts, ends):
+    if hasattr(deep_gemm, "fp8_mqa_logits"):
+        return deep_gemm.fp8_mqa_logits(
+            q, kv, weights, starts, ends, clean_logits=False
+        )
+    from rtp_llm.models_py.triton_kernels.sparse_mla.fp8_indexer_score import (
+        fp8_ragged_indexer_logits,
+    )
+
+    return fp8_ragged_indexer_logits(q, kv, weights, starts, ends)
 
 
 _persistent_topk_workspace: Dict[torch.device, torch.Tensor] = {}
@@ -761,23 +772,37 @@ class IndexerOp(nn.Module):
                 has_schedule_metadata = schedule_metadata.numel() > 0
             except RuntimeError:
                 has_schedule_metadata = False
-        if not has_schedule_metadata:
+        if not has_schedule_metadata and hasattr(deep_gemm, "fp8_paged_mqa_logits"):
             schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                 kvlen_2d,
                 self.blocksize,
                 deep_gemm.get_num_sms(),
             )
 
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8.unsqueeze(1),
-            kv_cache_fp8.view(dtype=torch.uint8),
-            weights,
-            kvlen_2d,
-            block_table,
-            schedule_metadata,
-            max_seq_len,
-            clean_logits=False,
-        )
+        if hasattr(deep_gemm, "fp8_paged_mqa_logits"):
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_fp8.unsqueeze(1),
+                kv_cache_fp8.view(dtype=torch.uint8),
+                weights,
+                kvlen_2d,
+                block_table,
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
+            )
+        else:
+            from rtp_llm.models_py.triton_kernels.sparse_mla.fp8_indexer_score import (
+                fp8_paged_indexer_logits,
+            )
+
+            logits = fp8_paged_indexer_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                kvlen_2d,
+                block_table,
+                max_seq_len,
+            )
 
         assert (
             fmha_params.expanded_seq_lens.device == logits.device
@@ -876,13 +901,12 @@ class IndexerOp(nn.Module):
         row_start = 0
         while row_start < num_rows:
             row_end = min(row_start + chunk_rows, num_rows)
-            logits = deep_gemm.fp8_mqa_logits(
+            logits = _fp8_ragged_logits(
                 q_fp8[row_start:row_end],
                 kv_fp8,
                 weights[row_start:row_end],
                 fmha_params.ks[row_start:row_end],
                 fmha_params.ke[row_start:row_end],
-                clean_logits=False,
             )
             topk_part = logits.new_empty(
                 (logits.shape[0], self.index_topk), dtype=torch.int32
@@ -1078,13 +1102,12 @@ class IndexerOp(nn.Module):
             row_start = 0
             while row_start < nr:
                 row_end = min(row_start + chunk_rows, nr)
-                logits_p = deep_gemm.fp8_mqa_logits(
+                logits_p = _fp8_ragged_logits(
                     q_part[row_start:row_end],
                     kv_fp8_full,
                     weights_part[row_start:row_end],
                     ks[row_start:row_end],
                     ke[row_start:row_end],
-                    clean_logits=False,
                 )
                 topk_part = logits_p.new_empty(
                     (logits_p.shape[0], self.index_topk), dtype=torch.int32

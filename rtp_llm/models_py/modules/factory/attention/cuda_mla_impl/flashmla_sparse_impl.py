@@ -44,11 +44,11 @@ from rtp_llm.models_py.triton_kernels.sparse_mla.block_index_to_global import (
 from rtp_llm.models_py.triton_kernels.sparse_mla.fused_qk_rope_cat_cache_mla import (
     fused_qk_rope_cat_cache_mla,
 )
-from rtp_llm.models_py.utils.fuse_config import fuse_kernels_enabled
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
     gather_nvfp4_cache,
     sparse_nvfp4_attention,
 )
+from rtp_llm.models_py.utils.fuse_config import fuse_kernels_enabled
 from rtp_llm.ops import (
     AttentionConfigs,
     FMHAConfig,
@@ -56,7 +56,12 @@ from rtp_llm.ops import (
     KvCacheDataType,
     ParallelismConfig,
 )
-from rtp_llm.ops.compute_ops import KVCache, LayerKVCache, PyAttentionInputs, rtp_llm_ops
+from rtp_llm.ops.compute_ops import (
+    KVCache,
+    LayerKVCache,
+    PyAttentionInputs,
+    rtp_llm_ops,
+)
 from rtp_llm.utils.model_weight import W
 
 from .rope_emb_new import NewMlaRotaryEmbeddingOp
@@ -179,7 +184,8 @@ class SparseMlaOp(object):
         """
         global_indices = (
             self._convert_topk_indices_to_global(topk_indices)
-            if physical_indices is None else physical_indices
+            if physical_indices is None
+            else physical_indices
         )
         out, _, _ = flash_mla_sparse_fwd(
             q, kv, global_indices, self.scale, d_v=self.kv_lora_rank
@@ -328,7 +334,9 @@ class SparseMlaFp8Op(SparseMlaOp):
     ) -> torch.Tensor:
         if self._gather is not None and physical_indices is None:
             return self._forward_gather(q, kv, topk_indices)
-        return self._forward_with_kvcache(q, kv, topk_indices, layer_id, physical_indices)
+        return self._forward_with_kvcache(
+            q, kv, topk_indices, layer_id, physical_indices
+        )
 
     def _forward_gather(
         self,
@@ -396,7 +404,8 @@ class SparseMlaFp8Op(SparseMlaOp):
         if self.is_nvfp4:
             indices = (
                 self._convert_topk_indices_to_global(topk_indices)
-                if physical_indices is None else physical_indices
+                if physical_indices is None
+                else physical_indices
             )
             return sparse_nvfp4_attention(q, kv, indices, self.scale)
         assert self._sched_meta is not None
@@ -410,9 +419,14 @@ class SparseMlaFp8Op(SparseMlaOp):
 
         # Indices: [T, 1, topk] → [1, T, topk] (kernel expects batched layout)
         global_indices = (
-            self._convert_topk_indices_to_global(topk_indices)
-            if physical_indices is None else physical_indices
-        ).squeeze(1).unsqueeze(0)
+            (
+                self._convert_topk_indices_to_global(topk_indices)
+                if physical_indices is None
+                else physical_indices
+            )
+            .squeeze(1)
+            .unsqueeze(0)
+        )
 
         attn_out, _ = flash_mla_with_kvcache(
             q=q.unsqueeze(0),
@@ -481,7 +495,10 @@ class SparseMlaImpl(MlaImplBase):
             op_cls = fmha_impl
         elif attn_configs.kv_cache_dtype == KvCacheDataType.BASE:
             op_cls = SparseMlaOp
-        elif attn_configs.kv_cache_dtype in (KvCacheDataType.FP8, KvCacheDataType.NVFP4):
+        elif attn_configs.kv_cache_dtype in (
+            KvCacheDataType.FP8,
+            KvCacheDataType.NVFP4,
+        ):
             op_cls = SparseMlaFp8Op
         else:
             raise ValueError(
@@ -508,10 +525,15 @@ class SparseMlaImpl(MlaImplBase):
         )
         self.kv_cache_write_op = MlaKVCacheWriteOp(
             kv_cache_dtype=attn_configs.kv_cache_dtype,
+            defer_full_blocks=bool(
+                getattr(attn_configs, "mla_nvfp4_deferred_blocks", False)
+            ),
+            tail_capacity=int(getattr(attn_configs, "mla_nvfp4_tail_blocks", 256)),
         )
 
         self._fuse_qk_rope_cat_cache_mla = (
-            fuse_kernels_enabled() and attn_configs.kv_cache_dtype != KvCacheDataType.NVFP4
+            fuse_kernels_enabled()
+            and attn_configs.kv_cache_dtype != KvCacheDataType.NVFP4
         )
         self._kv_cache_type = (
             "fp8_ds_mla"
@@ -553,6 +575,10 @@ class SparseMlaImpl(MlaImplBase):
         try:
             import deep_gemm
         except Exception:
+            return
+        # DeepGEMM 2.8 removed the legacy FP8/FP32-scale score API. That
+        # cache format uses the Triton compatibility scorer and no DG schedule.
+        if not hasattr(deep_gemm, "fp8_paged_mqa_logits"):
             return
         if not hasattr(deep_gemm, "get_paged_mqa_logits_metadata"):
             return
@@ -796,7 +822,8 @@ class SparseMlaImpl(MlaImplBase):
             cache_target = LayerKVCache()
             cache_target.kv_cache_base = torch.empty(
                 (q.shape[0], 1, kv_cache.kv_cache_base.shape[-1]),
-                dtype=kv_cache.kv_cache_base.dtype, device=q.device,
+                dtype=kv_cache.kv_cache_base.dtype,
+                device=q.device,
             )
             write_slots = torch.arange(q.shape[0], dtype=torch.int64, device=q.device)
 
@@ -819,15 +846,21 @@ class SparseMlaImpl(MlaImplBase):
         else:
             self.rope_impl.forward(q_pe, k_pe, self.rope_params)
             self.kv_cache_write_op.forward(
-                compressed_kv, k_pe, cache_target, self.rope_params,
+                compressed_kv,
+                k_pe,
+                cache_target,
+                self.rope_params,
                 slot_mapping_override=write_slots,
             )
 
         if working_entry is not None:
             # Q projection overlaps admission and H2D before joining prefetch.
             q_transformed = self._apply_input_bmm(q, layer_id)
-            working.write(group_layer, self.rope_params.slot_mapping,
-                          cache_target.kv_cache_base.flatten(0, 1))
+            working.write(
+                group_layer,
+                self.rope_params.slot_mapping,
+                cache_target.kv_cache_base.flatten(0, 1),
+            )
         common.apply_write_cache_store(
             self.write_cache_store_impl, self.attn_inputs, kv_cache
         )
@@ -835,8 +868,11 @@ class SparseMlaImpl(MlaImplBase):
             q_transformed = self._apply_input_bmm(q, layer_id)
 
         # 3. Sparse attention. FP8 op consumes paged shape; BF16 op wants flat.
-        kv_input = (working.resident[group_layer] if working_entry is not None
-                    else kv_cache.kv_cache_base)
+        kv_input = (
+            working.resident[group_layer]
+            if working_entry is not None
+            else kv_cache.kv_cache_base
+        )
         if not self.fmha_impl.expects_paged_kv:
             kv_input = kv_input.view(-1, 1, kv_input.size(-1))
         attention_kwargs = {}

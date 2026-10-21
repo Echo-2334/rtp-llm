@@ -50,6 +50,17 @@ TEST_F(MLANvfp4CacheSpecTest, BlockIncludesCentersAndFormatIdentifiesCount) {
     EXPECT_EQ(attention_.mlaCacheFormat(), "");
 }
 
+TEST_F(MLANvfp4CacheSpecTest, DeferredPagesHaveDistinctPortableFormat) {
+    attention_.mla_nvfp4_cluster_centers = 4;
+    const auto immediate_format = attention_.mlaCacheFormat();
+    attention_.mla_nvfp4_deferred_blocks = true;
+    EXPECT_NE(attention_.mlaCacheFormat(), immediate_format);
+    EXPECT_EQ(attention_.mlaCacheFormat(), "nvfp4_mla_cluster_v1_b64_k4_496_deferred_v1");
+    MLAKVCacheSpec spec(attention_, parallelism_);
+    spec.dtype = DataType::TYPE_UINT8;
+    EXPECT_EQ(spec.block_size_bytes(), 64 * 496);
+}
+
 TEST_F(MLANvfp4CacheSpecTest, RejectsUnsupportedLayouts) {
     attention_.mla_nvfp4_cluster_centers = 3;
     EXPECT_THROW(MLAKVCacheSpec(attention_, parallelism_), std::runtime_error);
