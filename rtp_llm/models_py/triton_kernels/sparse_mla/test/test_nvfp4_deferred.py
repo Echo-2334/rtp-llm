@@ -103,9 +103,11 @@ class DeferredNvfp4Test(unittest.TestCase):
             write_nvfp4_cache(
                 x[i], rope[i], gold, torch.arange(b * 64, (b + 1) * 64, device="cuda")
             )
-            self.assertTrue((cache[b, :, 420] < 4).all().item())
+            self.assertTrue(
+                ((cache[b, :, 420] < 4) | (cache[b, :, 420] == 255)).all().item()
+            )
             torch.testing.assert_close(
-                gather(cache, b, 64), gather(gold, b, 64), atol=0, rtol=0
+                gather(cache.clone(), b, 64), gather(gold, b, 64), atol=0, rtol=0
             )
             torch.testing.assert_close(
                 cache[b, :, :424], gold[b, :, :424], atol=0, rtol=0
@@ -126,7 +128,11 @@ class DeferredNvfp4Test(unittest.TestCase):
         )
         actual = sparse_nvfp4_attention(query, cache, indices, 1 / 16)
         dense = decode(cache).float()
-        dense[5 * 64 : 5 * 64 + 21, :512] = x[1, :21].float()
+        # Plain rows with a resident generation-matched shadow stay BF16,
+        # including zero-center fallbacks in sealed blocks.
+        for i, (b, n) in enumerate(zip(blocks, lengths)):
+            plain = cache[b, : n + 1, 420] == 255
+            dense[b * 64 : b * 64 + n + 1, :512][plain] = x[i, : n + 1][plain].float()
         selected = dense[indices]
         probs = (
             torch.einsum("thd,tkd->thk", query.float(), selected)
@@ -167,8 +173,40 @@ class DeferredNvfp4Test(unittest.TestCase):
                 gold = torch.zeros_like(cache)
                 write_nvfp4_cache(x, rope, gold, torch.arange(64, device="cuda"))
                 torch.testing.assert_close(
-                    gather(cache, 0, 64), gather(gold, 0, 64), atol=0, rtol=0
+                    gather(cache.clone(), 0, 64), gather(gold, 0, 64), atol=0, rtol=0
                 )
+
+    def test_zero_center_seal_and_shadow_eviction(self):
+        cache, state = self.make(capacity=1)
+        latent = torch.randn((64, 512), device="cuda", dtype=torch.bfloat16)
+        latent[1].mul_(0.003)
+        latent[2].zero_()
+        rope = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
+        self.write(
+            cache, state, latent[:17], rope[:17], torch.arange(17, device="cuda")
+        )
+        self.write(
+            cache, state, latent[17:], rope[17:], torch.arange(17, 64, device="cuda")
+        )
+        self.assertTrue((cache[0, 1:3, 420] == 255).all().item())
+        direct = torch.zeros((1, 64, 432), device="cuda", dtype=torch.uint8)
+        write_nvfp4_cache(latent, rope, direct, torch.arange(64, device="cuda"))
+        torch.testing.assert_close(
+            cache[0, 1:3, :292], direct[0, 1:3, :292], rtol=0, atol=0
+        )
+        portable = cache.clone()
+        packed = gather(portable, 0, 64)
+        torch.testing.assert_close(
+            packed[1:3], gather(direct, 0, 64)[1:3], rtol=0, atol=0
+        )
+        # Existing readers can use the exact shadow for marker 255 while resident.
+        torch.testing.assert_close(
+            gather(cache, 0, 64)[1:3, :512], latent[1:3], rtol=0, atol=0
+        )
+        # Reusing the only shadow slot must leave the sealed packed page readable.
+        self.write(cache, state, latent[:1], rope[:1], [64])
+        self.assertEqual(state.mapping[0].item(), -1)
+        torch.testing.assert_close(gather(cache, 0, 64), packed, rtol=0, atol=0)
 
     def test_pd_copy_and_append_restore_portable_tail(self):
         source, state = self.make()
@@ -192,7 +230,7 @@ class DeferredNvfp4Test(unittest.TestCase):
         baseline = torch.cat((portable[:, :512], x[19:]))
         write_nvfp4_cache(baseline, rope, gold, torch.arange(128, 192, device="cuda"))
         torch.testing.assert_close(
-            gather(dest, 2, 64), gather(gold, 2, 64), atol=0, rtol=0
+            gather(dest.clone(), 2, 64), gather(gold, 2, 64), atol=0, rtol=0
         )
 
     def test_same_cache_page_copy_does_not_alias_another_raw_tail(self):
@@ -239,7 +277,7 @@ class DeferredNvfp4Test(unittest.TestCase):
             cache[5, :, 432:], golden[5, :, 432:], atol=0, rtol=0
         )
         torch.testing.assert_close(
-            gather(cache, 5, 64), gather(golden, 5, 64), atol=0, rtol=0
+            gather(cache.clone(), 5, 64), gather(golden, 5, 64), atol=0, rtol=0
         )
 
     def test_rewrite_full_block_uses_original_shadow(self):
@@ -253,7 +291,7 @@ class DeferredNvfp4Test(unittest.TestCase):
         gold = torch.zeros_like(cache)
         write_nvfp4_cache(x, rope, gold, torch.arange(64, device="cuda"))
         torch.testing.assert_close(
-            gather(cache, 0, 64), gather(gold, 0, 64), atol=0, rtol=0
+            gather(cache.clone(), 0, 64), gather(gold, 0, 64), atol=0, rtol=0
         )
         # Recycle the same physical page for a new request.
         self.write(cache, state, x[:1] + 5, rope[:1], [0])
@@ -273,7 +311,9 @@ class DeferredNvfp4Test(unittest.TestCase):
         more = torch.randn((63, 512), device="cuda", dtype=torch.bfloat16)
         more_rope = torch.randn((63, 64), device="cuda", dtype=torch.bfloat16)
         self.write(cache, state, more, more_rope, torch.arange(65, 128, device="cuda"))
-        self.assertTrue((cache[1, :, 420] < 4).all().item())
+        self.assertTrue(
+            ((cache[1, :, 420] < 4) | (cache[1, :, 420] == 255)).all().item()
+        )
         self.assertEqual(state.data.shape, (1, 64, 512))
         self.assertTrue(torch.isfinite(gather(cache, 1, 64)).all().item())
         before = cache.clone()
@@ -324,7 +364,9 @@ class DeferredNvfp4Test(unittest.TestCase):
         )
         portable = gather(cache, 1, 63)[:, :512].clone()
         self.write(cache, state, x[:, 63], rope[:, 63], [63, 127])
-        self.assertTrue((cache[:2, :, 420] < 4).all().item())
+        self.assertTrue(
+            ((cache[:2, :, 420] < 4) | (cache[:2, :, 420] == 255)).all().item()
+        )
         gold = torch.zeros_like(cache)
         ordinary = torch.zeros((1, 64, 432), device="cuda", dtype=torch.uint8)
         write_nvfp4_cache(

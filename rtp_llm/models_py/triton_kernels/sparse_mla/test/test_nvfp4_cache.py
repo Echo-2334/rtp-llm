@@ -35,7 +35,12 @@ def reference_decode(cache):
             .reshape(-1, centers, 512)
         )
         blocks = torch.arange(rows.shape[0], device=cache.device) // 64
-        latent += table[blocks, rows[:, 420].long()].float()
+        ids = rows[:, 420].long()
+        latent += torch.where(
+            (ids < centers)[:, None],
+            table[blocks, ids.clamp(max=centers - 1)].float(),
+            0.0,
+        )
     return torch.cat((latent.bfloat16(), rope), -1)
 
 
@@ -226,6 +231,69 @@ class ClusteredNvfp4CacheTest(unittest.TestCase):
                 actual = sparse_nvfp4_attention(query, peer, indices, 1 / 32)
                 expected = reference_attention(query, peer, indices, 1 / 32)
                 torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.04)
+
+    def test_zero_center_fallback_preserves_sink_and_pd_copy(self):
+        latent = torch.randn((64, 512), device="cuda", dtype=torch.bfloat16)
+        latent[1].mul_(0.003)
+        latent[2].zero_()
+        rope = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
+        direct = torch.zeros((1, 64, CACHE_BYTES), device="cuda", dtype=torch.uint8)
+        write_nvfp4_cache(latent, rope, direct, torch.arange(64, device="cuda"))
+        for centers in (1, 2, 4):
+            with self.subTest(centers=centers):
+                cache = torch.zeros(
+                    (3, 64, CACHE_BYTES + 16 * centers),
+                    device="cuda",
+                    dtype=torch.uint8,
+                )
+                write_nvfp4_cache(
+                    latent, rope, cache, torch.arange(64, 128, device="cuda")
+                )
+                self.assertTrue((cache[1, 1:3, 420] == 255).all().item())
+                torch.testing.assert_close(
+                    cache[1, 1:3, :292], direct[0, 1:3, :292], rtol=0, atol=0
+                )
+                decoded = reference_decode(cache)[64:128]
+                torch.testing.assert_close(
+                    decoded[1:3], reference_decode(direct)[1:3], rtol=0, atol=0
+                )
+                # The zero-center marker must survive relocation without a tail pool.
+                peer = torch.zeros_like(cache)
+                peer[2].copy_(cache[1])
+                output = torch.empty((64, 576), device="cuda", dtype=torch.bfloat16)
+                gather_nvfp4_cache(
+                    peer,
+                    output,
+                    torch.tensor([[2]], device="cuda", dtype=torch.int32),
+                    torch.tensor([64], device="cuda", dtype=torch.int32),
+                    torch.tensor([0], device="cuda", dtype=torch.int32),
+                    1,
+                    64,
+                )
+                torch.testing.assert_close(output, decoded, rtol=0.008, atol=1e-6)
+                source_output = torch.empty_like(output)
+                gather_nvfp4_cache(
+                    cache,
+                    source_output,
+                    torch.tensor([[1]], device="cuda", dtype=torch.int32),
+                    torch.tensor([64], device="cuda", dtype=torch.int32),
+                    torch.tensor([0], device="cuda", dtype=torch.int32),
+                    1,
+                    64,
+                )
+                torch.testing.assert_close(output, source_output, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    output[1:3], reference_decode(direct)[1:3], rtol=0, atol=0
+                )
+                query = torch.zeros((2, 16, 576), device="cuda", dtype=torch.bfloat16)
+                indices = (
+                    torch.tensor([129, 130], device="cuda")[:, None]
+                    .expand(2, 64)
+                    .contiguous()
+                )
+                actual = sparse_nvfp4_attention(query, peer, indices, 1 / 32)
+                expected = decoded[1:3, :512][:, None, :].expand_as(actual)
+                torch.testing.assert_close(actual, expected, rtol=0.025, atol=1e-6)
 
     def test_partial_block_append_and_recycle(self):
         cache = torch.zeros((3, 64, 496), device="cuda", dtype=torch.uint8)

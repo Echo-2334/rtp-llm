@@ -66,7 +66,8 @@ def _store_latent(
     center_id = tl.full((), 255, tl.int32)
     if CENTERS:
         if CLUSTER:
-            best_distance = tl.full((), float("inf"), tl.float32)
+            # Keep the origin as a candidate for low-norm attention-sink tokens.
+            best_distance = tl.sum(tl.sum(values * values, 1), 0)
             best_center = tl.full((32, 16), 0.0, tl.float32)
             features = groups[:, None] * 16 + lanes[None, :]
             for cluster in tl.static_range(CENTERS):
