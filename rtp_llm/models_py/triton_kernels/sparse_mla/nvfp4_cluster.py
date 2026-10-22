@@ -54,13 +54,14 @@ def _fit_centers(values, valid, CENTERS: tl.constexpr):
     return centers.to(tl.bfloat16)
 
 
-@triton.jit
+# TOKENS varies with every prefill batch; specializing on it recompiles per length.
+@triton.jit(do_not_specialize=["TOKENS"])
 def _initialize_centers_kernel(
     Latent,
     Cache,
     SortedSlots,
     Order,
-    TOKENS: tl.constexpr,
+    TOKENS,
     LATENT_STRIDE: tl.constexpr,
     CAPACITY: tl.constexpr,
     ROW_BYTES: tl.constexpr,

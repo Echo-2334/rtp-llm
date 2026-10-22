@@ -40,8 +40,9 @@ def find_state(cache):
     return _STATES.get(_key(cache))
 
 
-@triton.jit
-def _protect(Slots, Mapping, Ages, Epoch, TOKENS: tl.constexpr, BLOCKS: tl.constexpr):
+# Keep arbitrary prefill token counts out of the JIT specialization key.
+@triton.jit(do_not_specialize=["TOKENS"])
+def _protect(Slots, Mapping, Ages, Epoch, TOKENS, BLOCKS: tl.constexpr):
     i = tl.program_id(0)
     slot = tl.load(Slots + i).to(tl.int64)
     if slot >= 0 and slot < BLOCKS * 64:
@@ -50,7 +51,7 @@ def _protect(Slots, Mapping, Ages, Epoch, TOKENS: tl.constexpr, BLOCKS: tl.const
             tl.store(Ages + tail, tl.load(Epoch) + 1)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS"])
 def _prepare(
     Cache,
     Slots,
@@ -66,7 +67,7 @@ def _prepare(
     FullEpoch,
     SealEpoch,
     Overflow,
-    TOKENS: tl.constexpr,
+    TOKENS,
     BLOCKS: tl.constexpr,
     ROW_BYTES: tl.constexpr,
     POOL: tl.constexpr,
@@ -149,7 +150,7 @@ def _prepare(
             i += 1
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS"])
 def _restore(
     Cache,
     Slots,
@@ -159,7 +160,7 @@ def _restore(
     RestoreEpoch,
     Prefix,
     Epoch,
-    TOKENS: tl.constexpr,
+    TOKENS,
     BLOCKS: tl.constexpr,
     ROW_BYTES: tl.constexpr,
     CENTERS: tl.constexpr,
@@ -236,14 +237,14 @@ def _write_deferred(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS"])
 def _plainify_fallback(
     Cache,
     Slots,
     Mapping,
     SealEpoch,
     Epoch,
-    TOKENS: tl.constexpr,
+    TOKENS,
     BLOCKS: tl.constexpr,
     ROW_BYTES: tl.constexpr,
     CENTERS: tl.constexpr,
@@ -273,7 +274,7 @@ def _plainify_fallback(
                 )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS"])
 def _seal_centers(
     Cache,
     Slots,
@@ -281,7 +282,7 @@ def _seal_centers(
     Mapping,
     SealEpoch,
     Epoch,
-    TOKENS: tl.constexpr,
+    TOKENS,
     BLOCKS: tl.constexpr,
     ROW_BYTES: tl.constexpr,
     CENTERS: tl.constexpr,
@@ -314,7 +315,7 @@ def _seal_centers(
             tl.store((Cache + offsets).to(tl.pointer_type(tl.bfloat16)), centers)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS"])
 def _seal_rows(
     Cache,
     Slots,
@@ -323,7 +324,7 @@ def _seal_rows(
     Tags,
     SealEpoch,
     Epoch,
-    TOKENS: tl.constexpr,
+    TOKENS,
     BLOCKS: tl.constexpr,
     ROW_BYTES: tl.constexpr,
     CENTERS: tl.constexpr,

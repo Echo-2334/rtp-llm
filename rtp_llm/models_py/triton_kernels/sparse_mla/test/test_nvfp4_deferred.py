@@ -1,10 +1,15 @@
 import unittest
 
 import torch
+
+from rtp_llm.models_py.triton_kernels.sparse_mla import nvfp4_deferred
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
     gather_nvfp4_cache,
     sparse_nvfp4_attention,
     write_nvfp4_cache,
+)
+from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cluster import (
+    _initialize_centers_kernel,
 )
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_deferred import (
     DeferredNvfp4State,
@@ -274,6 +279,35 @@ class DeferredNvfp4Test(unittest.TestCase):
         before = cache.clone()
         self.write(cache, state, x, rope, [-1, cache.shape[0] * 64])
         torch.testing.assert_close(cache, before, atol=0, rtol=0)
+
+    def test_prefill_lengths_share_compiled_kernels(self):
+        kernels = (
+            nvfp4_deferred._protect,
+            nvfp4_deferred._prepare,
+            nvfp4_deferred._restore,
+            nvfp4_deferred._plainify_fallback,
+            nvfp4_deferred._seal_centers,
+            nvfp4_deferred._seal_rows,
+            _initialize_centers_kernel,
+        )
+        if not all(hasattr(kernel, "device_caches") for kernel in kernels):
+            self.skipTest("Triton JIT cache introspection unavailable")
+
+        def compiled():
+            return [
+                sum(len(entry[0]) for entry in kernel.device_caches.values())
+                for kernel in kernels
+            ]
+
+        cache, state = self.make()
+        start, counts = 64, []
+        for n in (37, 100, 129, 250):
+            x = torch.randn((n, 512), device="cuda", dtype=torch.bfloat16)
+            rope = torch.randn((n, 64), device="cuda", dtype=torch.bfloat16)
+            self.write(cache, state, x, rope, torch.arange(start, start + n))
+            start += (n + 63) // 64 * 64
+            counts.append(compiled())
+        self.assertEqual(counts[0], counts[-1])
 
     def test_overflow_full_block_still_seals_safely(self):
         cache, state = self.make(capacity=1)
