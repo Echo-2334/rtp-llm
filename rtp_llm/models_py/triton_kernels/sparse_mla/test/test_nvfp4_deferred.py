@@ -1,8 +1,6 @@
 import unittest
 
 import torch
-
-from rtp_llm.models_py.triton_kernels.sparse_mla import nvfp4_deferred
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
     CACHE_BYTES,
     CENTER_DATA_OFFSET,
@@ -13,11 +11,13 @@ from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
     sparse_nvfp4_attention,
     write_nvfp4_cache,
 )
+from rtp_llm.models_py.triton_kernels.sparse_mla import nvfp4_deferred
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cluster import (
     _initialize_centers_kernel,
 )
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_deferred import (
     DeferredNvfp4State,
+    _OverflowMonitor,
 )
 
 
@@ -338,6 +338,22 @@ class DeferredNvfp4Test(unittest.TestCase):
         before = cache.clone()
         self.write(cache, state, x, rope, [-1, cache.shape[0] * 64])
         torch.testing.assert_close(cache, before, atol=0, rtol=0)
+
+    def test_overflow_monitor_reports_new_overflow_once(self):
+        cache, state = self.make(capacity=1)
+        x = torch.randn((2, 512), device="cuda", dtype=torch.bfloat16)
+        rope = torch.randn((2, 64), device="cuda", dtype=torch.bfloat16)
+        monitor = _OverflowMonitor(interval=0)
+        self.write(cache, state, x, rope, [64, 128])
+        monitor.poll()
+        torch.cuda.synchronize()
+        with self.assertLogs(level="WARNING") as logs:
+            monitor.poll()
+        self.assertIn("RTP_MLA_NVFP4_TAIL_BLOCKS", logs.output[0])
+        self.assertEqual(state.reported_overflow, 1)
+        torch.cuda.synchronize()
+        with self.assertNoLogs(level="WARNING"):
+            monitor.poll()
 
     def test_prefill_lengths_share_compiled_kernels(self):
         kernels = (

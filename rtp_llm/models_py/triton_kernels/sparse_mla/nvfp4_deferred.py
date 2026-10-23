@@ -12,7 +12,9 @@ If oversubscribed, the portable mirror remains correct; overflow is counted.
 
 from __future__ import annotations
 
+import logging
 import secrets
+import time
 import weakref
 
 import torch
@@ -42,7 +44,8 @@ def find_state(cache):
     return _STATES.get(_key(cache))
 
 
-# Keep arbitrary prefill token counts out of the JIT specialization key.
+# TOKENS is a runtime argument: eager prefill batches have arbitrary lengths and
+# specializing on it would recompile every kernel below for each new length.
 @triton.jit(do_not_specialize=["TOKENS"])
 def _protect(Slots, Mapping, Ages, Epoch, TOKENS, BLOCKS: tl.constexpr):
     i = tl.program_id(0)
@@ -395,6 +398,7 @@ class DeferredNvfp4State:
         self.full_epoch = torch.zeros_like(self.restore_epoch)
         self.seal_epoch = torch.zeros_like(self.restore_epoch)
         self.overflow_count = torch.zeros((1,), dtype=torch.int64, device=device)
+        self.reported_overflow = 0
         previous = find_state(cache)
         if previous is not None:
             raise ValueError("A deferred state already owns this cache; reuse it")
@@ -501,3 +505,66 @@ class DeferredNvfp4State:
             CENTERS=centers,
             num_warps=4,
         )
+
+
+class _OverflowMonitor:
+    """Surfaces GPU-side tail overflow without synchronizing the forward path.
+
+    A poll enqueues an async copy of every pool's counter; a later poll reads it
+    once its event completes. It is a no-op while a CUDA Graph is capturing.
+    """
+
+    def __init__(self, interval=10.0):
+        self.interval = interval
+        self.next_poll = 0.0
+        self.pending = None
+
+    def poll(self):
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if self.pending is not None:
+            event, host, states = self.pending
+            if not event.query():
+                return
+            self.pending = None
+            self._report(host.tolist(), states)
+        now = time.monotonic()
+        if now < self.next_poll:
+            return
+        device = torch.cuda.current_device()
+        states = [s for s in list(_STATES.values()) if s.cache.device.index == device]
+        if not states:
+            return
+        self.next_poll = now + self.interval
+        counts = torch.cat([state.overflow_count for state in states])
+        host = torch.empty(counts.shape, dtype=counts.dtype, pin_memory=True)
+        host.copy_(counts, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        self.pending = (event, host, states)
+
+    @staticmethod
+    def _report(values, states):
+        new = 0
+        for state, value in zip(states, values):
+            new += max(value - state.reported_overflow, 0)
+            state.reported_overflow = value
+        if new:
+            logging.warning(
+                "Deferred NVFP4 tail pool overflowed %d times since last report "
+                "(%d total over %d layers, capacity %d tails/layer); those rows "
+                "fell back to plain NVFP4. Set RTP_MLA_NVFP4_TAIL_BLOCKS to at "
+                "least the per-rank max_generate_batch_size.",
+                new,
+                sum(values),
+                len(states),
+                states[0].capacity,
+            )
+
+
+_OVERFLOW_MONITOR = _OverflowMonitor()
+
+
+def poll_overflow():
+    """Cheap and sync-free; call from eager code that runs every step."""
+    _OVERFLOW_MONITOR.poll()

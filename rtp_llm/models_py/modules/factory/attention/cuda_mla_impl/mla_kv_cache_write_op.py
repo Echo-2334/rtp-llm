@@ -60,6 +60,7 @@ class MlaKVCacheWriteOp:
                     from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_deferred import (
                         DeferredNvfp4State,
                         find_state,
+                        poll_overflow,
                     )
 
                     base = kv_cache.kv_cache_base
@@ -74,6 +75,8 @@ class MlaKVCacheWriteOp:
                     slot_mapping,
                     deferred_state=state,
                 )
+                if state is not None:
+                    poll_overflow()
                 return
             compute_ops.concat_and_cache_mla(
                 append_ckv_t,

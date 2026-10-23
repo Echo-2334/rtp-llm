@@ -48,6 +48,7 @@ from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
     gather_nvfp4_cache,
     sparse_nvfp4_attention,
 )
+from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_deferred import poll_overflow
 from rtp_llm.models_py.utils.fuse_config import fuse_kernels_enabled
 from rtp_llm.ops import (
     AttentionConfigs,
@@ -659,6 +660,9 @@ class SparseMlaImpl(MlaImplBase):
         )
 
     def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs) -> None:
+        # Graph replay skips the Python write path, so poll tail overflow here.
+        if self.kv_cache_write_op.defer_full_blocks:
+            poll_overflow()
         if (
             _is_multi_token_decode(attn_inputs)
             and isinstance(self.fmha_impl, SparseMlaFp8Op)
