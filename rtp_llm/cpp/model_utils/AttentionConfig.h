@@ -91,7 +91,10 @@ struct AttentionConfigs {
 
 public:
     size_t nvfp4CacheBytesPerToken() const {
-        return 432 + 16 * mla_nvfp4_cluster_centers;
+        // Clustered v2 stores 32 four-bit subspace center IDs (16 bytes),
+        // an int64 deferred tag (8 bytes), and 4 bytes of alignment padding
+        // before the BF16 center stripes.
+        return mla_nvfp4_cluster_centers == 0 ? 432 : 448 + 16 * mla_nvfp4_cluster_centers;
     }
 
     std::string mlaCacheFormat() const {
@@ -101,8 +104,8 @@ public:
         if (mla_nvfp4_cluster_centers == 0) {
             return "nvfp4_mla_v1_432";
         }
-        return "nvfp4_mla_cluster_v1_b64_k" + std::to_string(mla_nvfp4_cluster_centers) + "_"
-               + std::to_string(nvfp4CacheBytesPerToken()) + (mla_nvfp4_deferred_blocks ? "_deferred_v1" : "");
+        return "nvfp4_mla_cluster_v2_b64_k" + std::to_string(mla_nvfp4_cluster_centers) + "_"
+               + std::to_string(nvfp4CacheBytesPerToken()) + (mla_nvfp4_deferred_blocks ? "_deferred_v2" : "");
     }
 
     std::string DebugAttentionConfigStr() const;

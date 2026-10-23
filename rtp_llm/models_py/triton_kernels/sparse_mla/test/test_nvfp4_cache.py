@@ -4,6 +4,10 @@ import torch
 
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
     CACHE_BYTES,
+    CENTER_DATA_OFFSET,
+    CENTER_ID_BYTES,
+    CENTER_ID_OFFSET,
+    CLUSTER_CACHE_BYTES,
     gather_nvfp4_cache,
     sparse_nvfp4_attention,
     write_nvfp4_cache,
@@ -26,22 +30,32 @@ def reference_decode(cache):
     outer = rows[:, 288:292].contiguous().view(torch.float32)
     rope = rows[:, 292:420].contiguous().view(torch.bfloat16)
     latent = values * scales * outer
-    centers = (cache.shape[-1] - CACHE_BYTES) // 16
+    centers = 0 if cache.shape[-1] == CACHE_BYTES else (cache.shape[-1] - CLUSTER_CACHE_BYTES) // 16
     if centers:
         table = (
-            cache[:, :, 432:]
+            cache[:, :, CENTER_DATA_OFFSET:]
             .contiguous()
             .view(torch.bfloat16)
             .reshape(-1, centers, 512)
         )
         blocks = torch.arange(rows.shape[0], device=cache.device) // 64
-        ids = rows[:, 420].long()
-        latent += torch.where(
-            (ids < centers)[:, None],
-            table[blocks, ids.clamp(max=centers - 1)].float(),
-            0.0,
-        )
+        id_bytes = rows[:, 420:436].long()
+        ids = torch.stack((id_bytes & 15, id_bytes >> 4), dim=-1).reshape(-1, 32)
+        ids = ids.repeat_interleave(16, dim=-1)
+        features = torch.arange(512, device=cache.device)[None, :]
+        center_values = table[
+            blocks[:, None],
+            ids.clamp(max=centers - 1),
+            features.expand(rows.shape[0], -1),
+        ]
+        latent += torch.where((ids < centers), center_values.float(), 0.0)
     return torch.cat((latent.bfloat16(), rope), -1)
+
+
+def subspace_ids(cache):
+    rows = cache.reshape(-1, cache.shape[-1])
+    packed = rows[:, CENTER_ID_OFFSET : CENTER_ID_OFFSET + CENTER_ID_BYTES].long()
+    return torch.stack((packed & 15, packed >> 4), dim=-1).reshape(-1, 32)
 
 
 def reference_attention(query, cache, indices, scale):
@@ -157,7 +171,7 @@ class ClusteredNvfp4CacheTest(unittest.TestCase):
         for centers in (1, 2, 4):
             with self.subTest(centers=centers):
                 cache = torch.zeros(
-                    (4, 64, 432 + 16 * centers), device="cuda", dtype=torch.uint8
+                    (4, 64, CLUSTER_CACHE_BYTES + 16 * centers), device="cuda", dtype=torch.uint8
                 )
                 source_centers = torch.randn((2, centers, 512), device="cuda") * 4
                 assignments = torch.arange(64, device="cuda") % centers
@@ -190,7 +204,7 @@ class ClusteredNvfp4CacheTest(unittest.TestCase):
                 self.assertLess(residual_error.item(), direct_error.item() * 0.1)
                 if centers == 1:
                     actual_centers = (
-                        cache[:2, :, 432:]
+                        cache[:2, :, 448:]
                         .contiguous()
                         .view(torch.bfloat16)
                         .reshape(2, 512)
@@ -242,14 +256,15 @@ class ClusteredNvfp4CacheTest(unittest.TestCase):
         for centers in (1, 2, 4):
             with self.subTest(centers=centers):
                 cache = torch.zeros(
-                    (3, 64, CACHE_BYTES + 16 * centers),
+                    (3, 64, CLUSTER_CACHE_BYTES + 16 * centers),
                     device="cuda",
                     dtype=torch.uint8,
                 )
                 write_nvfp4_cache(
                     latent, rope, cache, torch.arange(64, 128, device="cuda")
                 )
-                self.assertTrue((cache[1, 1:3, 420] == 255).all().item())
+                ids = subspace_ids(cache[1, 1:3])
+                self.assertTrue((ids == centers).all().item())
                 torch.testing.assert_close(
                     cache[1, 1:3, :292], direct[0, 1:3, :292], rtol=0, atol=0
                 )
@@ -296,20 +311,20 @@ class ClusteredNvfp4CacheTest(unittest.TestCase):
                 torch.testing.assert_close(actual, expected, rtol=0.025, atol=1e-6)
 
     def test_partial_block_append_and_recycle(self):
-        cache = torch.zeros((3, 64, 496), device="cuda", dtype=torch.uint8)
-        cache[:, :, 432:].fill_(255)
+        cache = torch.zeros((3, 64, CLUSTER_CACHE_BYTES + 16 * 4), device="cuda", dtype=torch.uint8)
+        cache[:, :, 448:].fill_(255)
         latent = torch.randn((64, 512), device="cuda", dtype=torch.bfloat16)
         rope = torch.randn((64, 64), device="cuda", dtype=torch.bfloat16)
         write_nvfp4_cache(
             latent[:19], rope[:19], cache, torch.arange(64, 83, device="cuda")
         )
-        saved_centers = cache[1, :, 432:].clone()
+        saved_centers = cache[1, :, 448:].clone()
         prefix = reference_decode(cache[1:2])[:19].clone()
         peer = cache.clone()
         write_nvfp4_cache(
             latent[19:], rope[19:], peer, torch.arange(83, 128, device="cuda")
         )
-        torch.testing.assert_close(peer[1, :, 432:], saved_centers, atol=0, rtol=0)
+        torch.testing.assert_close(peer[1, :, 448:], saved_centers, atol=0, rtol=0)
         decoded = reference_decode(peer[1:2])
         torch.testing.assert_close(decoded[:19], prefix, atol=0, rtol=0)
         torch.testing.assert_close(decoded[:, 512:], rope, atol=0, rtol=0)
@@ -319,7 +334,7 @@ class ClusteredNvfp4CacheTest(unittest.TestCase):
         )
         latent.add_(10)
         write_nvfp4_cache(latent[:1], rope[:1], peer, torch.tensor([64], device="cuda"))
-        centers = peer[1, :, 432:].contiguous().view(torch.bfloat16).reshape(4, 512)
+        centers = peer[1, :, 448:].contiguous().view(torch.bfloat16).reshape(4, 512)
         torch.testing.assert_close(centers, latent[:1].expand(4, -1), atol=0, rtol=0)
         torch.testing.assert_close(peer[0], cache[0], atol=0, rtol=0)
         torch.testing.assert_close(peer[2], cache[2], atol=0, rtol=0)
@@ -330,7 +345,7 @@ class ClusteredNvfp4CacheTest(unittest.TestCase):
         torch.testing.assert_close(peer, before, atol=0, rtol=0)
 
     def test_clustered_cuda_graph_replay(self):
-        cache = torch.zeros((8, 64, 496), device="cuda", dtype=torch.uint8)
+        cache = torch.zeros((8, 64, CLUSTER_CACHE_BYTES + 16 * 4), device="cuda", dtype=torch.uint8)
         latent = torch.randn((4, 512), device="cuda", dtype=torch.bfloat16)
         rope = torch.randn((4, 64), device="cuda", dtype=torch.bfloat16)
         slots = torch.arange(4, device="cuda") * 64
@@ -368,7 +383,7 @@ class ClusteredNvfp4CacheTest(unittest.TestCase):
             )
 
     def test_unsupported_page_size(self):
-        cache = torch.zeros((2, 32, 496), device="cuda", dtype=torch.uint8)
+        cache = torch.zeros((2, 32, CLUSTER_CACHE_BYTES + 16 * 4), device="cuda", dtype=torch.uint8)
         latent = torch.zeros((1, 512), device="cuda", dtype=torch.bfloat16)
         rope = torch.zeros((1, 64), device="cuda", dtype=torch.bfloat16)
         with self.assertRaisesRegex(ValueError, "64-token"):

@@ -264,7 +264,8 @@ class ModelConfig(CppModelConfig):
                 self.attn_config.indexer_head_dim
                 + self.attn_config.indexer_head_dim // 128 * 4
             )
-            cache_bytes = 432 + 16 * self.attn_config.mla_nvfp4_cluster_centers
+            centers = self.attn_config.mla_nvfp4_cluster_centers
+            cache_bytes = 432 if centers == 0 else 448 + 16 * centers
             return self.num_layers * self.max_seq_len * (cache_bytes + indexer_bytes)
         # Get kv_cache_dtype from attn_config
         kv_cache_dtype_enum = self.attn_config.kv_cache_dtype
@@ -727,10 +728,11 @@ class ModelConfig(CppModelConfig):
             self.attn_config.kv_cache_dtype = KvCacheDataType.NVFP4
             if cluster_centers:
                 logging.info(
-                    "Using experimental clustered MLA NVFP4 cache v1: "
-                    "%d centers/block, 64 tokens/block, %d bytes/token, BF16 centers/RoPE",
+                    "Using experimental clustered MLA NVFP4 cache v2: "
+                    "%d centers/block, 32 independent 16-channel subspaces, "
+                    "64 tokens/block, %d bytes/token, BF16 centers/RoPE",
                     cluster_centers,
-                    432 + 16 * cluster_centers,
+                    448 + 16 * cluster_centers,
                 )
             else:
                 logging.info(

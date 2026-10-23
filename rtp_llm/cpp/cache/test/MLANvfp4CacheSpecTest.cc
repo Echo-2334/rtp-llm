@@ -37,13 +37,13 @@ TEST_F(MLANvfp4CacheSpecTest, BlockIncludesCentersAndFormatIdentifiesCount) {
         attention_.mla_nvfp4_cluster_centers = centers;
         MLAKVCacheSpec spec(attention_, parallelism_);
         spec.dtype = DataType::TYPE_UINT8;
-        EXPECT_EQ(spec.block_size_bytes(), 64 * (432 + 16 * centers));
+        EXPECT_EQ(spec.block_size_bytes(), 64 * (centers == 0 ? 432 : 448 + 16 * centers));
         EXPECT_EQ(spec.k_block_size_bytes(), spec.block_size_bytes());
         EXPECT_EQ(spec.v_block_size_bytes(), 0);
         EXPECT_EQ(spec.scale_block_size_bytes(), 64 * 132);
         EXPECT_TRUE(formats.insert(attention_.mlaCacheFormat()).second);
     }
-    EXPECT_EQ(attention_.mlaCacheFormat(), "nvfp4_mla_cluster_v1_b64_k4_496");
+    EXPECT_EQ(attention_.mlaCacheFormat(), "nvfp4_mla_cluster_v2_b64_k4_512");
     attention_.mla_nvfp4_cluster_centers = 0;
     EXPECT_EQ(attention_.mlaCacheFormat(), "nvfp4_mla_v1_432");
     attention_.kv_cache_dtype = KvCacheDataType::FP8;
@@ -55,10 +55,10 @@ TEST_F(MLANvfp4CacheSpecTest, DeferredPagesHaveDistinctPortableFormat) {
     const auto immediate_format = attention_.mlaCacheFormat();
     attention_.mla_nvfp4_deferred_blocks = true;
     EXPECT_NE(attention_.mlaCacheFormat(), immediate_format);
-    EXPECT_EQ(attention_.mlaCacheFormat(), "nvfp4_mla_cluster_v1_b64_k4_496_deferred_v1");
+    EXPECT_EQ(attention_.mlaCacheFormat(), "nvfp4_mla_cluster_v2_b64_k4_512_deferred_v2");
     MLAKVCacheSpec spec(attention_, parallelism_);
     spec.dtype = DataType::TYPE_UINT8;
-    EXPECT_EQ(spec.block_size_bytes(), 64 * 496);
+    EXPECT_EQ(spec.block_size_bytes(), 64 * 512);
 }
 
 TEST_F(MLANvfp4CacheSpecTest, RejectsUnsupportedLayouts) {

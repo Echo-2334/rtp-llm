@@ -1,4 +1,7 @@
-"""MLA NVFP4: 256B E2M1, 32B E4M3, 4B FP32, 128B BF16, 12B metadata.
+"""MLA NVFP4: 256B E2M1, 32B E4M3, 4B FP32, 128B BF16.
+
+Plain pages use 12B metadata; clustered v2 pages use 16B packed subspace IDs
+and an 8B deferred tag before their center stripes.
 
 The FP32 scale is per token; E4M3 scales cover 16 latent elements each.
 Clustered layouts append stripes of the block center table to each row.
@@ -14,6 +17,14 @@ from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cluster import (
 )
 
 CACHE_BYTES = 432
+# Clustered pages need 16 nibbles to carry 32 independent subspace IDs,
+# followed by the existing 64-bit deferred-tail tag.  Align the center table
+# to 16 bytes so the v2 layouts are 464/480/512 bytes for C=1/2/4.
+CLUSTER_CACHE_BYTES = 448
+CENTER_ID_OFFSET = 420
+CENTER_ID_BYTES = 16
+TAG_OFFSET = 436
+NO_CENTER_ID = 15
 
 
 def is_supported(latent: torch.Tensor, rope: torch.Tensor) -> bool:
@@ -63,11 +74,13 @@ def _store_latent(
     groups = tl.arange(0, 32)
     lanes = tl.arange(0, 16)
     values = tl.reshape(values, (32, 16)).to(tl.float32)
-    center_id = tl.full((), 255, tl.int32)
+    center_ids = tl.full((32,), NO_CENTER_ID, tl.int32)
     if CENTERS:
         if CLUSTER:
-            # Keep the origin as a candidate for low-norm attention-sink tokens.
-            best_distance = tl.sum(tl.sum(values * values, 1), 0)
+            # Each 16-channel NVFP4 group chooses its own center.  The origin
+            # is a virtual candidate, encoded as CENTERS, so low-norm sink
+            # groups do not get forced onto a learned center.
+            best_distance = tl.sum(values * values, 1)
             best_center = tl.full((32, 16), 0.0, tl.float32)
             features = groups[:, None] * 16 + lanes[None, :]
             for cluster in tl.static_range(CENTERS):
@@ -78,12 +91,16 @@ def _store_latent(
                     tl.float32
                 )
                 difference = values - center
-                distance = tl.sum(tl.sum(difference * difference, 1), 0)
+                distance = tl.sum(difference * difference, 1)
                 better = distance < best_distance
-                best_center = tl.where(better, center, best_center)
-                center_id = tl.where(better, cluster, center_id)
+                best_center = tl.where(better[:, None], center, best_center)
+                center_ids = tl.where(better, cluster, center_ids)
                 best_distance = tl.minimum(best_distance, distance)
             values -= best_center
+            # Groups that stayed on the origin use the virtual ID CENTERS;
+            # readers skip center addition for IDs >= CENTERS.
+            center_ids = tl.where(center_ids == NO_CENTER_ID, CENTERS, center_ids)
+
     maxima = tl.max(tl.abs(values), 1)
     global_scale = tl.maximum(tl.max(maxima, 0) / (6.0 * 448.0), 1.0e-30)
     scales = tl.maximum(maxima / (6.0 * global_scale), 0.001953125).to(tl.float8e4nv)
@@ -99,13 +116,23 @@ def _store_latent(
     tl.store(base + tl.arange(0, 256), packed.to(tl.uint8))
     tl.store((base + 256).to(tl.pointer_type(tl.float8e4nv)) + groups, scales)
     tl.store((base + 288).to(tl.pointer_type(tl.float32)), global_scale)
-    padding = tl.arange(0, 16)
-    tl.store(
-        base + 420 + padding,
-        tl.where(padding == 0, center_id, 0).to(tl.uint8),
-        padding < 4,
-    )
-    tl.store((base + 424).to(tl.pointer_type(tl.int64)), tag)
+    if CENTERS:
+        padding = tl.arange(0, 16)
+        id_pairs = tl.reshape(center_ids, (16, 2))
+        packed_ids = tl.sum(
+            tl.where(
+                tl.arange(0, 2)[None, :] == 0,
+                id_pairs,
+                id_pairs << 4,
+            ),
+            1,
+        )
+        tl.store(
+            (base + CENTER_ID_OFFSET + padding).to(tl.pointer_type(tl.uint8)),
+            packed_ids.to(tl.uint8),
+        )
+        tl.store((base + TAG_OFFSET).to(tl.pointer_type(tl.int64)), tag)
+
 
 
 @triton.jit
@@ -181,12 +208,15 @@ def _validate_cache(cache):
         or cache.dtype != torch.uint8
         or not cache.is_contiguous()
         or cache.ndim != 3
-        or cache.shape[-1] not in (432, 448, 464, 496)
+        or cache.shape[-1] not in (CACHE_BYTES, 464, 480, 512)
     ):
         raise ValueError(
-            "NVFP4 MLA cache must be contiguous CUDA uint8 [blocks,page,432/448/464/496]"
+            "NVFP4 MLA cache must be contiguous CUDA uint8 [blocks,page,432/464/480/512]"
         )
-    centers = (cache.shape[-1] - CACHE_BYTES) // 16
+    if cache.shape[-1] == CACHE_BYTES:
+        centers = 0
+    else:
+        centers = (cache.shape[-1] - CLUSTER_CACHE_BYTES) // 16
     if centers and cache.shape[1] != 64:
         raise ValueError("Clustered NVFP4 MLA requires 64-token blocks")
     return centers
@@ -211,19 +241,21 @@ def _load_latent(
     )
     values = _decode_fp4(code) * block_scale * global_scale[:, None]
     if CENTERS:
-        center_ids = tl.load(Cache + slots.to(tl.int64) * ROW_BYTES + 420, valid, 0).to(
-            tl.int32
+        feature_groups = features[None, :] // 16
+        packed_ids = tl.load(
+            base + CENTER_ID_OFFSET + (feature_groups // 2), valid[:, None], 0
         )
-        has_center = valid & (center_ids < CENTERS)
+        center_ids = (packed_ids >> ((feature_groups % 2) * 4)) & 15
+        has_center = valid[:, None] & (center_ids < CENTERS)
         offsets = _center_offsets(
             slots[:, None].to(tl.int64) // 64,
-            tl.minimum(center_ids, CENTERS - 1)[:, None],
+            center_ids,
             features[None, :],
             ROW_BYTES,
             CENTERS,
         )
         centers = tl.load(
-            (Cache + offsets).to(tl.pointer_type(tl.bfloat16)), has_center[:, None], 0
+            (Cache + offsets).to(tl.pointer_type(tl.bfloat16)), has_center, 0
         ).to(tl.float32)
         values += centers
     return values.to(tl.bfloat16)
@@ -251,7 +283,7 @@ def _load_mixed_latent(
         safe = tl.maximum(mapping, 0)
         owner = tl.load(Owners + safe, valid & (mapping >= 0), -1)
         stored_tag = tl.load(
-            (Cache + slots.to(tl.int64) * ROW_BYTES + 424).to(
+            (Cache + slots.to(tl.int64) * ROW_BYTES + TAG_OFFSET).to(
                 tl.pointer_type(tl.int64)
             ),
             valid,
@@ -259,14 +291,20 @@ def _load_mixed_latent(
         )
         pool_tag = tl.load(Tags + safe, valid & (mapping >= 0), -1)
         count = tl.load(Counts + safe, valid & (mapping >= 0), 0)
-        marker = tl.load(Cache + slots.to(tl.int64) * ROW_BYTES + 420, valid, 0)
+        id_bytes = tl.load(
+            Cache + slots[:, None].to(tl.int64) * ROW_BYTES
+            + CENTER_ID_OFFSET + tl.arange(0, CENTER_ID_BYTES)[None, :],
+            valid[:, None],
+            0,
+        )
+        plain_row = tl.sum((id_bytes != 255).to(tl.int32), 1) == 0
         raw_valid = (
             valid
             & (mapping >= 0)
             & (owner == blocks)
             & (stored_tag == pool_tag)
             & (slots % 64 < count)
-            & (marker == 255)
+            & plain_row
         )
         raw = tl.load(
             Tail

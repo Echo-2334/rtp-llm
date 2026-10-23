@@ -4,6 +4,11 @@ import torch
 
 from rtp_llm.models_py.triton_kernels.sparse_mla import nvfp4_deferred
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
+    CACHE_BYTES,
+    CENTER_DATA_OFFSET,
+    CENTER_ID_BYTES,
+    CENTER_ID_OFFSET,
+    CLUSTER_CACHE_BYTES,
     gather_nvfp4_cache,
     sparse_nvfp4_attention,
     write_nvfp4_cache,
@@ -14,6 +19,12 @@ from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cluster import (
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_deferred import (
     DeferredNvfp4State,
 )
+
+
+def subspace_ids(cache):
+    rows = cache.reshape(-1, cache.shape[-1])
+    packed = rows[:, CENTER_ID_OFFSET : CENTER_ID_OFFSET + CENTER_ID_BYTES].long()
+    return torch.stack((packed & 15, packed >> 4), -1).reshape(-1, 32)
 
 
 def decode(cache):
@@ -31,11 +42,23 @@ def decode(cache):
     )
     outer = rows[:, 288:292].contiguous().view(torch.float32)
     values = values * scales * outer
-    n = (cache.shape[-1] - 432) // 16
-    centers = cache[:, :, 432:].contiguous().view(torch.bfloat16).reshape(-1, n, 512)
-    ids = rows[:, 420].long()
-    blocks = torch.arange(len(rows), device=cache.device) // 64
-    values += centers[blocks, ids.clamp(max=n - 1)].float() * (ids < n)[:, None]
+    n = 0 if cache.shape[-1] == CACHE_BYTES else (cache.shape[-1] - CLUSTER_CACHE_BYTES) // 16
+    if n:
+        centers = (
+            cache[:, :, CENTER_DATA_OFFSET:]
+            .contiguous()
+            .view(torch.bfloat16)
+            .reshape(-1, n, 512)
+        )
+        id_bytes = rows[:, 420:436].long()
+        ids = torch.stack((id_bytes & 15, id_bytes >> 4), -1).reshape(-1, 32)
+        ids = ids.repeat_interleave(16, -1)
+        blocks = torch.arange(len(rows), device=cache.device) // 64
+        features = torch.arange(512, device=cache.device)[None, :]
+        center_values = centers[
+            blocks[:, None], ids.clamp(max=n - 1), features.expand(len(rows), -1)
+        ]
+        values += center_values.float() * (ids < n)
     return torch.cat(
         (values.bfloat16(), rows[:, 292:420].contiguous().view(torch.bfloat16)), -1
     )
@@ -62,7 +85,7 @@ class DeferredNvfp4Test(unittest.TestCase):
 
     def make(self, centers=4, capacity=8):
         cache = torch.zeros(
-            (12, 64, 432 + centers * 16), device="cuda", dtype=torch.uint8
+            (12, 64, 448 + centers * 16), device="cuda", dtype=torch.uint8
         )
         return cache, DeferredNvfp4State(cache, capacity)
 
@@ -103,17 +126,15 @@ class DeferredNvfp4Test(unittest.TestCase):
             write_nvfp4_cache(
                 x[i], rope[i], gold, torch.arange(b * 64, (b + 1) * 64, device="cuda")
             )
-            self.assertTrue(
-                ((cache[b, :, 420] < 4) | (cache[b, :, 420] == 255)).all().item()
-            )
+            self.assertTrue((subspace_ids(cache[b]) <= 4).all().item())
             torch.testing.assert_close(
                 gather(cache.clone(), b, 64), gather(gold, b, 64), atol=0, rtol=0
             )
             torch.testing.assert_close(
-                cache[b, :, :424], gold[b, :, :424], atol=0, rtol=0
+                cache[b, :, :436], gold[b, :, :436], atol=0, rtol=0
             )
             torch.testing.assert_close(
-                cache[b, :, 432:], gold[b, :, 432:], atol=0, rtol=0
+                cache[b, :, 448:], gold[b, :, 448:], atol=0, rtol=0
             )
         self.assertTrue((cache[5, :21, 420] == 255).all().item())
         torch.testing.assert_close(
@@ -271,10 +292,10 @@ class DeferredNvfp4Test(unittest.TestCase):
         )
         # The generation tag is intentionally local and differs from legacy.
         torch.testing.assert_close(
-            cache[5, :, :424], golden[5, :, :424], atol=0, rtol=0
+            cache[5, :, :436], golden[5, :, :436], atol=0, rtol=0
         )
         torch.testing.assert_close(
-            cache[5, :, 432:], golden[5, :, 432:], atol=0, rtol=0
+            cache[5, :, 448:], golden[5, :, 448:], atol=0, rtol=0
         )
         torch.testing.assert_close(
             gather(cache.clone(), 5, 64), gather(golden, 5, 64), atol=0, rtol=0
@@ -311,9 +332,7 @@ class DeferredNvfp4Test(unittest.TestCase):
         more = torch.randn((63, 512), device="cuda", dtype=torch.bfloat16)
         more_rope = torch.randn((63, 64), device="cuda", dtype=torch.bfloat16)
         self.write(cache, state, more, more_rope, torch.arange(65, 128, device="cuda"))
-        self.assertTrue(
-            ((cache[1, :, 420] < 4) | (cache[1, :, 420] == 255)).all().item()
-        )
+        self.assertTrue((subspace_ids(cache[1]) <= 4).all().item())
         self.assertEqual(state.data.shape, (1, 64, 512))
         self.assertTrue(torch.isfinite(gather(cache, 1, 64)).all().item())
         before = cache.clone()
@@ -364,9 +383,7 @@ class DeferredNvfp4Test(unittest.TestCase):
         )
         portable = gather(cache, 1, 63)[:, :512].clone()
         self.write(cache, state, x[:, 63], rope[:, 63], [63, 127])
-        self.assertTrue(
-            ((cache[:2, :, 420] < 4) | (cache[:2, :, 420] == 255)).all().item()
-        )
+        self.assertTrue((subspace_ids(cache[:2]) <= 4).all().item())
         gold = torch.zeros_like(cache)
         ordinary = torch.zeros((1, 64, 432), device="cuda", dtype=torch.uint8)
         write_nvfp4_cache(

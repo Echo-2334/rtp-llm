@@ -1,8 +1,15 @@
-"""Frozen per-layer, per-64-token-block BF16 centers for residual NVFP4."""
+"""Frozen per-layer, per-64-token-block BF16 subspace centers for residual NVFP4."""
 
 import torch
 import triton
 import triton.language as tl
+
+
+# The 512 latent features are quantized as 32 independent 16-feature NVFP4
+# groups.  Clustered pages keep one center id for each such group.
+SUBSPACE_SIZE = 16
+NUM_SUBSPACES = 512 // SUBSPACE_SIZE
+CENTER_DATA_OFFSET = 448
 
 
 @triton.jit
@@ -14,44 +21,82 @@ def _center_offsets(
     return (
         blocks * 64 * ROW_BYTES
         + linear // stripe_elements * ROW_BYTES
-        + 432
+        + CENTER_DATA_OFFSET
         + linear % stripe_elements * 2
     )
 
 
 @triton.jit
 def _fit_centers(values, valid, CENTERS: tl.constexpr):
+    """Fit C centers independently in each 16-channel latent subspace.
+
+    The C stored centers are fitted independently for every subspace.  The
+    origin is a separate virtual candidate during residual encoding, so the
+    learned center budget remains C.
+    """
     rows = tl.arange(0, 64)
+    groups = tl.arange(0, NUM_SUBSPACES)
+    lanes = tl.arange(0, SUBSPACE_SIZE)
     clusters = tl.arange(0, CENTERS)
-    centers = tl.full((CENTERS, 512), 0.0, tl.float32)
-    nearest = tl.full((64,), float("inf"), tl.float32)
-    selected = tl.full((), 0, tl.int32)
+    values = tl.reshape(values, (64, NUM_SUBSPACES, SUBSPACE_SIZE))
+    centers = tl.full(
+        (CENTERS, NUM_SUBSPACES, SUBSPACE_SIZE), 0.0, tl.float32
+    )
+
+    # Farthest-point initialization is performed independently per subspace.
+    nearest = tl.full((64, NUM_SUBSPACES), float("inf"), tl.float32)
+    selected = tl.argmax(valid.to(tl.int32), 0, tie_break_left=True)
     for cluster in tl.static_range(CENTERS):
-        center = tl.sum(tl.where(rows[:, None] == selected, values, 0.0), 0)
-        centers = tl.where(clusters[:, None] == cluster, center[None, :], centers)
-        difference = values - center[None, :]
-        distance = tl.sum(difference * difference, 1)
+        center = tl.sum(
+            tl.where(
+                rows[:, None, None] == selected[None, :, None],
+                values,
+                0.0,
+            ),
+            0,
+        )
+        centers = tl.where(
+            clusters[:, None, None] == cluster,
+            center[None, :, :],
+            centers,
+        )
+        difference = values - center[None, :, :]
+        distance = tl.sum(difference * difference, 2)
         nearest = tl.minimum(nearest, distance)
-        selected = tl.argmax(tl.where(valid, nearest, -1.0), 0, tie_break_left=True)
-    for iteration in range(4):
-        nearest = tl.full((64,), float("inf"), tl.float32)
-        assignment = tl.full((64,), 0, tl.int32)
+        selected = tl.argmax(
+            tl.where(valid[:, None], nearest, -1.0), 0, tie_break_left=True
+        )
+
+    # A few iterations are enough for the 64-token block and keep the kernel
+    # shape fixed for CUDA graph capture.
+    for _ in range(4):
+        nearest = tl.full((64, NUM_SUBSPACES), float("inf"), tl.float32)
+        assignment = tl.full((64, NUM_SUBSPACES), 0, tl.int32)
         for cluster in tl.static_range(CENTERS):
-            center = tl.sum(tl.where(clusters[:, None] == cluster, centers, 0.0), 0)
-            difference = values - center[None, :]
-            distance = tl.sum(difference * difference, 1)
+            center = tl.sum(
+                tl.where(
+                    clusters[:, None, None] == cluster,
+                    centers,
+                    0.0,
+                ),
+                0,
+            )
+            difference = values - center[None, :, :]
+            distance = tl.sum(difference * difference, 2)
             assignment = tl.where(distance < nearest, cluster, assignment)
             nearest = tl.minimum(nearest, distance)
         for cluster in tl.static_range(CENTERS):
-            members = valid & (assignment == cluster)
+            members = valid[:, None] & (assignment == cluster)
             count = tl.sum(members.to(tl.int32), 0)
-            mean = tl.sum(tl.where(members[:, None], values, 0.0), 0) / tl.maximum(
-                count, 1
-            )
+            mean = tl.sum(
+                tl.where(members[:, :, None], values, 0.0), 0
+            ) / tl.maximum(count[:, None], 1)
             centers = tl.where(
-                (clusters[:, None] == cluster) & (count > 0), mean[None, :], centers
+                (clusters[:, None, None] == cluster) & (count[None, :, None] > 0),
+                mean[None, :, :],
+                centers,
             )
-    return centers.to(tl.bfloat16)
+    return tl.reshape(centers, (CENTERS, 512)).to(tl.bfloat16)
 
 
 # TOKENS varies with every prefill batch; specializing on it recompiles per length.
