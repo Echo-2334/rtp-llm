@@ -19,7 +19,6 @@ import torch
 import triton
 import triton.language as tl
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cache import (
-    CENTER_ID_BYTES,
     CENTER_ID_OFFSET,
     TAG_OFFSET,
     _load_latent,
@@ -264,16 +263,9 @@ def _plainify_fallback(
         ):
             positions = tl.full((1,), block * 64 + row, tl.int64)
             features = tl.arange(0, 512)
-            id_bytes = tl.load(
-                Cache
-                + (block * 64 + row) * ROW_BYTES
-                + CENTER_ID_OFFSET
-                + tl.arange(0, CENTER_ID_BYTES)
-            )
-            has_center = tl.sum(
-                (id_bytes != 255).to(tl.int32), 0
-            ) > 0
-            if has_center:
+            # Plain mirrors keep 0xFF in every ID byte; clustered IDs are <= 4.
+            marker = tl.load(Cache + (block * 64 + row) * ROW_BYTES + CENTER_ID_OFFSET)
+            if marker != 255:
                 values = tl.reshape(
                     _load_latent(
                         Cache, positions, positions >= 0, features, ROW_BYTES, CENTERS

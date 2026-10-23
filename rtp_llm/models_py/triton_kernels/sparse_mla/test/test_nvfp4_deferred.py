@@ -209,7 +209,8 @@ class DeferredNvfp4Test(unittest.TestCase):
         self.write(
             cache, state, latent[17:], rope[17:], torch.arange(17, 64, device="cuda")
         )
-        self.assertTrue((cache[0, 1:3, 420] == 255).all().item())
+        # Sink rows stay on the virtual zero center (ID == C) in every subspace.
+        self.assertTrue((subspace_ids(cache[0, 1:3]) == 4).all().item())
         direct = torch.zeros((1, 64, 432), device="cuda", dtype=torch.uint8)
         write_nvfp4_cache(latent, rope, direct, torch.arange(64, device="cuda"))
         torch.testing.assert_close(
@@ -220,10 +221,9 @@ class DeferredNvfp4Test(unittest.TestCase):
         torch.testing.assert_close(
             packed[1:3], gather(direct, 0, 64)[1:3], rtol=0, atol=0
         )
-        # Existing readers can use the exact shadow for marker 255 while resident.
-        torch.testing.assert_close(
-            gather(cache, 0, 64)[1:3, :512], latent[1:3], rtol=0, atol=0
-        )
+        # Sealed v2 rows never carry the all-15 plain marker, so readers decode
+        # the packed page even while the BF16 shadow is still resident.
+        torch.testing.assert_close(gather(cache, 0, 64), packed, rtol=0, atol=0)
         # Reusing the only shadow slot must leave the sealed packed page readable.
         self.write(cache, state, latent[:1], rope[:1], [64])
         self.assertEqual(state.mapping[0].item(), -1)

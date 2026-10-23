@@ -12,19 +12,22 @@ import torch
 import triton
 import triton.language as tl
 from rtp_llm.models_py.triton_kernels.sparse_mla.nvfp4_cluster import (
+    CENTER_DATA_OFFSET,
     _center_offsets,
     initialize_block_centers,
 )
 
 CACHE_BYTES = 432
 # Clustered pages need 16 nibbles to carry 32 independent subspace IDs,
-# followed by the existing 64-bit deferred-tail tag.  Align the center table
-# to 16 bytes so the v2 layouts are 464/480/512 bytes for C=1/2/4.
+# followed by 4 bytes of padding and the existing 64-bit deferred-tail tag,
+# which must stay 8-byte aligned.  The center table then starts at byte 448,
+# so the v2 layouts are 464/480/512 bytes for C=1/2/4.
 CLUSTER_CACHE_BYTES = 448
-CENTER_ID_OFFSET = 420
-CENTER_ID_BYTES = 16
-TAG_OFFSET = 436
-NO_CENTER_ID = 15
+# Read inside @triton.jit functions, so these must be constexpr globals.
+CENTER_ID_OFFSET = tl.constexpr(420)
+CENTER_ID_BYTES = tl.constexpr(16)
+TAG_OFFSET = tl.constexpr(440)
+NO_CENTER_ID = tl.constexpr(15)
 
 
 def is_supported(latent: torch.Tensor, rope: torch.Tensor) -> bool:
@@ -291,13 +294,12 @@ def _load_mixed_latent(
         )
         pool_tag = tl.load(Tags + safe, valid & (mapping >= 0), -1)
         count = tl.load(Counts + safe, valid & (mapping >= 0), 0)
-        id_bytes = tl.load(
-            Cache + slots[:, None].to(tl.int64) * ROW_BYTES
-            + CENTER_ID_OFFSET + tl.arange(0, CENTER_ID_BYTES)[None, :],
-            valid[:, None],
-            0,
+        # Clustered IDs are <= C <= 4, so a row is a plain mirror iff its first
+        # ID byte still holds two NO_CENTER_ID nibbles (0xFF).
+        marker = tl.load(
+            Cache + slots.to(tl.int64) * ROW_BYTES + CENTER_ID_OFFSET, valid, 0
         )
-        plain_row = tl.sum((id_bytes != 255).to(tl.int32), 1) == 0
+        plain_row = marker == 255
         raw_valid = (
             valid
             & (mapping >= 0)

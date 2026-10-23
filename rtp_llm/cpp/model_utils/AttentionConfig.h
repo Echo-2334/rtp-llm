@@ -91,9 +91,9 @@ struct AttentionConfigs {
 
 public:
     size_t nvfp4CacheBytesPerToken() const {
-        // Clustered v2 stores 32 four-bit subspace center IDs (16 bytes),
-        // an int64 deferred tag (8 bytes), and 4 bytes of alignment padding
-        // before the BF16 center stripes.
+        // Clustered v2 stores 32 four-bit subspace center IDs (16 bytes) at
+        // 420, 4 bytes of padding, then an 8-byte-aligned int64 deferred tag
+        // at 440, before the BF16 center stripes at 448.
         return mla_nvfp4_cluster_centers == 0 ? 432 : 448 + 16 * mla_nvfp4_cluster_centers;
     }
 

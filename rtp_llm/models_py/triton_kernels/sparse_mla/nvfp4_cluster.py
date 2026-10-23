@@ -7,9 +7,10 @@ import triton.language as tl
 
 # The 512 latent features are quantized as 32 independent 16-feature NVFP4
 # groups.  Clustered pages keep one center id for each such group.
-SUBSPACE_SIZE = 16
-NUM_SUBSPACES = 512 // SUBSPACE_SIZE
-CENTER_DATA_OFFSET = 448
+# Read inside @triton.jit functions, so these must be constexpr globals.
+SUBSPACE_SIZE = tl.constexpr(16)
+NUM_SUBSPACES = tl.constexpr(512 // 16)
+CENTER_DATA_OFFSET = tl.constexpr(448)
 
 
 @triton.jit
@@ -45,7 +46,9 @@ def _fit_centers(values, valid, CENTERS: tl.constexpr):
 
     # Farthest-point initialization is performed independently per subspace.
     nearest = tl.full((64, NUM_SUBSPACES), float("inf"), tl.float32)
-    selected = tl.argmax(valid.to(tl.int32), 0, tie_break_left=True)
+    # Every subspace starts from the first valid row.
+    first = tl.argmax(valid.to(tl.int32), 0, tie_break_left=True)
+    selected = tl.full((NUM_SUBSPACES,), 0, tl.int32) + first
     for cluster in tl.static_range(CENTERS):
         center = tl.sum(
             tl.where(
