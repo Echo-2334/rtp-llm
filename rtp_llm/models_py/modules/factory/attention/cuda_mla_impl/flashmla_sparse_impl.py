@@ -56,6 +56,7 @@ from rtp_llm.ops import (
     FMHAType,
     KvCacheDataType,
     ParallelismConfig,
+    RoleType,
 )
 from rtp_llm.ops.compute_ops import (
     KVCache,
@@ -530,11 +531,22 @@ class SparseMlaImpl(MlaImplBase):
                 getattr(attn_configs, "mla_nvfp4_deferred_blocks", False)
             ),
             tail_capacity=int(getattr(attn_configs, "mla_nvfp4_tail_blocks", 256)),
+            prefill_role=getattr(parallelism_config, "role_type", None)
+            == RoleType.PREFILL,
+            # MTP target verify / draft extend arrive as prefill but are decode.
+            is_prefill=bool(
+                attn_inputs.is_prefill
+                and not getattr(attn_inputs, "is_target_verify", False)
+                and not getattr(attn_inputs, "is_draft_extend", False)
+            ),
         )
 
+        # The fused RoPE kernel writes the cache itself, bypassing NVFP4 and
+        # the NVFP4 simulation in kv_cache_write_op.
         self._fuse_qk_rope_cat_cache_mla = (
             fuse_kernels_enabled()
             and attn_configs.kv_cache_dtype != KvCacheDataType.NVFP4
+            and self.kv_cache_write_op.sim is None
         )
         self._kv_cache_type = (
             "fp8_ds_mla"
@@ -818,6 +830,12 @@ class SparseMlaImpl(MlaImplBase):
         cache_target = kv_cache
         write_slots = self.rope_params.slot_mapping
         if working_entry is not None:
+            sim = self.kv_cache_write_op.sim
+            if sim is not None and sim.mode == "cluster":
+                # Sealing reads whole blocks back from the cache being written.
+                raise NotImplementedError(
+                    "RTP_MLA_NVFP4_SIM=cluster does not support the pinned host MLA cache"
+                )
             working, group_layer = working_entry
             if not kv_prefetched:
                 self.prefetch_kv(layer_id, topk_indices)

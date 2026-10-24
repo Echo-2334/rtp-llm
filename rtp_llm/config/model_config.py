@@ -738,6 +738,37 @@ class ModelConfig(CppModelConfig):
                 logging.info(
                     "Using experimental MLA NVFP4 cache v1: 432 bytes/token, BF16 RoPE"
                 )
+        sim_mode = os.environ.get("RTP_MLA_NVFP4_SIM", "")
+        if sim_mode:
+            if sim_mode not in ("plain", "cluster"):
+                raise ValueError("RTP_MLA_NVFP4_SIM must be plain or cluster")
+            if os.environ.get("RTP_MLA_NVFP4", "0") == "1":
+                raise ValueError(
+                    "RTP_MLA_NVFP4_SIM simulates NVFP4 on a BF16/FP8 cache; "
+                    "unset RTP_MLA_NVFP4"
+                )
+            if not (
+                self.attn_config.use_mla
+                and self.attn_config.is_sparse
+                and self.attn_config.kv_lora_rank == 512
+                and self.attn_config.rope_head_dim == 64
+                and self.attn_config.kv_cache_dtype
+                in (KvCacheDataType.BASE, KvCacheDataType.FP8)
+            ):
+                raise ValueError(
+                    "RTP_MLA_NVFP4_SIM requires sparse MLA with latent=512, "
+                    "RoPE=64 and a BF16 or FP8 KV cache"
+                )
+            logging.info(
+                "Simulating MLA NVFP4 KV (%s%s) on a %s cache",
+                sim_mode,
+                (
+                    ", %s centers" % os.environ.get("RTP_MLA_NVFP4_SIM_CENTERS", "2")
+                    if sim_mode == "cluster"
+                    else ""
+                ),
+                self.attn_config.kv_cache_dtype,
+            )
 
         # Set final data_type
         # This uses ModelConfig's __setattr__ which handles string-to-enum conversion

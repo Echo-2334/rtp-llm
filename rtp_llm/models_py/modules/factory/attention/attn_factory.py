@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable, Dict, List, Optional, Union
 
 from rtp_llm.model_loader.model_weight_info import ModelWeights
@@ -78,9 +79,14 @@ def get_mla_impl(
             continue
 
         cos_sin_cache = weight.get_global_weight(W.rope_cos_sin_cache)
+        # NVFP4 (real or simulated) must attend over the quantized cache, so it
+        # never takes the dense fast path that reads the unquantized KV.
+        quantized_kv = attn_configs.kv_cache_dtype == KvCacheDataType.NVFP4 or bool(
+            os.environ.get("RTP_MLA_NVFP4_SIM", "")
+        )
         use_fast_path = (
             attn_inputs.is_prefill
-            and attn_configs.kv_cache_dtype != KvCacheDataType.NVFP4
+            and not quantized_kv
             and not use_decode_mla
             and attn_inputs.cu_kv_seqlens.max().item() <= attn_configs.indexer_topk
             and not (
@@ -104,7 +110,7 @@ def get_mla_impl(
         ):
             continue
 
-        if attn_configs.kv_cache_dtype == KvCacheDataType.NVFP4 and not impl.is_sparse():
+        if quantized_kv and not impl.is_sparse():
             continue
 
         try:
