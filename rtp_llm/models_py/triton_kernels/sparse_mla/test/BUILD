@@ -52,3 +52,21 @@ py_test(
     tags = ["H20"],
     exec_properties = {'gpu': 'H20', 'gpu_count': '1'},
 )
+
+py_test(
+    name = "test_indexer_pool_reuse",
+    srcs = ["test_indexer_pool_reuse.py"],
+    deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
+    env = {"GPU_COUNT": "1"},
+    tags = ["H20"],
+    exec_properties = {'gpu': 'H20', 'gpu_count': '1'},
+)
+
+py_test(
+    name = "test_indexer_pool_deepgemm",
+    srcs = ["test_indexer_pool_deepgemm.py"],
+    deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
+    env = {"GPU_COUNT": "1"},
+    tags = ["H20"],
+    exec_properties = {'gpu': 'H20', 'gpu_count': '1'},
+)

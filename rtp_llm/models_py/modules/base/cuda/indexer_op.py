@@ -42,6 +42,31 @@ def _get_topk_workspace(device: torch.device) -> torch.Tensor:
     return ws
 
 
+def _make_indexer_pool(index_topk: int, index_head_dim: int, blocksize: int):
+    """GLM5_INDEXER_POOL_REUSE_STEPS=N reuses a decode step's Indexer pool
+    (top GLM5_INDEXER_POOL_SIZE tokens, default 8192) for the next N steps;
+    0 keeps the full-context Indexer every step."""
+    steps = int(os.environ.get("GLM5_INDEXER_POOL_REUSE_STEPS", "0"))
+    if steps == 0:
+        return None
+    if (index_topk, index_head_dim, blocksize) != (2048, 128, 64):
+        raise ValueError(
+            "GLM5_INDEXER_POOL_REUSE_STEPS requires top-2048, 128-dim Indexer "
+            f"keys and 64-token pages, got {(index_topk, index_head_dim, blocksize)}"
+        )
+    from rtp_llm.models_py.triton_kernels.sparse_mla.indexer_pool_reuse import (
+        IndexerPool,
+    )
+
+    return IndexerPool(
+        slots=int(os.environ.get("GLM5_INDEXER_POOL_SLOTS", "128")),
+        reuse_steps=steps,
+        min_length=int(os.environ.get("GLM5_INDEXER_POOL_MIN_KV_LEN", "16384")),
+        device=torch.device("cuda", torch.cuda.current_device()),
+        pool_size=int(os.environ.get("GLM5_INDEXER_POOL_SIZE", "8192")),
+    )
+
+
 def _fp8_mqa_logits_chunk_rows() -> int:
     """Rows per FP8 MQA logits chunk.
 
@@ -238,6 +263,7 @@ class IndexerOp(nn.Module):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.is_neox_style = is_neox_style
+        self._pool = _make_indexer_pool(index_topk, index_head_dim, blocksize)
 
         glm5_topk_backend = (
             os.environ.get("GLM5_INDEXER_TOPK_BACKEND", "dsv4_persistent")
@@ -732,6 +758,16 @@ class IndexerOp(nn.Module):
                 (0, self.index_topk), dtype=torch.int32, device=q_fp8.device
             )
 
+        if (
+            self._pool is not None
+            and not is_multi_token_decode
+            and not attention_inputs.is_prefill
+            and self._pool.supports(q_fp8.shape[0], block_table)
+        ):
+            return self._get_topk_paged_pool(
+                q_fp8, weights, kv_cache_fp8, block_table, lengths, kvlen_2d
+            )
+
         if is_multi_token_decode:
             num_tokens = q_fp8.shape[0]
             batch_size = block_table.shape[0]
@@ -792,6 +828,52 @@ class IndexerOp(nn.Module):
         )
 
         return topk_result
+
+    def _get_topk_paged_pool(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        block_table: torch.Tensor,
+        lengths: torch.Tensor,
+        kvlen_2d: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single-token decode through the reused Indexer pool."""
+        max_seq_len = block_table.shape[1] * self.blocksize
+        paged_q = q_fp8.view(*kvlen_2d.shape, self.index_n_heads, self.index_head_dim)
+        workspace = _get_topk_workspace(q_fp8.device)
+
+        def full_logits(full_lengths: torch.Tensor) -> torch.Tensor:
+            # Reuse rows have zero length; schedule only the refresh rows.
+            context_lens = full_lengths.view_as(kvlen_2d)
+            schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                context_lens, self.blocksize, deep_gemm.get_num_sms()
+            )
+            return deep_gemm.fp8_paged_mqa_logits(
+                paged_q,
+                kv_cache_fp8,
+                weights,
+                context_lens,
+                block_table,
+                schedule,
+                max_seq_len,
+                clean_logits=False,
+            )
+
+        def select_topk(logits, row_lengths, out, max_len):
+            self._paged_topk_op(
+                logits, row_lengths, out, workspace, self.index_topk, max_len
+            )
+
+        return self._pool.topk(
+            q_fp8,
+            weights,
+            kv_cache_fp8,
+            block_table,
+            lengths,
+            full_logits,
+            select_topk,
+        )
 
     def _get_topk_ragged(
         self,
