@@ -20,26 +20,78 @@ how much the required tokens change between steps:
 
 Refresh rows skip candidate scoring/selection work. Row lengths select full
 or candidate work on device, keeping mixed refresh/reuse rows compatible with
-CUDA graphs. The revised implementation's latency is being measured.
+CUDA graphs. Performance depends on batch size, context length, and the
+native TopK backend; reuse can be slower for short contexts or small batches.
 
-## Accuracy investigation in progress (2026-10-27)
+## Controlled accuracy re-evaluation (2026-10-28)
 
-A subsequent uncapped-output run on the same 100 frozen, approximately 48K
-CWE prompts scored 9.2% answer-word recall for baseline and 1.6% for 8K/N15,
-with 67 and 69 confirmed generation loops counted as zero. Baseline itself is
-abnormal: its first eight prompts scored 87.5%, the remaining 92 scored 2.39%.
-This is a diagnostic clue, not proof of a request-state bug. The root cause is
-under investigation; neither this run nor kernel tests establishes healthy
-model quality or end-to-end alignment.
+The original uncapped run on 100 frozen, approximately 48K CWE prompts scored
+9.2% answer-word recall for baseline and 1.6% for 8K/N15, with 67 and 69
+confirmed generation loops counted as zero. That baseline is invalid for
+judging approximation quality: its first eight prompts scored 87.5%, the
+remaining 92 scored 2.39%.
 
-Current changes address two independent correctness boundaries: request page
-recycling and exact refresh selection. They have not yet been evaluated on the
-100-prompt end-to-end run. The latency and recall tables below predate them.
+An independent EP8 GPU reproducer identified a MoE chunk-scheduling problem
+in the fused DP8/EP8 test deployment. The wrapper's rank-local capacity was
+17280 tokens, so a 48010-token prefill invoked three MoE kernels per layer.
+Idle ranks invoked one kernel per layer and advanced to different layer
+weights while the active rank was still processing its earlier layer's
+chunks. With three distinct layers, the misaligned result had relative L2
+error 0.635; matching the chunk count on every rank produced bitwise-identical
+outputs to the balanced-load reference.
 
-## End-to-end status (2026-10-27)
+The controlled rerun sets `DSV4_MOE_CHUNK_TOKENS=65536` on both services, above
+this test's `MAX_BATCH_TOKENS_SIZE=57344`. This avoids chunking for this bounded
+cohort; it is not a general fix for arbitrary DP/CP inputs. It keeps 1M context
+capacity, greedy generation with no extra output cap, explicit DP backend
+routing, and the same frozen 100 prompts. Confirmed loops count as failures
+with zero score. Both runs use TP1/DP8/EP8, FP8 KV, eager execution, native
+`dsv4_persistent` decode TopK, and `topk_v3_tie_break` prefill TopK. The same
+private control hook is present in both runs; it reads configuration on each
+forward and records prefill metadata, so these are not production latency
+measurements.
 
-The 8K pool / N=15 implementation completes end-to-end inference, but has
-**not passed quality validation**. Keep it experimental and disabled by default.
+| Metric | Baseline | Fixed pool 8K, N=15 |
+|---|---:|---:|
+| Frozen CWE prompts | 100 | 100 |
+| Answer-word recall | 100% | 100% |
+| All ten words correct | 100/100 | 100/100 |
+| Natural completions | 100/100 | 100/100 |
+| Confirmed loops / request errors | 0 / 0 | 0 / 0 |
+| Mean output tokens | 239.96 | 237.33 |
+| Maximum output tokens | 1740 | 953 |
+| Median request TPOT, ms | 154.452 | 166.912 |
+| P95 request TPOT, ms | 194.081 | 226.316 |
+
+All 100 paired scores tie. Median TPOT increased 8.07% in this approximately
+48K, one-request-per-DP-rank eager experiment. Output trajectories and mixed
+prefill/decode scheduling differ, so this is a descriptive measurement rather
+than an isolated performance comparison. It does not establish production
+CUDA-graph latency or SWE quality.
+
+A separate native profiler request recorded 651 launches each of the pool
+plan, pool selection, candidate scoring, and result mapping kernels: 31 decode
+steps across 21 Indexer layers. Candidate scoring takes the short refresh path
+on steps 1 and 17, with active scoring on intervening steps, consistent with
+one refresh followed by 15 reuse steps. This trace is a path check, excluded
+from the accuracy and latency measurements.
+
+The corrected environment and the pool fixes were evaluated together. Do not
+attribute the change from the old corrupted run solely to the pool fixes;
+there is no original-pool ablation in the corrected environment.
+
+The pool changes separately fix request-page recycling and preserve the
+native full-context TopK result on refresh steps. Both native decode TopK
+backends pass the 19 GPU regression checks listed below. Accuracy aligns on
+this frozen CWE cohort; broader task validation remains necessary. The
+historical latency and quality tables below predate the fixes and the
+corrected baseline environment.
+
+## Historical end-to-end results (before the baseline correction)
+
+These earlier runs predate the controlled 100-prompt validation above and
+used an unhealthy baseline. Keep the approximation experimental and disabled
+by default; one corrected CWE cohort does not establish general equivalence.
 
 On eval80, the baseline and pool runs used the same GLM-5.3 model, FP8 KV,
 DP8/EP8, CUDA graphs (capture sizes 1/2/4/8), and 47,740–48,124-token inputs.
@@ -70,8 +122,9 @@ Paired scores improved for 6 prompts, tied for 4, and worsened for 14.
 Eight pool outputs repeated `</think>` 120 times (none in baseline);
 other pool outputs also included repetition or irrelevant answers. Therefore
 the observed regression cannot be explained solely by the output length cap.
-The root cause (approximation versus an implementation/state issue) remains
-unresolved; successful requests and kernel tests do not prove model quality.
+The MoE scheduling defect described above prevents this run from isolating
+approximation loss. Successful requests and kernel tests do not establish
+model quality; use the controlled rerun for the new comparison.
 
 The tested remote commit was `346f1713c70b6fdb8d040a8af66e2b629935ffd2`;
 its tree equals local commit `f714a35a4e305a26d8019647c4b68718cf00ef72`.
@@ -150,6 +203,29 @@ do no work.
   batch fallback, including the production Indexer entry;
 - MTP key-only and paged-backend fallback boundaries;
 - crossing the minimum KV length after skipping pool construction.
+
+## Isolated kernel timing with native topk_v3 (2026-10-28)
+
+These measurements use an NVIDIA L20D with the evaluation model stopped.
+Leaving the DP8 service running is not isolation: idle ranks still execute
+dummy forwards and disturb timings. A 16-step CUDA graph cycle includes one
+refresh and 15 reuse steps, reset, length updates, and DeepGEMM metadata.
+The block table has 1M-token capacity. Results are synthetic Indexer-core
+medians, not production model speedups.
+
+| Decode rows | KV tokens | Baseline µs | Fixed 8K/N15 µs | Baseline / pool |
+|---|---:|---:|---:|---:|
+| 1 | 48000 | 18.183 | 31.219 | 0.58x |
+| 16 | 48000 | 33.697 | 46.339 | 0.73x |
+| 64 | 48000 | 92.111 | 98.529 | 0.93x |
+| 1 | 128000 | 20.828 | 31.055 | 0.67x |
+| 16 | 128000 | 67.714 | 51.090 | 1.33x |
+| 64 | 128000 | 217.698 | 115.028 | 1.89x |
+
+The 8K/N3 and 16K/N3 kernel variants were also measured, but are not quality
+claims: the 100-prompt evaluation used 8K/N15. Shortening the reuse window
+increases refresh cost. Keep default reuse disabled, and validate both task
+quality and latency for the actual backend, context lengths, and batch sizes.
 
 ## Historical latency per Indexer layer, CUDA graph, N = 15
 
