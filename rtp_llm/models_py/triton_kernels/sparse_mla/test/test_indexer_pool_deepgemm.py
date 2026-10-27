@@ -138,6 +138,13 @@ class IndexerPoolDeepGemmTest(unittest.TestCase):
         recall = []
         for step in range(17):
             q, w = make_query(rows, seed=10 + step)
+            full_selections = []
+
+            def select(logits, row_lengths, result, max_len):
+                persistent_topk(logits, row_lengths, result, max_len)
+                if max_len == table.shape[1] * PAGE:
+                    full_selections.append(result.clone())
+
             out = pool.topk(
                 q,
                 w,
@@ -145,13 +152,16 @@ class IndexerPoolDeepGemmTest(unittest.TestCase):
                 table,
                 lengths,
                 lambda n: deepgemm_logits(q, w, cache, table, n),
-                persistent_topk,
+                select,
             )
             exact = original(q, w, cache, table, lengths)
             if step in (0, 16):
-                # Triton and DeepGEMM sum heads in different orders: near-ties may swap.
-                for a, b in zip(as_sets(out), as_sets(exact)):
-                    self.assertLessEqual(len(a ^ b), 8, f"refresh step {step}")
+                # Native persistent TopK does not guarantee output order
+                # across calls, even on identical logits. The refresh must
+                # preserve this invocation's result exactly, and its set
+                # must match the independent original path with no slack.
+                self.assertTrue(torch.equal(out, full_selections[0]))
+                self.assertEqual(as_sets(out), as_sets(exact), f"refresh step {step}")
             else:
                 hits = [len(a & b) / TOPK for a, b in zip(as_sets(out), as_sets(exact))]
                 recall.append(min(hits))

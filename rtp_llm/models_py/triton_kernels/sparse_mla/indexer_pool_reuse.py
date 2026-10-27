@@ -1,18 +1,19 @@
 """Reuse a per-request top-8192 Indexer pool across GLM-5.3 decode steps.
 
 A refresh step scores the full context with the original Indexer logits and
-keeps the request's top-8192 token indices as its pool. That step and the next
-`reuse_steps` decode steps then score only the pool plus the tokens appended
-since the refresh, and select top-2048 from those candidates; on the refresh
-step this is the full-context top-2048 up to near-ties. Rows shorter than
-`min_length` refresh every step, with all their tokens in the pool when they
-have at most 8192.
+keeps the request's top-8192 token indices as its pool. The refresh step returns
+the original full-context top-2048. The next `reuse_steps` decode steps score
+the pool plus the tokens appended since the refresh and select top-2048 from
+those candidates. Rows shorter than
+`min_length` use the original full-context selection every step without
+building a pool.
 
 Rows find their pool slot through KV pages rather than request ids: the first
-physical page, and the page that held the refresh step's last token. That page
-was private to the request when the pool was built, so a reordered batch finds
-its pools again and a new request never inherits one. All decisions are made on
-the device, so one CUDA graph per batch size serves refresh and reuse steps.
+physical page, and the page that held the refresh step's last token. A reordered
+decode batch therefore finds its pools again. The caller must reset pools on
+real prefill boundaries because a new request can recycle both physical pages.
+All decisions are made on the device, so one CUDA graph per batch size serves
+refresh and reuse steps.
 """
 
 from typing import Callable
@@ -41,6 +42,7 @@ SEGMENT = 4096
 def _plan_kernel(
     block_table,
     lengths,
+    prompt_lengths,
     slot_first_page,
     slot_anchor,
     slot_anchor_page,
@@ -56,6 +58,7 @@ def _plan_kernel(
     CANDIDATES: tl.constexpr,
     ROWS: tl.constexpr,
     SLOTS: tl.constexpr,
+    HAS_PROMPT_LENGTHS: tl.constexpr,
 ):
     r = tl.arange(0, ROWS)
     s = tl.arange(0, SLOTS)
@@ -73,6 +76,12 @@ def _plan_kernel(
         & (length[:, None] > s_anchor[None, :])
         & (length[:, None] <= s_anchor[None, :] + REUSE_STEPS)
     )
+    if HAS_PROMPT_LENGTHS:
+        prompt_length = tl.load(prompt_lengths + r, live, other=0)
+        # NormalModelInputGatherer publishes the original input length for
+        # decode rows. The first decode includes its first generated token.
+        # This boundary is also visible on a separate P/D decode worker.
+        in_window = in_window & (length[:, None] > prompt_length[:, None] + 1)
     anchor_col = (s_anchor - 1) // PAGE
     page_at = tl.load(
         block_table + r[:, None].to(tl.int64) * TABLE_STRIDE + anchor_col[None, :],
@@ -98,7 +107,9 @@ def _plan_kernel(
 
     tl.store(row_slot + r, slot, live)
     tl.store(pool_lengths + r, tl.where(building, length, 0), live)
-    tl.store(candidate_lengths + r, tl.where(slot >= 0, CANDIDATES, 0), live)
+    # Refresh rows return the original full-context selection; re-scoring
+    # their new pool would be wasted work.
+    tl.store(candidate_lengths + r, tl.where(matched, CANDIDATES, 0), live)
 
     last_page = tl.load(
         block_table + r.to(tl.int64) * TABLE_STRIDE + (length - 1) // PAGE,
@@ -228,19 +239,24 @@ def _count_kernel(
     TARGET: tl.constexpr,
     SCRATCH: tl.constexpr,
     POOL: tl.constexpr,
+    MIN_LENGTH: tl.constexpr,
     SPLITS: tl.constexpr,
 ):
     row = tl.program_id(0)
     seg = tl.program_id(1)
     n = tl.load(pool_lengths + row)
-    if n > POOL:
-        base = logits + row.to(tl.int64) * LOGITS_STRIDE
-        lo = _sample_floor(base, n, TARGET, SCRATCH, SPLITS)
-        if seg == 0:
-            tl.store(floor + row, lo)
-        offs = seg * SEGMENT + tl.arange(0, SEGMENT)
-        x = tl.load(base + offs, offs < n, other=float("-inf"))
-        count = tl.sum(((offs < n) & (x >= lo)).to(tl.int32))
+    if (n > POOL) & (n >= MIN_LENGTH):
+        # Captured tables can span 1M tokens while a request uses far fewer.
+        # Empty segments contribute zero without repeating the floor search.
+        count = tl.full((), 0, tl.int32)
+        if seg * SEGMENT < n:
+            base = logits + row.to(tl.int64) * LOGITS_STRIDE
+            lo = _sample_floor(base, n, TARGET, SCRATCH, SPLITS)
+            if seg == 0:
+                tl.store(floor + row, lo)
+            offs = seg * SEGMENT + tl.arange(0, SEGMENT)
+            x = tl.load(base + offs, offs < n, other=float("-inf"))
+            count = tl.sum(((offs < n) & (x >= lo)).to(tl.int32))
         tl.store(segment_counts + row * SEGMENTS + seg, count)
 
 
@@ -258,12 +274,13 @@ def _compact_kernel(
     SEGMENT: tl.constexpr,
     SCRATCH: tl.constexpr,
     POOL: tl.constexpr,
+    MIN_LENGTH: tl.constexpr,
 ):
     """Logits >= floor, in token order, into the row's scratch."""
     row = tl.program_id(0)
     seg = tl.program_id(1)
     n = tl.load(pool_lengths + row)
-    if (n > POOL) & (seg * SEGMENT < n):
+    if (n > POOL) & (n >= MIN_LENGTH) & (seg * SEGMENT < n):
         s = tl.arange(0, SEGMENTS_P2)
         before = tl.sum(tl.load(segment_counts + row * SEGMENTS + s, s < seg, other=0))
         if before < SCRATCH:
@@ -295,6 +312,7 @@ def _pool_select_kernel(
     SEGMENTS_P2: tl.constexpr,
     SCRATCH: tl.constexpr,
     POOL: tl.constexpr,
+    MIN_LENGTH: tl.constexpr,
     CHUNK: tl.constexpr,
     SPLITS: tl.constexpr,
     PASSES: tl.constexpr,
@@ -305,6 +323,7 @@ def _pool_select_kernel(
     them all."""
     row = tl.program_id(0)
     n = tl.load(pool_lengths + row)
+    n = tl.where(n >= MIN_LENGTH, n, 0)
     if (n > 0) & (n <= POOL):
         out = pool + tl.load(row_slot + row).to(tl.int64) * POOL
         for start in range(0, POOL, CHUNK):
@@ -421,6 +440,8 @@ def _candidate_logits_kernel(
 @triton.jit
 def _choose_kernel(
     candidate_topk,
+    refresh_topk,
+    pool_lengths,
     lengths,
     row_slot,
     pool,
@@ -429,16 +450,19 @@ def _choose_kernel(
     TOPK: tl.constexpr,
     POOL: tl.constexpr,
 ):
-    """Candidate positions back to token indices; -1 for unused entries."""
+    """Keep the original selector on refresh; map candidates on reuse."""
     row = tl.program_id(0)
     k = tl.arange(0, TOPK)
-    slot = tl.load(row_slot + row)
-    c = tl.load(candidate_topk + row * TOPK + k)
-    safe = tl.maximum(slot, 0).to(tl.int64)
-    token, valid = _candidate_token(
-        c, pool, safe, tl.load(slot_anchor + safe), tl.load(lengths + row), POOL
-    )
-    tl.store(out + row * TOPK + k, tl.where(valid & (slot >= 0), token, -1))
+    if tl.load(pool_lengths + row) > 0:
+        tl.store(out + row * TOPK + k, tl.load(refresh_topk + row * TOPK + k))
+    else:
+        slot = tl.load(row_slot + row)
+        c = tl.load(candidate_topk + row * TOPK + k)
+        safe = tl.maximum(slot, 0).to(tl.int64)
+        token, valid = _candidate_token(
+            c, pool, safe, tl.load(slot_anchor + safe), tl.load(lengths + row), POOL
+        )
+        tl.store(out + row * TOPK + k, tl.where(valid & (slot >= 0), token, -1))
 
 
 class IndexerPool:
@@ -476,7 +500,12 @@ class IndexerPool:
     def supports(self, rows: int, block_table: torch.Tensor) -> bool:
         return 0 < rows <= self.slots and block_table.shape[0] == rows
 
-    def plan(self, block_table: torch.Tensor, lengths: torch.Tensor):
+    def plan(
+        self,
+        block_table: torch.Tensor,
+        lengths: torch.Tensor,
+        prompt_lengths: torch.Tensor | None = None,
+    ):
         rows = lengths.numel()
         i32 = dict(dtype=torch.int32, device=lengths.device)
         row_slot = torch.empty((rows,), **i32)
@@ -485,6 +514,7 @@ class IndexerPool:
         _plan_kernel[(1,)](
             block_table,
             lengths,
+            lengths if prompt_lengths is None else prompt_lengths,
             self.first_page,
             self.anchor,
             self.anchor_page,
@@ -500,6 +530,7 @@ class IndexerPool:
             CANDIDATES=self.candidates,
             ROWS=max(triton.next_power_of_2(rows), 16),
             SLOTS=self.slots,
+            HAS_PROMPT_LENGTHS=prompt_lengths is not None,
             num_warps=8,
         )
         return row_slot, pool_lengths, candidate_lengths
@@ -522,6 +553,7 @@ class IndexerPool:
             SEGMENT=SEGMENT,
             SCRATCH=self.scratch,
             POOL=self.pool_size,
+            MIN_LENGTH=self.min_length,
         )
         _count_kernel[(rows, segments)](
             logits,
@@ -559,6 +591,7 @@ class IndexerPool:
             SEGMENTS_P2=triton.next_power_of_2(segments),
             SCRATCH=self.scratch,
             POOL=self.pool_size,
+            MIN_LENGTH=self.min_length,
             CHUNK=2048,
             SPLITS=8,
             PASSES=5,
@@ -608,6 +641,7 @@ class IndexerPool:
         lengths: torch.Tensor,
         full_logits: Callable[[torch.Tensor], torch.Tensor],
         select_topk: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], None],
+        prompt_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Top-2048 token indices per decode row.
 
@@ -620,10 +654,19 @@ class IndexerPool:
         """
         rows, heads, head_dim = q_fp8.shape
         assert head_dim == HEAD_DIM and weights.shape == (rows, heads)
-        row_slot, pool_lengths, candidate_lengths = self.plan(block_table, lengths)
+        row_slot, pool_lengths, candidate_lengths = self.plan(
+            block_table, lengths, prompt_lengths
+        )
         # Rows rebuilding a pool score their full context; others have zero
         # length here and cost nothing.
-        self._build_pools(full_logits(pool_lengths), pool_lengths, row_slot)
+        refresh_logits = full_logits(pool_lengths)
+        self._build_pools(refresh_logits, pool_lengths, row_slot)
+        refresh_topk = torch.empty((rows, TOPK), dtype=torch.int32, device=q_fp8.device)
+        # Re-ranking the refresh pool with a different score reduction and
+        # candidate order can change even exact ties. Return the baseline
+        # selector's original result on refresh rows; zero-length reuse rows
+        # are ignored by the selector and by _choose_kernel.
+        select_topk(refresh_logits, pool_lengths, refresh_topk, refresh_logits.shape[1])
         candidate_logits = self.score_candidates(
             q_fp8, weights, cache, block_table, lengths, row_slot, candidate_lengths
         )
@@ -636,6 +679,8 @@ class IndexerPool:
         result = torch.empty_like(candidate_topk)
         _choose_kernel[(rows,)](
             candidate_topk,
+            refresh_topk,
+            pool_lengths,
             lengths,
             row_slot,
             self.pool,

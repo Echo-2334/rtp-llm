@@ -774,8 +774,19 @@ class IndexerOp(nn.Module):
             and self._pool.supports(q_fp8.shape[0], block_table)
         ):
             return self._get_topk_paged_pool(
-                q_fp8, weights, kv_cache_fp8, block_table, lengths, kvlen_2d
+                q_fp8,
+                weights,
+                kv_cache_fp8,
+                block_table,
+                lengths,
+                kvlen_2d,
+                attention_inputs.input_lengths,
             )
+
+        if self._pool is not None:
+            # A request may enter and leave while a fallback path bypasses
+            # the pool. Do not later revive its predecessor's slot state.
+            self._pool.reset()
 
         if is_multi_token_decode:
             num_tokens = q_fp8.shape[0]
@@ -846,6 +857,7 @@ class IndexerOp(nn.Module):
         block_table: torch.Tensor,
         lengths: torch.Tensor,
         kvlen_2d: torch.Tensor,
+        prompt_lengths: torch.Tensor,
     ) -> torch.Tensor:
         """Single-token decode through the reused Indexer pool."""
         max_seq_len = block_table.shape[1] * self.blocksize
@@ -882,6 +894,7 @@ class IndexerOp(nn.Module):
             lengths,
             full_logits,
             select_topk,
+            prompt_lengths=prompt_lengths,
         )
 
     def _get_topk_ragged(

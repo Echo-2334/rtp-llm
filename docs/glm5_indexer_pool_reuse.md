@@ -1,21 +1,40 @@
 # GLM-5.3 Indexer pool reuse
 
-GLM-5.3 decode runs the DSA Indexer over the whole context on every step. Its
-top-2048 changes slowly between neighbouring steps, so this option builds a
-larger candidate pool on one step and only re-ranks that pool on the next N
-steps:
+GLM-5.3 decode runs the DSA Indexer over the whole context on every step. This
+option approximates later selections by building a larger candidate pool on
+one step and only re-ranking that pool on the next N steps. Quality depends on
+how much the required tokens change between steps:
 
 - **Refresh step:** score the full context (DeepGEMM `fp8_paged_mqa_logits`)
   and keep the top `GLM5_INDEXER_POOL_SIZE` (default 8192) token indices as the
   request's pool.
-- **Every step, refresh included:** score the pool plus the tokens appended
-  since the refresh (at most 63) with a fused Triton kernel that reads the
-  paged FP8 Indexer cache directly. Then select top-2048 with the existing
-  TopK kernel. On a refresh step this is the full-context top-2048, up to
-  near-ties, since Triton and DeepGEMM sum heads in a different order.
+- **Refresh output:** return the original TopK selector's full-context result.
+  Re-ranking the candidate pool can change near-ties and tie ordering, so it
+  must not replace that result on a refresh step.
+- **Reuse output:** score the pool plus the tokens appended since the refresh
+  (at most 63) with a fused Triton kernel reading the paged FP8 Indexer cache,
+  then select top-2048 with the existing TopK kernel.
 - **Short rows:** rows shorter than `GLM5_INDEXER_POOL_MIN_KV_LEN` refresh on
-  every step. Rows of at most 8192 tokens keep all their tokens in the pool,
-  so their results stay exact.
+  every step and return the original full-context TopK result without building
+  a candidate pool.
+
+Refresh rows skip candidate scoring/selection work. Row lengths select full
+or candidate work on device, keeping mixed refresh/reuse rows compatible with
+CUDA graphs. The revised implementation's latency is being measured.
+
+## Accuracy investigation in progress (2026-10-27)
+
+A subsequent uncapped-output run on the same 100 frozen, approximately 48K
+CWE prompts scored 9.2% answer-word recall for baseline and 1.6% for 8K/N15,
+with 67 and 69 confirmed generation loops counted as zero. Baseline itself is
+abnormal: its first eight prompts scored 87.5%, the remaining 92 scored 2.39%.
+This is a diagnostic clue, not proof of a request-state bug. The root cause is
+under investigation; neither this run nor kernel tests establishes healthy
+model quality or end-to-end alignment.
+
+Current changes address two independent correctness boundaries: request page
+recycling and exact refresh selection. They have not yet been evaluated on the
+100-prompt end-to-end run. The latency and recall tables below predate them.
 
 ## End-to-end status (2026-10-27)
 
@@ -92,8 +111,15 @@ changes:
 - the page that held the refresh step's last token, which was private to the
   request when the pool was built.
 
-A reordered or shrunk batch therefore finds its pools again, and a new request
-never inherits one. Padded graph rows have zero length and do no work.
+A reordered or shrunk decode batch therefore finds its pools again. Physical
+pages alone do not identify a request: a new request can recycle both pages.
+Prefill resets pools, and decode's original input-length metadata forces
+the first decode step to refresh, including on a separate P/D decode worker.
+An oversized decode batch or MTP verify/extend path also resets pools, so later
+supported batches cannot revive stale slots. This includes MTP's key-only fast
+path: a new request can reach ordinary decode after its initial prompt+1 step.
+Other live rows rebuild after a reset. Padded graph rows have zero length and
+do no work.
 
 ## Kernels per step (per Indexer layer)
 
@@ -101,24 +127,31 @@ never inherits one. Padded graph rows have zero length and do no work.
 |---|---|
 | plan | One program. Matches rows to slots, assigns free slots, emits per-row lengths |
 | DeepGEMM metadata + logits | Lengths are zero for rows that reuse their pool, so a reuse step does no work here |
-| count / compact / select | Builds the pool. A sampled floor keeps about 2× the pool size per row, compacted in token order by 4096-token segments; an exact multiway bisection then picks the top pool size |
-| candidate logits | Fused gather + FP8 dot over pool + appended tokens |
-| TopK + map | Existing `dsv4_persistent_topk` (or `topk_v3`), then candidates back to token indices |
+| count / compact / select | Builds the pool for refresh rows at or above the minimum length. A sampled floor keeps about 2× the pool size per row, compacted in token order by 4096-token segments; multiway bisection then picks the pool, allowing near-tie swaps |
+| candidate logits | On reuse rows only: fused gather + dot over FP8 pool keys and appended tokens |
+| Full TopK | Existing selector on refresh rows; zero-length reuse rows are ignored |
+| Candidate TopK + map | Existing selector, then candidate positions back to token indices; refresh rows retain full TopK |
 
 ## Kernel validation (eval80, L20D, DeepGEMM 2.8.0+6d6aaad)
 
-`test/test_indexer_pool_reuse.py` (7 tests) and
-`test/test_indexer_pool_deepgemm.py` (3 tests) pass. They cover:
+`test/test_indexer_pool_reuse.py` (10 tests),
+`test/test_indexer_pool_deepgemm.py` (3 tests), and the hybrid module's
+`test/indexer_pool_lifecycle_test.py` (6 tests) pass together. They cover:
 
 - candidate logits against a torch reference and against DeepGEMM, within 2e-5;
-- refresh steps against the original Indexer;
+- refresh steps preserving the original selector, including a deterministic
+  tie policy; independent persistent TopK calls may reorder an identical set;
 - pools against the exact top-8192;
 - reordered, new, short and changed-page rows;
 - slot recycling;
 - 4K and 16K pools;
-- CUDA graph replay at batch sizes 1, 4, 8 and 16 against eager.
+- CUDA graph replay at batch sizes 1, 4, 8 and 16 against eager;
+- page recycling at prefill, first decode without local prefill, and oversized
+  batch fallback, including the production Indexer entry;
+- MTP key-only and paged-backend fallback boundaries;
+- crossing the minimum KV length after skipping pool construction.
 
-## Latency per Indexer layer, CUDA graph, N = 15
+## Historical latency per Indexer layer, CUDA graph, N = 15
 
 From `test/bench_indexer_pool_reuse.py`; "avg" is (refresh + 15 reuse) / 16.
 

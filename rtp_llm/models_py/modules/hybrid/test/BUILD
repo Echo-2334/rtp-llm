@@ -111,6 +111,14 @@ py_test(
 )
 
 py_test(
+    name = "indexer_pool_lifecycle_test",
+    srcs = ["indexer_pool_lifecycle_test.py"],
+    deps = py_test_deps + ["//rtp_llm:testlib"],
+    tags = ["open_skip", "H20"],
+    exec_properties = {"gpu": "H20"},
+)
+
+py_test(
     name = "test_dense_mlp_fp8_silu_fusion",
     srcs = ["test_dense_mlp_fp8_silu_fusion.py"],
     deps = py_test_deps,

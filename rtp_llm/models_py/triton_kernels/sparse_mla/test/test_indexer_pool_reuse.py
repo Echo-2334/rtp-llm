@@ -121,6 +121,53 @@ def near_equal(test, out, exact, slack=4):
 
 
 class IndexerPoolTest(unittest.TestCase):
+    def test_first_decode_rebuilds_without_local_prefill(self):
+        pool = IndexerPool(slots=4, reuse_steps=15, min_length=16384, device="cuda")
+        table = torch.arange(400, dtype=torch.int32, device="cuda").view(1, -1)
+        lengths = torch.tensor([20000], dtype=torch.int32, device="cuda")
+        prompt = torch.tensor([19000], dtype=torch.int32, device="cuda")
+        pool.plan(table, lengths, prompt)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _, refresh, _ = pool.plan(table, lengths, prompt)
+        # A P/D decode worker need not see the new request's prefill. Its
+        # initial input length distinguishes the first decode after recycling.
+        lengths.fill_(20001)
+        prompt.fill_(20000)
+        graph.replay()
+        self.assertEqual(refresh.tolist(), [20001])
+        lengths.add_(1)
+        graph.replay()
+        self.assertEqual(refresh.tolist(), [0])
+
+    def test_refresh_preserves_original_selection_for_ties(self):
+        batch = Batch([20000, 23000], table_cols=400, pages=1024)
+        pool = IndexerPool(slots=4, reuse_steps=3, min_length=16384, device="cuda")
+        table, lengths = batch.inputs([0, 1])
+        q, w = make_query(2)
+        q.zero_()
+
+        def full_logits(n):
+            return reference_logits(q, w, batch.cache, table, n, batch.max_len)
+
+        def select_tail_ties(logits, n, out, max_len):
+            # A valid exact selector with a deterministic later-position tie
+            # rule. Candidate compaction must not silently replace its rule.
+            cols = torch.arange(logits.shape[1], device="cuda")[None, :]
+            masked = torch.where(cols < n[:, None], logits, float("-inf"))
+            order = torch.argsort(masked.flip(1), dim=1, descending=True, stable=True)
+            indices = logits.shape[1] - 1 - order[:, :TOPK]
+            out.copy_(torch.where(indices < n[:, None], indices, -1).int())
+
+        out = pool.topk(
+            q, w, batch.cache, table, lengths, full_logits, select_tail_ties
+        )
+        exact = torch.empty_like(out)
+        select_tail_ties(full_logits(lengths), lengths, exact, batch.max_len)
+        # Equal Indexer scores do not imply equal MLA values. Preserve the
+        # baseline tie choice and ordering instead of choosing within 8K.
+        self.assertTrue(torch.equal(out, exact))
+
     def test_refresh_is_exact_then_reuse_selects_from_pool(self):
         batch = Batch([20000, 30000, 17000], table_cols=480, pages=2048)
         pool = IndexerPool(slots=8, reuse_steps=3, min_length=16384, device="cuda")
@@ -237,7 +284,7 @@ class IndexerPoolTest(unittest.TestCase):
         table, lengths = batch.inputs([2, 0, 4, 3])
         row_slot, rebuild, candidates = pool.plan(table, lengths)
         self.assertEqual(rebuild.tolist(), [0, 0, batch.lengths[4], batch.lengths[3]])
-        self.assertEqual(candidates.tolist(), [CANDIDATES] * 4)
+        self.assertEqual(candidates.tolist(), [CANDIDATES, CANDIDATES, 0, 0])
         self.assertEqual(len(set(row_slot.tolist())), 4)
         # A row whose pages changed is a different request.
         batch.lengths = [n + 1 for n in batch.lengths]
@@ -266,6 +313,24 @@ class IndexerPoolTest(unittest.TestCase):
             row_slot, rebuild, _ = pool.plan(table, lengths)
             self.assertEqual(rebuild.tolist(), lengths.tolist())
             self.assertEqual(sorted(row_slot.tolist()), [0, 1, 2, 3])
+
+    def test_crossing_minimum_length_builds_before_reuse(self):
+        batch = Batch([16383], table_cols=300, pages=512, seed=19)
+        pool = IndexerPool(slots=4, reuse_steps=3, min_length=16384, device="cuda")
+        for step in range(3):
+            out, exact, full, _ = run(pool, batch, [0], seed=91 + step)
+            if step < 2:
+                self.assertEqual(full.tolist(), batch.lengths)
+                self.assertTrue(torch.equal(out, exact))
+            else:
+                self.assertEqual(full.tolist(), [0])
+                slot = pool.anchor.tolist().index(16384)
+                members = pool.pool[slot].tolist()
+                self.assertEqual(len(set(members)), POOL)
+                self.assertGreaterEqual(min(members), 0)
+                self.assertLess(max(members), 16384)
+                self.assertTrue(set(out[0].tolist()) <= set(members) | {16384})
+            batch.lengths[0] += 1
 
     def test_cuda_graph_multi_batch_matches_eager(self):
         # Lengths stay within the 360-page tables for all 12 steps.

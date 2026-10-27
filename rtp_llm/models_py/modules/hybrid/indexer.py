@@ -380,6 +380,19 @@ class Indexer(nn.Module):
         q_c_fp8: Optional[torch.Tensor] = None,
         q_c_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Physical pages can be recycled between requests. Page identity and a
+        # nearby sequence length alone cannot distinguish a new request from
+        # the one that built the pool. Invalidate at prefill and MTP boundaries;
+        # these paths can admit requests without running the pool planner.
+        # Other live decode rows safely rebuild on their next step.
+        pool = getattr(self.indexer_op, "_pool", None)
+        if pool is not None and (
+            attention_inputs.is_prefill
+            or getattr(attention_inputs, "is_target_verify", False)
+            or getattr(attention_inputs, "is_draft_extend", False)
+        ):
+            pool.reset()
+
         if use_fast_path:
             key = self._get_k_bf16(hidden_states, fmha_params)
             self.indexer_op.quant_k_only(key, kv_cache, fmha_params.slot_mapping)
