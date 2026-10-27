@@ -17,6 +17,50 @@ steps:
   every step. Rows of at most 8192 tokens keep all their tokens in the pool,
   so their results stay exact.
 
+## End-to-end status (2026-10-27)
+
+The 8K pool / N=15 implementation completes end-to-end inference, but has
+**not passed quality validation**. Keep it experimental and disabled by default.
+
+On eval80, the baseline and pool runs used the same GLM-5.3 model, FP8 KV,
+DP8/EP8, CUDA graphs (capture sizes 1/2/4/8), and 47,740–48,124-token inputs.
+The only difference in saved service settings was
+`GLM5_INDEXER_POOL_REUSE_STEPS=15`. Logs contain 168 pool initialization
+messages (21 Indexer layers × 8 ranks), with pool=8192, reuse=15,
+min-KV=16384 and slots=128, plus CUDA graph capture messages for both runs.
+These logs confirm configuration and initialization; they are not per-step
+refresh/reuse counters.
+
+| Metric | Baseline | Pool 8K, N=15 |
+|---|---:|---:|
+| RULER-CWE answer-word recall, 24 prompts | 0.5875 | 0.3417 |
+| RULER request errors | 0/24 | 0/24 |
+| Decode latency median, ms/token | 16.5654 | 19.6208 |
+| Decode latency mean, ms/token | 16.5713 | 19.9204 |
+| Decode request errors | 0/64 | 0/64 |
+
+Decode used 64 concurrent requests across 8 DP frontends, each generating
+exactly 512 tokens. Latency is the per-request server-reported
+`(cost_time - first_token_cost_time) / (output_len - 1)`, then aggregated
+across requests. Median latency increased 18.44%; mean increased 20.21%.
+This is one end-to-end run, not an isolated kernel timing or a scaling study.
+
+RULER used greedy generation limited to 120 new tokens. Scores measure the
+fraction of ten answer words present in that output, not full-answer accuracy.
+Paired scores improved for 6 prompts, tied for 4, and worsened for 14.
+Eight pool outputs repeated `</think>` 120 times (none in baseline);
+other pool outputs also included repetition or irrelevant answers. Therefore
+the observed regression cannot be explained solely by the output length cap.
+The root cause (approximation versus an implementation/state issue) remains
+unresolved; successful requests and kernel tests do not prove model quality.
+
+The tested remote commit was `346f1713c70b6fdb8d040a8af66e2b629935ffd2`;
+its tree equals local commit `f714a35a4e305a26d8019647c4b68718cf00ef72`.
+The subsequent formatting commit `15025aeda6c7928320394177b316aba2f4126d9a`
+preserves the Python AST of every changed file. The run completed at
+14:16 CST. Remote evidence is under `/opt/src/glm53-pool-build/e2e/`, in
+`run-base` and `run-pool8k` (settings, logs, RULER outputs, and decode JSON).
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -61,7 +105,7 @@ never inherits one. Padded graph rows have zero length and do no work.
 | candidate logits | Fused gather + FP8 dot over pool + appended tokens |
 | TopK + map | Existing `dsv4_persistent_topk` (or `topk_v3`), then candidates back to token indices |
 
-## Validation (eval80, L20D SM89, DeepGEMM 2.8.0+6d6aaad)
+## Kernel validation (eval80, L20D, DeepGEMM 2.8.0+6d6aaad)
 
 `test/test_indexer_pool_reuse.py` (7 tests) and
 `test/test_indexer_pool_deepgemm.py` (3 tests) pass. They cover:
@@ -89,6 +133,11 @@ From `test/bench_indexer_pool_reuse.py`; "avg" is (refresh + 15 reuse) / 16.
 
 ## Recall on real decode logits
 
+**Historical diagnostic only:** these logits were later found to come from
+an older clustered-NVFP4 runtime whose generated outputs were corrupted.
+Do not use the following numbers as validated model recall or accuracy.
+The end-to-end results above supersede the earlier pending-evaluation status.
+
 Run with `test/replay_indexer_pool_recall.py` on 3 RULER-CWE requests at about
 130K context: 21 layers × 119 decode steps. Recall is the share of the
 selected top-2048 whose logit reaches the exact 2048-th logit.
@@ -104,4 +153,4 @@ selected top-2048 whose logit reaches the exact 2048-th logit.
 Recall barely depends on the distance from the refresh: one step after it, the
 mean is already 0.82. The loss comes from steps where the Indexer's target
 moves to a region outside the pool, so a larger pool helps more than a smaller
-N. Accuracy on target tasks still needs an end-to-end evaluation.
+N within this historical dataset. This does not establish task accuracy.
