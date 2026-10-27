@@ -26,7 +26,9 @@ def make_cache(pages, seed=0):
 
 def make_query(rows, seed=1):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    q = (torch.randn((rows, HEADS, 128), device="cuda", generator=g)).to(torch.float8_e4m3fn)
+    q = (torch.randn((rows, HEADS, 128), device="cuda", generator=g)).to(
+        torch.float8_e4m3fn
+    )
     w = torch.randn((rows, HEADS), device="cuda", generator=g) / HEADS
     return q, w
 
@@ -37,9 +39,17 @@ def reference_logits(q, w, cache, table, lengths, max_len):
     page = table[:, token // PAGE].long()
     base = page * PAGE_BYTES
     flat = cache.view(-1)
-    key_offsets = base[..., None] + ((token % PAGE) * 128)[None, :, None] + torch.arange(128, device="cuda")
+    key_offsets = (
+        base[..., None]
+        + ((token % PAGE) * 128)[None, :, None]
+        + torch.arange(128, device="cuda")
+    )
     keys = flat[key_offsets].view(torch.float8_e4m3fn).float()
-    scale_offsets = base[..., None] + (PAGE * 128 + (token % PAGE) * 4)[None, :, None] + torch.arange(4, device="cuda")
+    scale_offsets = (
+        base[..., None]
+        + (PAGE * 128 + (token % PAGE) * 4)[None, :, None]
+        + torch.arange(4, device="cuda")
+    )
     scales = flat[scale_offsets].contiguous().view(torch.float32)[..., 0]
     score = torch.einsum("rhd,rld->rhl", q.float(), keys)
     logits = (score.clamp_min(0) * w[:, :, None]).sum(1) * scales
@@ -63,13 +73,20 @@ class Batch:
         self.cache = make_cache(pages, seed)
         g = torch.Generator().manual_seed(seed)
         perm = torch.randperm(pages, generator=g)
-        self.tables = perm[: len(lengths) * table_cols].view(len(lengths), table_cols).int().cuda()
+        self.tables = (
+            perm[: len(lengths) * table_cols]
+            .view(len(lengths), table_cols)
+            .int()
+            .cuda()
+        )
         self.lengths = list(lengths)
         self.max_len = table_cols * PAGE
 
     def inputs(self, order):
         table = self.tables[order].contiguous()
-        lengths = torch.tensor([self.lengths[i] for i in order], dtype=torch.int32, device="cuda")
+        lengths = torch.tensor(
+            [self.lengths[i] for i in order], dtype=torch.int32, device="cuda"
+        )
         return table, lengths
 
 
@@ -84,7 +101,12 @@ def run(pool, batch, order, seed):
 
     out = pool.topk(q, w, batch.cache, table, lengths, full_logits, select_topk)
     exact = torch.empty_like(out)
-    select_topk(reference_logits(q, w, batch.cache, table, lengths, batch.max_len), lengths, exact, batch.max_len)
+    select_topk(
+        reference_logits(q, w, batch.cache, table, lengths, batch.max_len),
+        lengths,
+        exact,
+        batch.max_len,
+    )
     return out, exact, calls[0], (q, w, table, lengths)
 
 
@@ -117,16 +139,22 @@ class IndexerPoolTest(unittest.TestCase):
 
         for step in range(1, 4):
             batch.lengths = [n + 1 for n in batch.lengths]
-            out, exact, full, (q, w, table, lengths) = run(pool, batch, [0, 1, 2], seed=10 + step)
+            out, exact, full, (q, w, table, lengths) = run(
+                pool, batch, [0, 1, 2], seed=10 + step
+            )
             self.assertEqual(full.tolist(), [0, 0, 0])
             logits = reference_logits(q, w, batch.cache, table, lengths, batch.max_len)
             for row in range(3):
                 slot = pool.anchor.tolist().index(batch.lengths[row] - step)
-                candidates = pool.pool[slot].tolist() + list(range(batch.lengths[row] - step, batch.lengths[row]))
+                candidates = pool.pool[slot].tolist() + list(
+                    range(batch.lengths[row] - step, batch.lengths[row])
+                )
                 candidates = torch.tensor(candidates, device="cuda")
                 expected = candidates[logits[row, candidates].topk(TOPK).indices]
                 # Summation order differs from the reference; only near-ties may swap.
-                self.assertLessEqual(len(set(out[row].tolist()) ^ set(expected.tolist())), 4)
+                self.assertLessEqual(
+                    len(set(out[row].tolist()) ^ set(expected.tolist())), 4
+                )
                 # Appended tokens are candidates on reuse steps.
                 self.assertTrue(set(out[row].tolist()) <= set(candidates.tolist()))
 
@@ -139,14 +167,28 @@ class IndexerPoolTest(unittest.TestCase):
         for pool_size in (4096, 16384):
             with self.subTest(pool_size=pool_size):
                 batch = Batch([40000, 23000], table_cols=700, pages=2048, seed=12)
-                pool = IndexerPool(slots=4, reuse_steps=2, min_length=16384, device="cuda", pool_size=pool_size)
-                out, exact, _, (q, w, table, lengths) = run(pool, batch, [0, 1], seed=40)
+                pool = IndexerPool(
+                    slots=4,
+                    reuse_steps=2,
+                    min_length=16384,
+                    device="cuda",
+                    pool_size=pool_size,
+                )
+                out, exact, _, (q, w, table, lengths) = run(
+                    pool, batch, [0, 1], seed=40
+                )
                 near_equal(self, out, exact)
-                top = reference_logits(q, w, batch.cache, table, lengths, batch.max_len).topk(pool_size, dim=1).indices
+                top = (
+                    reference_logits(q, w, batch.cache, table, lengths, batch.max_len)
+                    .topk(pool_size, dim=1)
+                    .indices
+                )
                 for row in range(2):
                     slot = pool.anchor.tolist().index(batch.lengths[row])
                     members = set(pool.pool[slot].tolist())
-                    self.assertGreaterEqual(len(members & set(top[row].tolist())), pool_size - 8)
+                    self.assertGreaterEqual(
+                        len(members & set(top[row].tolist())), pool_size - 8
+                    )
                 batch.lengths = [n + 1 for n in batch.lengths]
                 out, _, full, _ = run(pool, batch, [0, 1], seed=41)
                 self.assertEqual(full.tolist(), [0, 0])
@@ -164,17 +206,28 @@ class IndexerPoolTest(unittest.TestCase):
         table, lengths = batch.inputs([1, 0])
         row_slot, rebuild, candidate_lengths = pool.plan(table, lengths)
         self.assertEqual(rebuild.tolist(), [0, 0])
-        logits = pool.score_candidates(q, w, batch.cache, table, lengths, row_slot, candidate_lengths)
+        logits = pool.score_candidates(
+            q, w, batch.cache, table, lengths, row_slot, candidate_lengths
+        )
         dense = reference_logits(q, w, batch.cache, table, lengths, batch.max_len)
         for row in range(2):
             slot = row_slot[row].item()
             anchor = pool.anchor[slot].item()
-            tokens = torch.cat([pool.pool[slot], torch.arange(anchor, anchor + 9, device="cuda", dtype=torch.int32)])
-            torch.testing.assert_close(logits[row, : POOL + 9], dense[row, tokens.long()], rtol=1e-5, atol=1e-5)
+            tokens = torch.cat(
+                [
+                    pool.pool[slot],
+                    torch.arange(anchor, anchor + 9, device="cuda", dtype=torch.int32),
+                ]
+            )
+            torch.testing.assert_close(
+                logits[row, : POOL + 9], dense[row, tokens.long()], rtol=1e-5, atol=1e-5
+            )
             self.assertTrue(torch.isneginf(logits[row, POOL + 9 :]).all())
 
     def test_reordered_new_and_short_rows(self):
-        batch = Batch([20000, 21000, 22000, 9000, 23000], table_cols=400, pages=4096, seed=7)
+        batch = Batch(
+            [20000, 21000, 22000, 9000, 23000], table_cols=400, pages=4096, seed=7
+        )
         pool = IndexerPool(slots=8, reuse_steps=15, min_length=16384, device="cuda")
         table, lengths = batch.inputs([0, 1, 2, 3])
         pool.plan(table, lengths)
@@ -205,7 +258,9 @@ class IndexerPoolTest(unittest.TestCase):
 
     def test_slots_recycle_without_running_out(self):
         pool = IndexerPool(slots=4, reuse_steps=2, min_length=16384, device="cuda")
-        batch = Batch([17000 + 100 * i for i in range(16)], table_cols=300, pages=4800, seed=9)
+        batch = Batch(
+            [17000 + 100 * i for i in range(16)], table_cols=300, pages=4800, seed=9
+        )
         for start in range(0, 16, 4):
             table, lengths = batch.inputs(list(range(start, start + 4)))
             row_slot, rebuild, _ = pool.plan(table, lengths)
@@ -214,13 +269,21 @@ class IndexerPoolTest(unittest.TestCase):
 
     def test_cuda_graph_multi_batch_matches_eager(self):
         # Lengths stay within the 360-page tables for all 12 steps.
-        batch = Batch([17000 + 697 * i for i in range(8)], table_cols=360, pages=4096, seed=11)
-        graph_pool = IndexerPool(slots=8, reuse_steps=4, min_length=16384, device="cuda")
-        eager_pool = IndexerPool(slots=8, reuse_steps=4, min_length=16384, device="cuda")
+        batch = Batch(
+            [17000 + 697 * i for i in range(8)], table_cols=360, pages=4096, seed=11
+        )
+        graph_pool = IndexerPool(
+            slots=8, reuse_steps=4, min_length=16384, device="cuda"
+        )
+        eager_pool = IndexerPool(
+            slots=8, reuse_steps=4, min_length=16384, device="cuda"
+        )
         graphs = {}
         for rows in (4, 8):
             static = dict(
-                q=torch.zeros((rows, HEADS, 128), device="cuda").to(torch.float8_e4m3fn),
+                q=torch.zeros((rows, HEADS, 128), device="cuda").to(
+                    torch.float8_e4m3fn
+                ),
                 w=torch.zeros((rows, HEADS), device="cuda"),
                 table=torch.zeros((rows, 360), dtype=torch.int32, device="cuda"),
                 lengths=torch.zeros((rows,), dtype=torch.int32, device="cuda"),
@@ -233,7 +296,9 @@ class IndexerPoolTest(unittest.TestCase):
                     batch.cache,
                     s["table"],
                     s["lengths"],
-                    lambda n: reference_logits(s["q"], s["w"], batch.cache, s["table"], n, batch.max_len),
+                    lambda n: reference_logits(
+                        s["q"], s["w"], batch.cache, s["table"], n, batch.max_len
+                    ),
                     select_topk,
                 )
 
@@ -248,7 +313,13 @@ class IndexerPoolTest(unittest.TestCase):
             graphs[rows] = (graph, static, out)
         graph_pool.reset()
 
-        orders = [list(range(8)), [3, 1, 0, 2], list(range(8)), [7, 6, 5, 4, 3, 2, 1, 0], [0, 2, 4, 6]]
+        orders = [
+            list(range(8)),
+            [3, 1, 0, 2],
+            list(range(8)),
+            [7, 6, 5, 4, 3, 2, 1, 0],
+            [0, 2, 4, 6],
+        ]
         for step_idx in range(12):
             order = orders[step_idx % len(orders)]
             graph, static, out = graphs[len(order)]

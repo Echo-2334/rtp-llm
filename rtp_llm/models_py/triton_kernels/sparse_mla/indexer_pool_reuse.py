@@ -80,9 +80,7 @@ def _plan_kernel(
         other=-2,
     )
     match = (
-        in_window
-        & (first[:, None] == s_first[None, :])
-        & (page_at == s_page[None, :])
+        in_window & (first[:, None] == s_first[None, :]) & (page_at == s_page[None, :])
     )
     found = tl.min(tl.where(match, s[None, :], SLOTS), axis=1)
     matched = found < SLOTS
@@ -192,7 +190,9 @@ def _select_into(
 
 
 @triton.jit
-def _sample_floor(base, n, TARGET: tl.constexpr, SCRATCH: tl.constexpr, SPLITS: tl.constexpr):
+def _sample_floor(
+    base, n, TARGET: tl.constexpr, SCRATCH: tl.constexpr, SPLITS: tl.constexpr
+):
     """A logit floor that about TARGET of the row's n logits reach, from 16
     evenly spaced 128-logit blocks; -inf for rows of at most TARGET."""
     b = tl.arange(0, 16)
@@ -210,7 +210,9 @@ def _sample_floor(base, n, TARGET: tl.constexpr, SCRATCH: tl.constexpr, SPLITS: 
         counts = tl.sum(tl.sum(hits.to(tl.int32), axis=2), axis=1)
         last = tl.max(tl.where(counts >= rank, j, -1))
         lo = tl.maximum(lo, tl.max(tl.where(j == last, thresholds, float("-inf"))))
-        top = tl.where(last + 1 < SPLITS, tl.sum(tl.where(j == last + 1, thresholds, 0.0)), top)
+        top = tl.where(
+            last + 1 < SPLITS, tl.sum(tl.where(j == last + 1, thresholds, 0.0)), top
+        )
     return tl.where(long_row, lo, float("-inf"))
 
 
@@ -267,7 +269,11 @@ def _compact_kernel(
         if before < SCRATCH:
             lo = tl.load(floor + row)
             offs = seg * SEGMENT + tl.arange(0, SEGMENT)
-            x = tl.load(logits + row.to(tl.int64) * LOGITS_STRIDE + offs, offs < n, other=float("-inf"))
+            x = tl.load(
+                logits + row.to(tl.int64) * LOGITS_STRIDE + offs,
+                offs < n,
+                other=float("-inf"),
+            )
             keep = (offs < n) & (x >= lo)
             at = before + tl.cumsum(keep.to(tl.int32), 0) - 1
             keep = keep & (at < SCRATCH)
@@ -306,18 +312,33 @@ def _pool_select_kernel(
             tl.store(out + token, tl.where(token < n, token, -1))
     if n > POOL:
         s = tl.arange(0, SEGMENTS_P2)
-        kept = tl.sum(tl.load(segment_counts + row * SEGMENTS + s, s < SEGMENTS, other=0))
+        kept = tl.sum(
+            tl.load(segment_counts + row * SEGMENTS + s, s < SEGMENTS, other=0)
+        )
         out = pool + tl.load(row_slot + row).to(tl.int64) * POOL
         if (kept >= POOL) & (kept <= SCRATCH):
             _select_into(
                 scratch_values + row.to(tl.int64) * SCRATCH,
                 scratch_tokens + row.to(tl.int64) * SCRATCH,
-                kept, out, POOL, CHUNK, SPLITS, PASSES, True,
+                kept,
+                out,
+                POOL,
+                CHUNK,
+                SPLITS,
+                PASSES,
+                True,
             )
         else:
             _select_into(
                 logits + row.to(tl.int64) * LOGITS_STRIDE,
-                scratch_tokens, n, out, POOL, CHUNK, SPLITS, PASSES, False,
+                scratch_tokens,
+                n,
+                out,
+                POOL,
+                CHUNK,
+                SPLITS,
+                PASSES,
+                False,
             )
 
 
@@ -382,7 +403,9 @@ def _candidate_logits_kernel(
             other=0.0,
         )
         h = tl.arange(0, HEADS)
-        query = tl.load(q + row.to(tl.int64) * HEADS * HEAD_DIM + h[:, None] * HEAD_DIM + d[None, :])
+        query = tl.load(
+            q + row.to(tl.int64) * HEADS * HEAD_DIM + h[:, None] * HEAD_DIM + d[None, :]
+        )
         # E4M3 values and their products are exact in fp16/fp32.
         score = tl.dot(
             query.to(tl.float16), tl.trans(k.to(tl.float16)), out_dtype=tl.float32
@@ -421,7 +444,14 @@ def _choose_kernel(
 class IndexerPool:
     """Per-layer pool slots, allocated before CUDA graph capture."""
 
-    def __init__(self, slots: int, reuse_steps: int, min_length: int, device, pool_size: int = POOL):
+    def __init__(
+        self,
+        slots: int,
+        reuse_steps: int,
+        min_length: int,
+        device,
+        pool_size: int = POOL,
+    ):
         if not 1 <= reuse_steps < TAIL:
             raise ValueError(f"reuse_steps must be in [1, {TAIL - 1}]")
         if slots <= 0 or slots & (slots - 1):
@@ -478,24 +508,61 @@ class IndexerPool:
         rows, width = logits.shape
         segments = triton.cdiv(width, SEGMENT)
         floor = torch.empty((rows,), dtype=torch.float32, device=logits.device)
-        segment_counts = torch.empty((rows, segments), dtype=torch.int32, device=logits.device)
-        scratch_values = torch.empty((rows, self.scratch), dtype=torch.float32, device=logits.device)
-        scratch_tokens = torch.empty((rows, self.scratch), dtype=torch.int32, device=logits.device)
-        common = dict(SEGMENTS=segments, SEGMENT=SEGMENT, SCRATCH=self.scratch, POOL=self.pool_size)
+        segment_counts = torch.empty(
+            (rows, segments), dtype=torch.int32, device=logits.device
+        )
+        scratch_values = torch.empty(
+            (rows, self.scratch), dtype=torch.float32, device=logits.device
+        )
+        scratch_tokens = torch.empty(
+            (rows, self.scratch), dtype=torch.int32, device=logits.device
+        )
+        common = dict(
+            SEGMENTS=segments,
+            SEGMENT=SEGMENT,
+            SCRATCH=self.scratch,
+            POOL=self.pool_size,
+        )
         _count_kernel[(rows, segments)](
-            logits, logits.stride(0), pool_lengths, floor, segment_counts,
-            TARGET=2 * self.pool_size, SPLITS=16, num_warps=4, **common,
+            logits,
+            logits.stride(0),
+            pool_lengths,
+            floor,
+            segment_counts,
+            TARGET=2 * self.pool_size,
+            SPLITS=16,
+            num_warps=4,
+            **common,
         )
         _compact_kernel[(rows, segments)](
-            logits, logits.stride(0), pool_lengths, floor, segment_counts,
-            scratch_values, scratch_tokens,
-            SEGMENTS_P2=triton.next_power_of_2(segments), num_warps=4, **common,
+            logits,
+            logits.stride(0),
+            pool_lengths,
+            floor,
+            segment_counts,
+            scratch_values,
+            scratch_tokens,
+            SEGMENTS_P2=triton.next_power_of_2(segments),
+            num_warps=4,
+            **common,
         )
         _pool_select_kernel[(rows,)](
-            logits, logits.stride(0), pool_lengths, segment_counts,
-            scratch_values, scratch_tokens, row_slot, self.pool,
-            SEGMENTS=segments, SEGMENTS_P2=triton.next_power_of_2(segments),
-            SCRATCH=self.scratch, POOL=self.pool_size, CHUNK=2048, SPLITS=8, PASSES=5, num_warps=8,
+            logits,
+            logits.stride(0),
+            pool_lengths,
+            segment_counts,
+            scratch_values,
+            scratch_tokens,
+            row_slot,
+            self.pool,
+            SEGMENTS=segments,
+            SEGMENTS_P2=triton.next_power_of_2(segments),
+            SCRATCH=self.scratch,
+            POOL=self.pool_size,
+            CHUNK=2048,
+            SPLITS=8,
+            PASSES=5,
+            num_warps=8,
         )
 
     def score_candidates(
@@ -505,7 +572,9 @@ class IndexerPool:
         tokens; -inf for unused candidates. Rows with zero candidate length
         are left unwritten."""
         rows, heads, _ = q_fp8.shape
-        logits = torch.empty((rows, self.candidates), dtype=torch.float32, device=q_fp8.device)
+        logits = torch.empty(
+            (rows, self.candidates), dtype=torch.float32, device=q_fp8.device
+        )
         _candidate_logits_kernel[(rows, self.candidates // CANDIDATE_TILE)](
             q_fp8,
             weights,
@@ -558,8 +627,12 @@ class IndexerPool:
         candidate_logits = self.score_candidates(
             q_fp8, weights, cache, block_table, lengths, row_slot, candidate_lengths
         )
-        candidate_topk = torch.empty((rows, TOPK), dtype=torch.int32, device=q_fp8.device)
-        select_topk(candidate_logits, candidate_lengths, candidate_topk, self.candidates)
+        candidate_topk = torch.empty(
+            (rows, TOPK), dtype=torch.int32, device=q_fp8.device
+        )
+        select_topk(
+            candidate_logits, candidate_lengths, candidate_topk, self.candidates
+        )
         result = torch.empty_like(candidate_topk)
         _choose_kernel[(rows,)](
             candidate_topk,

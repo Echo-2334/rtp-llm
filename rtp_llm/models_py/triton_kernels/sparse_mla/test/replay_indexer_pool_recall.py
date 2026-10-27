@@ -36,7 +36,9 @@ def main():
     p.add_argument("--pools", default="8192,16384,32768")
     p.add_argument("--steps", default="4,15")
     args = p.parse_args()
-    configs = [(int(a), int(b)) for a in args.pools.split(",") for b in args.steps.split(",")]
+    configs = [
+        (int(a), int(b)) for a in args.pools.split(",") for b in args.steps.split(",")
+    ]
     recall = collections.defaultdict(list)
     per_layer = collections.defaultdict(list)
     stale = collections.defaultdict(list)
@@ -49,7 +51,13 @@ def main():
         for layer, records in sorted(by_layer.items()):
             data = np.memmap(f"{prefix}-layer{layer}.f16", dtype=np.float16, mode="r")
             steps = [
-                torch.from_numpy(np.array(data[r["offset_bytes"] // 2 : r["offset_bytes"] // 2 + r["count"]]))
+                torch.from_numpy(
+                    np.array(
+                        data[
+                            r["offset_bytes"] // 2 : r["offset_bytes"] // 2 + r["count"]
+                        ]
+                    )
+                )
                 .cuda()
                 .float()
                 for r in records
