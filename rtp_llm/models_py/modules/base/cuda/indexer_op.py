@@ -1,5 +1,6 @@
 """CUDA-specific indexer operations for DeepSeek-V3.2 DSA mechanism."""
 
+import logging
 import os
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
@@ -58,13 +59,21 @@ def _make_indexer_pool(index_topk: int, index_head_dim: int, blocksize: int):
         IndexerPool,
     )
 
-    return IndexerPool(
+    pool = IndexerPool(
         slots=int(os.environ.get("GLM5_INDEXER_POOL_SLOTS", "128")),
         reuse_steps=steps,
         min_length=int(os.environ.get("GLM5_INDEXER_POOL_MIN_KV_LEN", "16384")),
         device=torch.device("cuda", torch.cuda.current_device()),
         pool_size=int(os.environ.get("GLM5_INDEXER_POOL_SIZE", "8192")),
     )
+    logging.info(
+        "Indexer pool reuse: pool %d, reuse %d steps, min KV %d, %d slots",
+        pool.pool_size,
+        pool.reuse_steps,
+        pool.min_length,
+        pool.slots,
+    )
+    return pool
 
 
 def _fp8_mqa_logits_chunk_rows() -> int:
