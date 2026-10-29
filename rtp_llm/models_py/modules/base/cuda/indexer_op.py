@@ -274,6 +274,23 @@ class IndexerOp(nn.Module):
         self.is_neox_style = is_neox_style
         self._pool = _make_indexer_pool(index_topk, index_head_dim, blocksize)
 
+        from rtp_llm.models_py.triton_kernels.sparse_mla.prefill_pivot import (
+            PrefillPivotConfig,
+        )
+
+        self._prefill_pivot = PrefillPivotConfig.from_env(index_topk)
+        if self._prefill_pivot is not None:
+            if (index_n_heads, index_head_dim, index_topk, block_size) != (
+                32,
+                128,
+                2048,
+                128,
+            ):
+                raise ValueError(
+                    "PIVOT prefill requires 32 heads, dim 128, Top-2048, one Q/K scale per head"
+                )
+            logging.info("PIVOT prefill (eager only): %s", self._prefill_pivot)
+
         glm5_topk_backend = (
             os.environ.get("GLM5_INDEXER_TOPK_BACKEND", "dsv4_persistent")
             .strip()
@@ -897,6 +914,43 @@ class IndexerOp(nn.Module):
             prompt_lengths=prompt_lengths,
         )
 
+    def _get_prefill_pivot_topk(self, q, q_scale, weights, kv, ks, ke, offsets):
+        """Optional prefill-only branch; native output offsets stay unchanged."""
+        if self._prefill_pivot is None:
+            return None
+        if q_scale is None:
+            raise ValueError("PIVOT prefill requires the original per-head Q scales")
+        from rtp_llm.models_py.triton_kernels.sparse_mla.prefill_pivot import pivot_topk
+
+        out = torch.empty(
+            (q.shape[0], self.index_topk), device=q.device, dtype=torch.int32
+        )
+        # Bound workspace even if the legacy chunk env is unset (0).
+        chunk = min(_fp8_mqa_logits_chunk_rows() or 2048, 2048)
+        canonicalize = _fp8_prefill_topk_canonicalize()
+        for start in range(0, q.shape[0], chunk):
+            end = min(start + chunk, q.shape[0])
+            indices = pivot_topk(
+                q[start:end],
+                q_scale[start:end],
+                weights[start:end],
+                kv,
+                ks[start:end],
+                ke[start:end],
+                offsets[start:end],
+                self.index_topk,
+                self._prefill_pivot,
+                lambda q, kv, w, ks, ke: deep_gemm.fp8_mqa_logits(
+                    q, kv, w, ks, ke, clean_logits=False
+                ),
+                self._run_prefill_topk,
+                output=None if canonicalize else out[start:end],
+                apply_offsets=not canonicalize,
+            )
+            if canonicalize:
+                _write_prefill_topk(indices, offsets[start:end], out[start:end])
+        return out
+
     def _get_topk_ragged(
         self,
         q_fp8: torch.Tensor,
@@ -904,6 +958,7 @@ class IndexerOp(nn.Module):
         kv_cache: KVCache,
         fmha_params: Any,
         attention_inputs: Any,
+        q_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute TopK indices for ragged attention (prefill phase).
@@ -961,6 +1016,18 @@ class IndexerOp(nn.Module):
         assert (
             fmha_params.ks is not None and fmha_params.ke is not None
         ), "ks/ke must be prepared in prefill"
+
+        pivot_result = self._get_prefill_pivot_topk(
+            q_fp8,
+            q_scale,
+            weights,
+            kv_fp8,
+            fmha_params.ks,
+            fmha_params.ke,
+            fmha_params.topk_indices_offset,
+        )
+        if pivot_result is not None:
+            return pivot_result
 
         num_rows = q_fp8.shape[0]
         topk_result = torch.empty(
@@ -1027,6 +1094,7 @@ class IndexerOp(nn.Module):
         indexer_copy_dst_idx: Optional[torch.Tensor] = None,
         indexer_src_for_padded: Optional[torch.Tensor] = None,
         total_local_ids_is_identity: bool = False,
+        q_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute TopK indices for ragged attention (prefill phase) with context parallel
@@ -1153,6 +1221,25 @@ class IndexerOp(nn.Module):
         if not has_local_ids:
             return torch.empty((0, self.index_topk), dtype=torch.int32, device=device)
         kv_fp8_full = (k_fp8, k_scale.view(torch.float32).squeeze(-1))
+        if self._prefill_pivot is not None:
+            if q_scale is None:
+                raise ValueError(
+                    "PIVOT CP prefill requires the original per-head Q scales"
+                )
+            local_scale = (
+                q_scale[: q0.shape[0]]
+                if total_local_ids_is_identity
+                else q_scale[total_local_ids].contiguous()
+            )
+            return self._get_prefill_pivot_topk(
+                q0,
+                local_scale,
+                weights_sq0,
+                kv_fp8_full,
+                precomputed_ks,
+                precomputed_ke,
+                precomputed_topk_off,
+            )
         prefill_max_kv_len = int(
             getattr(fmha_params, "prefill_max_kv_len", total_kv_tokens)
         )

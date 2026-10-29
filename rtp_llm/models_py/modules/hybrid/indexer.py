@@ -325,6 +325,7 @@ class Indexer(nn.Module):
         fmha_params: Any,
         attention_inputs: Any,
         cp_params: Optional[Any],
+        q_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         is_multi_token_decode = bool(
             getattr(attention_inputs, "is_target_verify", False)
@@ -361,9 +362,10 @@ class Indexer(nn.Module):
                 total_local_ids_is_identity=bool(
                     getattr(cp_params, "total_local_ids_is_identity", False)
                 ),
+                q_scale=q_scale,
             )
         return self.indexer_op._get_topk_ragged(
-            q_fp8, weights, kv_cache, fmha_params, attention_inputs
+            q_fp8, weights, kv_cache, fmha_params, attention_inputs, q_scale=q_scale
         )
 
     def forward(
@@ -451,5 +453,11 @@ class Indexer(nn.Module):
 
         weights = self._get_logits_head_gate(hidden_states, q_scale)
         return self._compute_topk(
-            q_fp8, weights, kv_cache, fmha_params, attention_inputs, cp_params
+            q_fp8,
+            weights,
+            kv_cache,
+            fmha_params,
+            attention_inputs,
+            cp_params,
+            q_scale=q_scale,
         )
