@@ -64,7 +64,8 @@ the decode `GLM5_INDEXER_POOL_*` options remain independent.
    mix two different packed K origins.
 7. Run the configured native prefill Top-2048 on candidate scores, map the
    selected candidate slots to original K IDs, check finite scores and causal
-   bounds, and scatter with output offsets in one kernel. Invalid slots remain
+   bounds, subtract each row's ragged K start to recover native request-relative
+   indices, and scatter with output offsets in one kernel. Invalid slots remain
    `-1`. Explicit canonicalization retains the existing sort/write path and
    still applies offsets exactly once.
 
@@ -133,3 +134,36 @@ separate prefill/decode workers. CP boundary unit tests do not replace that
 deployment validation. TTFT includes JIT and concurrent scheduling effects;
 the two arms also produced different output trajectories. No SWE evaluation
 was performed for this prefill change.
+
+## Ragged output-coordinate fix (2026-10-30)
+
+The initial implementation returned assembled-K indices for refined rows,
+while native TopK and fallback rows returned request-relative indices. For a
+second request whose K starts at 40000, this incorrectly shifted every refined
+index by 40000. CP gathered attention adds a request workspace offset itself,
+so the initial output could read the wrong request region or go out of bounds.
+The remap kernel now subtracts the row's K start before applying the caller's
+output offset. Zero-origin single-request behavior is unchanged.
+
+A reproducer with identical queries and sufficient candidates had 0% selected
+set overlap for the second request before the fix and 100% after it. GPU
+regression coverage includes nonzero request origins, refined/fallback rows,
+4K/16K budgets, both final TopK backends, canonicalization, and the CP entry
+with identity/permuted query layouts (transport mocked); 51 tests passed.
+
+`MAX_CONTEXT_BATCH_SIZE=1` is not a singleton admission guarantee in this
+branch's FIFO scheduler. With CP enabled and `CP_FORCE_SINGLE_PREFILL=0`,
+multiple requests may be admitted subject to concurrency and token/KV limits.
+The previous single-request-per-rank RULER run did not exercise this bug.
+The user's SWE degradation has not yet been reproduced end-to-end, so this
+confirmed bug is not proof that all observed quality loss has been explained.
+
+A separate shadow run on eight approximately 48K RULER CWE prompts sampled
+64 queries in each of 21 active indexer layers (10752 query/layer observations
+per variant), keeping the model trajectory native. Mean native Top-2048
+candidate coverage was 88.67% for g4/C4096, 95.86% for g4/C8192 and 98.93% for
+g4/C16384. Final selected-set overlap matched coverage on every sampled g4
+row; candidate scores matched the native full-context scores exactly. However,
+the minimum g4/C16384 coverage was only 18.99%, at a final prompt query in
+layer 0. These zero-origin measurements isolate approximation from the ragged
+coordinate bug; they are neither SWE accuracy nor proof of CP8 correctness.

@@ -1,8 +1,8 @@
 """Opt-in, stateless PIVOT-Refine for eager prefill (including CP).
 
-Indices throughout this module address the assembled ragged K tensor. The
-output writer applies the per-row offset exactly once, optionally fused with
-refine's remap/scatter.
+Candidate indices address the assembled ragged K tensor. Output indices are
+relative to each row's K start, matching native ragged TopK. The output writer
+applies the per-row offset exactly once, optionally fused with remap/scatter.
 Boundary/short rows use the caller's original full-context Indexer kernels.
 """
 

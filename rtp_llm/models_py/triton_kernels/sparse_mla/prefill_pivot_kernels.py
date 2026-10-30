@@ -473,6 +473,10 @@ def _remap(
         & (tl.abs(score) != float("inf"))
     )
     dest = tl.load(ROWS + r)
+    # Candidates address assembled K, but native ragged TopK returns indices
+    # relative to each request's K start. Preserve that output contract before
+    # applying the caller's offset (which is zero for paged sparse attention).
+    token -= lo
     if APPLY_OFFSET:
         token += tl.load(OFF + dest)
     tl.store(OUT + dest * TOPK + j, tl.where(valid, token, -1), j < TOPK)

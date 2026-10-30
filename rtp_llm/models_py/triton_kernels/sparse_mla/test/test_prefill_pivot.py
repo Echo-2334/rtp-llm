@@ -200,16 +200,16 @@ class PrefillPivotGpuTest(unittest.TestCase):
         groups = torch.tensor([[3, 1, 4, 0]], device="cuda")
         ks = torch.full((4,), 10, device="cuda", dtype=torch.int32)
         ke = torch.full((4,), 14, device="cuda", dtype=torch.int32)
-        offsets = torch.tensor([-5, -10, 0, 100, -8], device="cuda", dtype=torch.int32)
+        offsets = torch.tensor([5, 10, 0, 100, 8], device="cuda", dtype=torch.int32)
         out = torch.full((5, 6), -777, device="cuda", dtype=torch.int32)
         remap_output(selected, scores, candidates, groups, ks, ke, offsets, out, True)
         expected = torch.tensor(
             [
                 [5, 6, 7, -1, -1, -1],
-                [0, 1, -1, -1, -1, -1],
+                [10, 11, -1, -1, -1, -1],
                 [-777] * 6,
-                [110, -1, 112, -1, -1, -1],
-                [-1, 3, 4, -1, -1, -1],
+                [100, -1, 102, -1, -1, -1],
+                [-1, 9, 10, -1, -1, -1],
             ],
             device="cuda",
             dtype=torch.int32,
@@ -339,12 +339,44 @@ class PrefillPivotGpuTest(unittest.TestCase):
         with patch.object(kernels, "score_candidates", side_effect=inspect):
             out = self.run_pivot((q, qs, w, kv, ks, ke), config, -ks)
         self.assertEqual(len(seen), 1)
-        self.assertTrue(((out >= ks[:, None]) & (out < ke[:, None])).all().item())
+        self.assertTrue(((out >= 0) & (out < (ke - ks)[:, None])).all().item())
         for row in out:
             self.assertEqual(row.unique().numel(), 2048)
         self.op._prefill_pivot = config
-        shifted = self.op._get_prefill_pivot_topk(q, qs, w, kv, ks, ke, -ks)
-        self.assertTrue(((shifted >= 0) & (shifted < (ke - ks)[:, None])).all().item())
+        shifted = self.op._get_prefill_pivot_topk(q, qs, w, kv, ks, ke, ks)
+        self.assertTrue(
+            ((shifted >= ks[:, None]) & (shifted < ke[:, None])).all().item()
+        )
+
+    def test_nonzero_ragged_origin_matches_native_output_coordinates(self):
+        q, qs, w, kv, ks, ke = self.inputs(rows=9, length=80000)
+        q = q[:1].expand_as(q).contiguous()
+        qs = torch.ones_like(qs)
+        w = w[:1].abs().expand_as(w).contiguous()
+        ks[4:] = 40000
+        ke[:4] = torch.arange(39997, 40001, device="cuda", dtype=torch.int32)
+        ke[4:] = torch.arange(79996, 80001, device="cuda", dtype=torch.int32)
+        dense = self.logits(q, kv, w, ks, ke)
+        for backend in ("dsv4_per_row", "topk_v3_tie_break"):
+            self.op._prefill_topk_backend = backend
+            native = torch.empty((9, 2048), device="cuda", dtype=torch.int32)
+            self.op._run_prefill_topk(dense, ks, ke, native, 40000)
+            threshold = dense.gather(1, native.long() + ks[:, None]).min(1).values
+            for budget in (4096, 16384):
+                self.op._prefill_pivot = PrefillPivotConfig(candidates=budget)
+                for canonicalize in ("0", "1"):
+                    with patch.dict(
+                        os.environ, {"DSV4_INDEXER_TOPK_CANONICALIZE": canonicalize}
+                    ):
+                        output = self.op._get_prefill_pivot_topk(
+                            q, qs, w, kv, ks, ke, torch.zeros_like(ks)
+                        )
+                    # Includes two refined request groups and a native tail row.
+                    self.assertTrue(
+                        ((output >= 0) & (output < (ke - ks)[:, None])).all().item()
+                    )
+                    scores = dense.gather(1, output.long() + ks[:, None])
+                    self.assertTrue((scores >= threshold[:, None] - 1e-4).all().item())
 
     def test_identical_queries_retain_full_context_topk(self):
         q, qs, w, kv, ks, ke = self.inputs(rows=8)
@@ -420,6 +452,60 @@ class PrefillPivotGpuTest(unittest.TestCase):
                 torch.testing.assert_close(
                     cp.sort(1).values, normal[ids].sort(1).values
                 )
+
+    def test_cp_nonzero_request_origin_matches_native(self):
+        from rtp_llm.models_py.modules.base.cuda import indexer_op as module
+
+        q, qs, w, kv, ks, ke = self.inputs(rows=12, length=80000)
+        q = q[:1].expand_as(q).contiguous()
+        qs = torch.ones_like(qs)
+        w = w[:1].abs().expand_as(w).contiguous()
+        ks[4:] = 40000
+        ke[:4] = torch.arange(39997, 40001, device="cuda", dtype=torch.int32)
+        ke[4:] = torch.arange(79993, 80001, device="cuda", dtype=torch.int32)
+        inputs = SimpleNamespace(is_prefill=True, cu_kv_seqlens=None)
+        params = SimpleNamespace(prefill_max_kv_len=40000)
+
+        def gather(cache, key, scale, table, cu):
+            key.copy_(kv[0])
+            scale.view(torch.float32).copy_(kv[1][:, None])
+
+        with patch.object(
+            module, "_prefill_physical_block_table", return_value=None
+        ), patch.object(self.op, "_kv_cache_blocks", return_value=None), patch.object(
+            module.rtp_llm_ops, "cp_gather_indexer_k_quant_cache", side_effect=gather
+        ):
+            for identity in (False, True):
+                ids = (
+                    torch.arange(12, device="cuda")
+                    if identity
+                    else torch.tensor(
+                        [8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7], device="cuda"
+                    )
+                )
+                args = (
+                    q,
+                    w[..., None],
+                    None,
+                    params,
+                    inputs,
+                    ids,
+                    None,
+                    kv[0].shape[0],
+                    ks[ids],
+                    ke[ids],
+                    ke[ids] - ks[ids],
+                    torch.zeros_like(ks)[ids],
+                )
+                self.op._prefill_pivot = None
+                native = self.op._get_topk_ragged_cp(
+                    *args, total_local_ids_is_identity=identity, q_scale=qs
+                )
+                self.op._prefill_pivot = PrefillPivotConfig(candidates=16384)
+                actual = self.op._get_topk_ragged_cp(
+                    *args, total_local_ids_is_identity=identity, q_scale=qs
+                )
+                torch.testing.assert_close(actual.sort(1).values, native.sort(1).values)
 
     def test_chunked_long_context_and_tail(self):
         q, qs, w, kv, ks, ke = self.inputs(rows=13, length=131072)
