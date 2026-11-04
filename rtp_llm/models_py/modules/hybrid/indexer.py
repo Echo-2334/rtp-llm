@@ -332,7 +332,7 @@ class Indexer(nn.Module):
         ) or bool(getattr(attention_inputs, "is_draft_extend", False))
         if not attention_inputs.is_prefill or is_multi_token_decode:
             return self.indexer_op._get_topk_paged(
-                q_fp8, weights, kv_cache, fmha_params, attention_inputs
+                q_fp8, weights, kv_cache, fmha_params, attention_inputs, q_scale=q_scale
             )
         if self._prefill_cp_enabled():
             assert cp_params is not None

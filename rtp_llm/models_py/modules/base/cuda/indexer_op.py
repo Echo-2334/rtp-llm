@@ -273,6 +273,17 @@ class IndexerOp(nn.Module):
         self.scale_fmt = scale_fmt
         self.is_neox_style = is_neox_style
         self._pool = _make_indexer_pool(index_topk, index_head_dim, blocksize)
+        from rtp_llm.models_py.triton_kernels.sparse_mla.decode_pivot import (
+            DecodePivotConfig,
+        )
+
+        self._decode_pivot = DecodePivotConfig.from_env(index_topk)
+        if self._decode_pivot is not None:
+            if (index_n_heads, index_head_dim, block_size) != (32, 128, 128):
+                raise ValueError(
+                    "Decode PIVOT requires 32 heads, dim 128 and per-head Q scale"
+                )
+            logging.info("PIVOT MTP3 target verification: %s", self._decode_pivot)
 
         from rtp_llm.models_py.triton_kernels.sparse_mla.prefill_pivot import (
             PrefillPivotConfig,
@@ -742,6 +753,7 @@ class IndexerOp(nn.Module):
         kv_cache: KVCache,
         fmha_params: Any,
         attention_inputs: Any,
+        q_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute TopK indices for paged attention (decode phase).
@@ -804,6 +816,62 @@ class IndexerOp(nn.Module):
             # A request may enter and leave while a fallback path bypasses
             # the pool. Do not later revive its predecessor's slot state.
             self._pool.reset()
+
+        pivot = getattr(self, "_decode_pivot", None)
+        if (
+            pivot is not None
+            and is_target_verify
+            and not is_draft_extend
+            and q_fp8.shape[0] == block_table.shape[0] * 4
+            and block_table.shape[1] * self.blocksize >= pivot.candidates
+        ):
+            if q_scale is None:
+                raise ValueError("Decode PIVOT requires original Q scales")
+            from rtp_llm.models_py.triton_kernels.sparse_mla.decode_pivot import (
+                decode_pivot_topk,
+            )
+
+            workspace = _get_topk_workspace(q_fp8.device)
+            max_len = block_table.shape[1] * self.blocksize
+
+            def full_logits(q, w, lens, table):
+                # Respect the runtime's native-MTP layout choice. Never reuse
+                # the four-query scheduler metadata for a one-query proxy.
+                if kvlen_2d.shape[1] == 1 and lens.shape[1] != 1:
+                    table = table.repeat_interleave(lens.shape[1], dim=0)
+                    lens = lens.reshape(-1, 1)
+                schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                    lens, self.blocksize, deep_gemm.get_num_sms()
+                )
+                return deep_gemm.fp8_paged_mqa_logits(
+                    q.view(*lens.shape, self.index_n_heads, self.index_head_dim),
+                    kv_cache_fp8,
+                    w,
+                    lens,
+                    table,
+                    schedule,
+                    max_len,
+                    clean_logits=False,
+                )
+
+            def select(logits, lens, out, max_length):
+                self._paged_topk_op(
+                    logits, lens, out, workspace, self.index_topk, max_length
+                )
+
+            return decode_pivot_topk(
+                q_fp8,
+                q_scale,
+                weights,
+                kv_cache_fp8,
+                block_table,
+                lengths,
+                self.blocksize,
+                self.index_topk,
+                pivot,
+                full_logits,
+                select,
+            )
 
         if is_multi_token_decode:
             num_tokens = q_fp8.shape[0]

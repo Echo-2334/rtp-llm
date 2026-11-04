@@ -1176,21 +1176,25 @@ makeFakeSPOutputBuffer(DataType data_type, size_t hidden_size, size_t vocab_size
 }
 
 static void ensureSpOutputTokenGpuMirrors(const SpeculativeExecutorStreamOutputPtr& sp_buffer) {
-    // Mirrors should already be device-resident from the buffer's construction
-    // site (MtpExecutor::prepareStreams + makeFakeSPOutputBuffer). Only the
-    // legacy P2P-injection path (StreamCacheResource::applyP2PSideChannel) and
-    // dispatchDecodeAsync intentionally replace them with values from a payload.
-    // This function exists as a defensive fallback for older paths; it should be
-    // a no-op in steady-state and never trigger an H2D sync.
     if (!sp_buffer || !sp_buffer->tokens.defined() || sp_buffer->tokens.numel() < 2) {
         return;
     }
-    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
-    if (!sp_buffer->target_token_gpu.defined() || !sp_buffer->target_token_gpu.is_cuda()) {
-        sp_buffer->target_token_gpu = torch::zeros({1}, cuda_i32);
+    const bool needs_target = !sp_buffer->target_token_gpu.defined() || !sp_buffer->target_token_gpu.is_cuda();
+    const bool needs_propose = !sp_buffer->propose_tokens_gpu.defined() || !sp_buffer->propose_tokens_gpu.is_cuda();
+    if (!needs_target && !needs_propose) {
+        return;
     }
-    if (!sp_buffer->propose_tokens_gpu.defined() || !sp_buffer->propose_tokens_gpu.is_cuda()) {
-        sp_buffer->propose_tokens_gpu = torch::zeros({1}, cuda_i32);
+    // Prefill dispatch and legacy P2P paths may publish only the CPU tokens.
+    // Missing mirrors must contain those tokens: zero is a valid vocabulary
+    // token, not an empty-state marker, and corrupts the first target verify.
+    // The synchronous copy also keeps the CPU storage alive until H2D completes.
+    auto tokens_gpu = sp_buffer->tokens.reshape({-1}).narrow(0, 0, 2).to(
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    if (needs_target) {
+        sp_buffer->target_token_gpu = tokens_gpu.narrow(0, 0, 1);
+    }
+    if (needs_propose) {
+        sp_buffer->propose_tokens_gpu = tokens_gpu.narrow(0, 1, 1);
     }
 }
 

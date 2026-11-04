@@ -826,8 +826,12 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
     if (!enable_cuda_graph_) {
         return false;
     }
-    const bool target_verify_decode = is_target_verify_ || inputs.attention_inputs.is_target_verify;
-    if (inputs.attention_inputs.is_prefill && !is_prefill_cuda_graph_mode_ && !target_verify_decode) {
+    // The target model also handles ordinary prompt prefill. The runner's
+    // capture role describes its graphs, not the current request phase;
+    // admitting prefill on that role would put the whole prompt into a
+    // four-token MTP verification graph.
+    if (inputs.attention_inputs.is_prefill && !is_prefill_cuda_graph_mode_
+        && !inputs.attention_inputs.is_target_verify) {
         return false;
     }
 

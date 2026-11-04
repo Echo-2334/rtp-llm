@@ -6,6 +6,7 @@
 #include "gtest/gtest.h"
 
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
+#include "rtp_llm/cpp/cuda_graph/cuda_graph_runner.h"
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 #include "rtp_llm/cpp/models/logits_processor/BaseLogitsProcessor.h"
 #include "rtp_llm/cpp/models/logits_processor/SpecLogitsProcessor.h"
@@ -31,6 +32,45 @@ namespace rtp_llm {
 
 using namespace std;
 namespace spec = speculative;
+
+#if USING_CUDA
+TEST(MtpCudaGraphRoutingTest, TargetRunnerRejectsPromptButAcceptsPaddedVerificationBatch) {
+    std::unique_ptr<py::scoped_interpreter> interpreter;
+    if (!Py_IsInitialized()) {
+        interpreter = std::make_unique<py::scoped_interpreter>();
+    }
+    py::gil_scoped_acquire gil;
+    auto model = py::module_::import("types").attr("SimpleNamespace")();
+    model.attr("prepare_fmha_impl") = py::none();
+    model.attr("forward") = py::none();
+    GraphParams params;
+    params.enable_cuda_graph = true;
+    params.is_target_verify = true;
+    params.num_tokens_per_bs = 4;
+    params.max_seq_len = 65536;
+    params.tokens_per_block = params.kernel_tokens_per_block = 64;
+    params.hidden_size = 1;
+    CudaGraphRunner runner(params, model);
+    // No model execution is needed to exercise the real graph-selection gate.
+    runner.capture_range_ = {1, 2, 4, 8};
+    torch_ext::PyModelInputs inputs;
+    inputs.attention_inputs.is_prefill = true;
+    inputs.attention_inputs.is_target_verify = false;
+    inputs.attention_inputs.input_lengths = torch::tensor({47935}, torch::kInt32);
+    inputs.attention_inputs.total_tokens = 47935;
+    CudaGraphState state;
+    EXPECT_FALSE(runner.canRun(inputs, state));
+
+    // PD decode enters with the actual target-verify flag. Three requests
+    // select the four-request bucket, preserving room for padded rows.
+    inputs.attention_inputs.is_target_verify = true;
+    inputs.attention_inputs.input_lengths = torch::full({3}, 4, torch::kInt32);
+    inputs.attention_inputs.total_tokens = 12;
+    EXPECT_TRUE(runner.canRun(inputs, state));
+    EXPECT_EQ(runner.getCurrentRealGraphBs(state), 4);
+    EXPECT_EQ(state.seq_len_sum, 12);
+}
+#endif
 
 struct MtpExecutorTestConfig {
     size_t max_seq_len         = 2048;
@@ -520,6 +560,35 @@ TEST_F(MtpExecutorTest, testDeterministicDraftSamplerReportsPointMassProposal) {
 
     EXPECT_EQ(output.token_ids.item<int64_t>(), 2);
     checkTensorEqual(output.all_probs, torch::tensor({{0.0f, 0.0f, 1.0f, 0.0f}}).to(torch::kCUDA));
+}
+
+TEST_F(MtpExecutorTest, testMissingTokenGpuMirrorsPreservePublishedPrefillTokens) {
+    MtpExecutorTestConfig test_config;
+    auto components = createMtpExecutorComponents(test_config);
+    auto stream = MtpExecutor::createMinFakeDecodeStream(test_config.gen_num_per_cycle,
+                                                        components.model_config,
+                                                        components.runtime_config,
+                                                        components.resource_context,
+                                                        test_config.vocab_size);
+    auto buffer = stream->getSPOutputBuffer();
+    buffer->tokens = torch::tensor({2, 3}, torch::kInt32).reshape({1, 2});
+    buffer->target_token_gpu = torch::Tensor();
+    buffer->propose_tokens_gpu = torch::Tensor();
+    std::list<GenerateStreamPtr> streams{stream}, prefill_streams, decode_streams;
+    components.executor->prepareStreams(streams, prefill_streams, decode_streams);
+    ASSERT_TRUE(buffer->target_token_gpu.is_cuda());
+    ASSERT_TRUE(buffer->propose_tokens_gpu.is_cuda());
+    EXPECT_EQ(buffer->target_token_gpu.item<int32_t>(), 2);
+    EXPECT_EQ(buffer->propose_tokens_gpu.item<int32_t>(), 3);
+
+    // A valid device mirror is authoritative even if the legacy CPU copy lags.
+    buffer->target_token_gpu.fill_(1);
+    buffer->propose_tokens_gpu = torch::Tensor();
+    prefill_streams.clear();
+    decode_streams.clear();
+    components.executor->prepareStreams(streams, prefill_streams, decode_streams);
+    EXPECT_EQ(buffer->target_token_gpu.item<int32_t>(), 1);
+    EXPECT_EQ(buffer->propose_tokens_gpu.item<int32_t>(), 3);
 }
 
 TEST_F(MtpExecutorTest, testFakeDecodeStreamGetsReusableIndexerSeedBeforeColdCheck) {
