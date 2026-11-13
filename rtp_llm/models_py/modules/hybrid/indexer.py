@@ -37,6 +37,7 @@ class Indexer(nn.Module):
         hw_kernel_config: Optional["HWKernelConfig"] = None,
         parallelism_config: Optional[ParallelismConfig] = None,
         scale_fmt: Optional[str] = "none",
+        prefill_pivot_setting: Optional[str] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -135,6 +136,7 @@ class Indexer(nn.Module):
             block_size=self.block_size,
             scale_fmt=self.scale_fmt,
             is_neox_style=self.is_neox_style,
+            prefill_pivot_setting=prefill_pivot_setting,
         )
 
     def _prefill_cp_enabled(self) -> bool:

@@ -35,6 +35,69 @@ the decode `GLM5_INDEXER_POOL_*` options remain independent.
 
 ## Algorithm and boundaries
 
+### Per-layer G4P4K / native selection
+
+Use `GLM5_PREFILL_PIVOT_MODE=layerwise` and set
+`GLM5_PREFILL_PIVOT_LAYER_CONFIG` to a JSON file available to every worker:
+
+```bash
+export GLM5_PREFILL_PIVOT_MODE=layerwise
+export GLM5_PREFILL_PIVOT_LAYER_CONFIG=/absolute/path/pivot_layers.json
+```
+
+```json
+{
+  "default": "native",
+  "layers": {"0": "native", "2": "G4P4K", "6": "G4P4K", "10": "native"}
+}
+```
+
+Only `native` and `G4P4K` are accepted. The default is `native`; unspecified
+indexer layers use `default`. `{"default":"G4P4K"}` enables every indexer,
+and `{"default":"native"}` disables prefill PIVOT everywhere. G4P4K fixes
+group size 4, candidate budget 4096, local window 4 and minimum KV length 32768;
+the global group/budget/window/minimum environment variables apply only to the
+legacy `refine` mode. Final selection remains Top-2048.
+
+[The GLM-5.3 configuration example](examples/glm53_prefill_pivot_layers.json)
+lists all 21 indexer layers explicitly and initially enables G4P4K for each.
+Change any value to `native` to disable query-group reuse at that layer.
+
+Keys are **zero-based physical model layer IDs**, not compact indexer IDs.
+GLM-5.3's 78-layer target model has 21 indexers at
+`0,1,2,6,10,14,18,22,26,30,34,38,42,46,50,54,58,62,66,70,74`.
+The mapping is validated against the loaded model rather than hard-coded.
+Shared layers retain the preceding full layer's indices, so choosing layer 6
+also changes the indices consumed by layers 7–9. Shared/out-of-range IDs,
+duplicate keys, unknown fields and invalid settings fail initialization.
+The extra MTP layer is excluded; its local layer numbering must not select a
+target-model policy accidentally.
+
+The file is read once per model initialization, with its SHA256 and resolved
+indexer settings logged. Restart the service to change policies; do not reuse
+KV caches across policies. Existing `off` and `refine` runs ignore this file.
+No environment or file lookup is added to the forward path, and the existing
+PIVOT kernels are unchanged.
+
+This mode is **prefill only**. Multiple requests and unequal sequence lengths
+use the existing ragged boundary checks: groups never cross requests and
+short/boundary/tail rows use native selection. Decode and MTP retain their
+existing dispatch. Decode CUDA graphs can be enabled (for example,
+`--enable_cuda_graph 1 --decode_capture_config 1,2,3,4`) while prefill remains
+eager. The PIVOT prefill operation itself is not graph-capturable. Actual
+request batching still depends on scheduler token/KV budgets; graph capture
+sizes and HTTP concurrency alone do not determine the executing GPU batch.
+
+Regression tests (run on a supported CUDA GPU):
+
+```bash
+python -m unittest \
+  rtp_llm.models_py.triton_kernels.sparse_mla.test.test_prefill_pivot \
+  rtp_llm.models_py.triton_kernels.sparse_mla.test.test_prefill_pivot_policy -v
+```
+
+### Shared PIVOT algorithm
+
 1. Keep the existing Q/K projections, positional transforms, quantization,
    cache writes and full K assembly. CP collective ordering is unchanged,
    including ranks with no local queries.

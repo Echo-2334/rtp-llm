@@ -248,6 +248,7 @@ class IndexerOp(nn.Module):
         block_size: int = 128,
         scale_fmt: str = "ue8m0",
         is_neox_style: bool = True,
+        prefill_pivot_setting: Optional[str] = None,
     ):
         """
         Initialize IndexerOp.
@@ -289,7 +290,9 @@ class IndexerOp(nn.Module):
             PrefillPivotConfig,
         )
 
-        self._prefill_pivot = PrefillPivotConfig.from_env(index_topk)
+        self._prefill_pivot = PrefillPivotConfig.resolve(
+            index_topk, prefill_pivot_setting
+        )
         if self._prefill_pivot is not None:
             if (index_n_heads, index_head_dim, index_topk, block_size) != (
                 32,

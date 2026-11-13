@@ -33,10 +33,29 @@ class PrefillPivotConfig:
             raise ValueError("PIVOT minimum KV length must be >= candidate budget")
 
     @classmethod
+    def resolve(
+        cls, topk: int, setting: Optional[str] = None
+    ) -> Optional["PrefillPivotConfig"]:
+        """A resolved layer choice overrides only prefill; None keeps legacy env."""
+        if setting is None:
+            return cls.from_env(topk)
+        if setting == "native":
+            return None
+        if setting != "G4P4K":
+            raise ValueError("PIVOT layer setting must be 'native' or 'G4P4K'")
+        config = cls()
+        config.validate(topk)
+        return config
+
+    @classmethod
     def from_env(cls, topk: int) -> Optional["PrefillPivotConfig"]:
         mode = os.environ.get("GLM5_PREFILL_PIVOT_MODE", "off").strip().lower()
         if mode == "off":
             return None
+        if mode == "layerwise":
+            raise ValueError(
+                "Layerwise PIVOT requires a setting resolved by the model initializer"
+            )
         if mode != "refine":
             raise ValueError("GLM5_PREFILL_PIVOT_MODE must be 'off' or 'refine'")
         config = cls(

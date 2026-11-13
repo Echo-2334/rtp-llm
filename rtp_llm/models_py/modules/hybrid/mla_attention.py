@@ -49,6 +49,7 @@ class MlaAttention(nn.Module):
         global_weights: Optional[Dict[str, torch.Tensor]] = None,
         has_indexer: Optional[bool] = None,
         reuse_topk_indices: bool = False,
+        prefill_pivot_setting: Optional[str] = None,
     ):
         super().__init__()
         self.attn_config = attn_config
@@ -80,6 +81,7 @@ class MlaAttention(nn.Module):
                 quant_config,
                 hw_kernel_config,
                 parallelism_config,
+                prefill_pivot_setting=prefill_pivot_setting,
             )
         else:
             self.indexer = None

@@ -14,6 +14,9 @@ from rtp_llm.models_py.model_desc.generic_moe import GenericMoeDecoderLayer
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.modules import Embedding, LinearFactory, RMSNorm, RMSResNorm
 from rtp_llm.models_py.modules.hybrid.glm5_cmp import should_enable_glm5_cmp
+from rtp_llm.models_py.triton_kernels.sparse_mla.prefill_pivot_policy import (
+    resolve_prefill_pivot_layers,
+)
 from rtp_llm.ops import MoeConfig, ParallelismConfig
 from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
@@ -90,6 +93,7 @@ class GenericMoeMTPModel(GptModelBase):
             if py_hw_kernel_config is not None
             else False
         )
+        prefill_pivot_layers = resolve_prefill_pivot_layers(model_config)
         self.layers = nn.ModuleList(
             [
                 GenericMoeDecoderLayer(
@@ -102,6 +106,11 @@ class GenericMoeMTPModel(GptModelBase):
                     max_generate_batch_size,
                     enable_cuda_graph=enable_cuda_graph,
                     hw_kernel_config=py_hw_kernel_config,
+                    prefill_pivot_setting=(
+                        prefill_pivot_layers[idx]
+                        if prefill_pivot_layers is not None
+                        else None
+                    ),
                 )
                 for idx in range(self.layer_num)
             ]

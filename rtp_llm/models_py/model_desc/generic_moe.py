@@ -35,6 +35,9 @@ from rtp_llm.models_py.modules.hybrid.glm5_cmp import (
     resolve_glm5_cmp_enabled,
     should_enable_glm5_cmp,
 )
+from rtp_llm.models_py.triton_kernels.sparse_mla.prefill_pivot_policy import (
+    resolve_prefill_pivot_layers,
+)
 from rtp_llm.ops import HWKernelConfig, MoeConfig, ParallelismConfig
 from rtp_llm.ops.compute_ops import LayerKVCache, PyModelInputs, PyModelOutputs
 from rtp_llm.utils.dsa_indexing import dsa_layer_has_indexer, dsa_layer_skips_topk
@@ -444,6 +447,7 @@ class GenericMoeDecoderLayer(nn.Module):
         max_generate_batch_size: int = 0,
         enable_cuda_graph: bool = False,
         hw_kernel_config: Optional["HWKernelConfig"] = None,
+        prefill_pivot_setting: Optional[str] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -472,6 +476,7 @@ class GenericMoeDecoderLayer(nn.Module):
                 global_weights=global_weights,
                 has_indexer=dsa_layer_has_indexer(config, layer_idx),
                 reuse_topk_indices=dsa_layer_skips_topk(config, layer_idx),
+                prefill_pivot_setting=prefill_pivot_setting,
             )
         else:
             attn_configs = config.getAttentionConfigs(
@@ -832,6 +837,7 @@ class GenericMoeModel(GptModelBase):
             if py_hw_kernel_config is not None
             else False
         )
+        prefill_pivot_layers = resolve_prefill_pivot_layers(model_config)
         self.layers = nn.ModuleList(
             [
                 GenericMoeDecoderLayer(
@@ -844,6 +850,11 @@ class GenericMoeModel(GptModelBase):
                     max_generate_batch_size,
                     enable_cuda_graph=enable_cuda_graph,
                     hw_kernel_config=py_hw_kernel_config,
+                    prefill_pivot_setting=(
+                        prefill_pivot_layers[idx]
+                        if prefill_pivot_layers is not None
+                        else None
+                    ),
                 )
                 for idx in range(self.layer_num)
             ]
