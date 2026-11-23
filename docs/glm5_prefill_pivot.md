@@ -37,7 +37,18 @@ the decode `GLM5_INDEXER_POOL_*` options remain independent.
 
 ### Per-layer G4P4K / native selection
 
-Use `GLM5_PREFILL_PIVOT_MODE=layerwise` and set
+For GLM-5.3, the following uses native per-query selection at physical indexer
+layers 34, 38 and 62 and G4P4K at every other indexer. Shared layers continue
+to consume the preceding indexer’s Top-K.
+
+```bash
+export GLM5_PREFILL_PIVOT_MODE=layerwise
+export GLM5_PREFILL_PIVOT_NATIVE_LAYERS=34,38,62
+```
+
+If a layer configuration file is also supplied, the listed layers override its
+settings. To configure the default and individual layers in a file, use
+`GLM5_PREFILL_PIVOT_MODE=layerwise` and set
 `GLM5_PREFILL_PIVOT_LAYER_CONFIG` to a JSON file available to every worker:
 
 ```bash

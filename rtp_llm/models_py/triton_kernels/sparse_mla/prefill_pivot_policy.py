@@ -52,17 +52,24 @@ def resolve_prefill_pivot_layers(config: Any) -> Optional[tuple[Optional[str], .
         raise ValueError("Layerwise PIVOT requires at least one indexer layer")
 
     path = os.environ.get("GLM5_PREFILL_PIVOT_LAYER_CONFIG", "").strip()
-    if not path:
+    native_layers = os.environ.get("GLM5_PREFILL_PIVOT_NATIVE_LAYERS", "").strip()
+    if path:
+        try:
+            raw = Path(path).read_bytes()
+        except OSError as error:
+            raise ValueError(
+                f"Cannot read PIVOT layer configuration {path!r}: {error}"
+            ) from error
+        data = json.loads(raw, object_pairs_hook=_unique_keys)
+        source = f"{path} sha256={hashlib.sha256(raw).hexdigest()}"
+    elif native_layers:
+        data = {"default": "G4P4K"}
+        source = "environment"
+    else:
         raise ValueError(
-            "GLM5_PREFILL_PIVOT_LAYER_CONFIG is required in layerwise mode"
+            "GLM5_PREFILL_PIVOT_LAYER_CONFIG or GLM5_PREFILL_PIVOT_NATIVE_LAYERS "
+            "is required in layerwise mode"
         )
-    try:
-        raw = Path(path).read_bytes()
-    except OSError as error:
-        raise ValueError(
-            f"Cannot read PIVOT layer configuration {path!r}: {error}"
-        ) from error
-    data = json.loads(raw, object_pairs_hook=_unique_keys)
     if not isinstance(data, dict) or set(data) - {"default", "layers"}:
         raise ValueError(
             "PIVOT configuration must be an object with only 'default' and 'layers'"
@@ -71,8 +78,14 @@ def resolve_prefill_pivot_layers(config: Any) -> Optional[tuple[Optional[str], .
     overrides = data.get("layers", {})
     if not isinstance(overrides, dict):
         raise ValueError("PIVOT 'layers' must map model layer IDs to settings")
+    choices = list(overrides.items())
+    if native_layers:
+        native_ids = _unique_keys(
+            (key.strip(), "native") for key in native_layers.split(",")
+        )
+        choices.extend(native_ids.items())
     settings = [default if i in full_layers else None for i in range(num_layers)]
-    for key, value in overrides.items():
+    for key, value in choices:
         if not key.isascii() or not key.isdecimal() or str(int(key)) != key:
             raise ValueError(
                 f"PIVOT layer ID must be a canonical nonnegative integer: {key!r}"
@@ -84,10 +97,9 @@ def resolve_prefill_pivot_layers(config: Any) -> Optional[tuple[Optional[str], .
             )
         settings[layer] = _setting(value)
     logging.info(
-        "Layerwise prefill PIVOT config=%s sha256=%s settings=%s "
+        "Layerwise prefill PIVOT config=%s settings=%s "
         "(G4P4K: group=4, candidates=4096, window=4, min_kv=32768)",
-        path,
-        hashlib.sha256(raw).hexdigest(),
+        source,
         {i: settings[i] for i in sorted(full_layers)},
     )
     return tuple(settings)

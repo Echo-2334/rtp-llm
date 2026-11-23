@@ -46,6 +46,7 @@ class PrefillPivotPolicyTest(unittest.TestCase):
             {
                 "GLM5_PREFILL_PIVOT_MODE": "layerwise",
                 "GLM5_PREFILL_PIVOT_LAYER_CONFIG": str(self.path),
+                "GLM5_PREFILL_PIVOT_NATIVE_LAYERS": "",
                 "GLM5_DECODE_PIVOT_MODE": "off",
                 "GLM5_INDEXER_POOL_REUSE_STEPS": "0",
                 "ENABLE_FUSE_KERNELS": "0",
@@ -69,6 +70,17 @@ class PrefillPivotPolicyTest(unittest.TestCase):
         self.assertEqual(settings[0], "native")
         self.assertEqual(updated[0], "G4P4K")
         self.assertEqual(updated[6], "native")
+
+    def test_env_native_layers_only_changes_query_group_policy(self):
+        os.environ["GLM5_PREFILL_PIVOT_NATIVE_LAYERS"] = "62, 38,34"
+        del os.environ["GLM5_PREFILL_PIVOT_LAYER_CONFIG"]
+        settings = resolve_prefill_pivot_layers(model_config())
+        self.assertEqual({i for i, s in enumerate(settings) if s == "native"}, {34, 38, 62})
+        self.assertEqual({i for i, s in enumerate(settings) if s == "G4P4K"}, set(FULL_LAYERS) - {34, 38, 62})
+        self.assertTrue(all(settings[i] is None for i in range(78) if i not in FULL_LAYERS))
+        os.environ["GLM5_PREFILL_PIVOT_NATIVE_LAYERS"] = "35"
+        with self.assertRaisesRegex(ValueError, "not an indexer layer"):
+            resolve_prefill_pivot_layers(model_config())
 
     def test_invalid_configuration_fails_instead_of_silent_fallback(self):
         invalid = [
