@@ -1,13 +1,14 @@
 # GLM5 prefill PIVOT-Refine (experimental)
 
-This opt-in path groups adjacent prefill queries, recalls a shared candidate
+This path groups adjacent prefill queries, recalls a shared candidate
 set with a mean proxy, and re-scores candidates independently for each query.
 It returns the existing Top-2048 interface. It is an approximation to the
 full-context Indexer, not a numerically equivalent optimization.
 
 ## Configuration
 
-Set these on the **prefill** worker:
+The 78-layer GLM-5.3 target uses the built-in per-layer policy described below.
+For other models using the legacy opt-in path, set these on the **prefill** worker:
 
 ```json
 [
@@ -37,22 +38,14 @@ the decode `GLM5_INDEXER_POOL_*` options remain independent.
 
 ### Per-layer G4P4K / native selection
 
-For GLM-5.3, the following uses native per-query selection at physical indexer
-layers 34, 38 and 62 and G4P4K at every other indexer. Shared layers continue
-to consume the preceding indexer’s Top-K.
+GLM-5.3 always uses native per-query selection at physical indexer layers
+34, 38 and 62. Every other indexer defaults to G4P4K. Shared layers consume
+the preceding indexer’s Top-K. Model initialization ignores
+`GLM5_PREFILL_PIVOT_MODE` and `GLM5_PREFILL_PIVOT_NATIVE_LAYERS` for this target.
+
+Optionally configure the other indexers with a JSON file available to every worker:
 
 ```bash
-export GLM5_PREFILL_PIVOT_MODE=layerwise
-export GLM5_PREFILL_PIVOT_NATIVE_LAYERS=34,38,62
-```
-
-If a layer configuration file is also supplied, the listed layers override its
-settings. To configure the default and individual layers in a file, use
-`GLM5_PREFILL_PIVOT_MODE=layerwise` and set
-`GLM5_PREFILL_PIVOT_LAYER_CONFIG` to a JSON file available to every worker:
-
-```bash
-export GLM5_PREFILL_PIVOT_MODE=layerwise
 export GLM5_PREFILL_PIVOT_LAYER_CONFIG=/absolute/path/pivot_layers.json
 ```
 
@@ -64,14 +57,14 @@ export GLM5_PREFILL_PIVOT_LAYER_CONFIG=/absolute/path/pivot_layers.json
 ```
 
 Only `native` and `G4P4K` are accepted. The default is `native`; unspecified
-indexer layers use `default`. `{"default":"G4P4K"}` enables every indexer,
+indexer layers use the file's `default`. `{"default":"G4P4K"}` enables every indexer except the three fixed native layers,
 and `{"default":"native"}` disables prefill PIVOT everywhere. G4P4K fixes
 group size 4, candidate budget 4096, local window 4 and minimum KV length 32768;
 the global group/budget/window/minimum environment variables apply only to the
 legacy `refine` mode. Final selection remains Top-2048.
 
 [The GLM-5.3 configuration example](examples/glm53_prefill_pivot_layers.json)
-lists all 21 indexer layers explicitly and initially enables G4P4K for each.
+lists all 21 indexer layers explicitly. The three fixed native layers take precedence.
 Change any value to `native` to disable query-group reuse at that layer.
 
 Keys are **zero-based physical model layer IDs**, not compact indexer IDs.

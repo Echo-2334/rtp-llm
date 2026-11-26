@@ -1,4 +1,4 @@
-"""Resolve opt-in, immutable prefill choices before constructing model layers."""
+"""Resolve immutable prefill choices before constructing model layers."""
 
 import hashlib
 import json
@@ -32,9 +32,17 @@ def resolve_prefill_pivot_layers(config: Any) -> Optional[tuple[Optional[str], .
     Shared layers have no Indexer and get None. MTP layers stay native and do
     not interpret the target model's layer IDs as their local layer IDs.
     """
-    if os.environ.get("GLM5_PREFILL_PIVOT_MODE", "off").strip().lower() != "layerwise":
-        return None
     num_layers = int(config.num_layers)
+    # The 78-layer GLM-5.3 target always uses the layerwise prefill policy.
+    glm53_target = (
+        getattr(config, "_is_glm52_architecture", False)
+        and num_layers == 78
+        and not getattr(config, "is_mtp", False)
+    )
+    if not glm53_target:
+        mode = os.environ.get("GLM5_PREFILL_PIVOT_MODE", "off").strip().lower()
+        if mode != "layerwise":
+            return None
     if bool(getattr(config, "is_mtp", False)):
         return ("native",) * num_layers
 
@@ -52,7 +60,13 @@ def resolve_prefill_pivot_layers(config: Any) -> Optional[tuple[Optional[str], .
         raise ValueError("Layerwise PIVOT requires at least one indexer layer")
 
     path = os.environ.get("GLM5_PREFILL_PIVOT_LAYER_CONFIG", "").strip()
-    native_layers = os.environ.get("GLM5_PREFILL_PIVOT_NATIVE_LAYERS", "").strip()
+    if glm53_target:
+        native_layers = ("34", "38", "62")
+    else:
+        raw_layers = os.environ.get("GLM5_PREFILL_PIVOT_NATIVE_LAYERS", "").strip()
+        native_layers = (
+            tuple(key.strip() for key in raw_layers.split(",")) if raw_layers else ()
+        )
     if path:
         try:
             raw = Path(path).read_bytes()
@@ -64,7 +78,7 @@ def resolve_prefill_pivot_layers(config: Any) -> Optional[tuple[Optional[str], .
         source = f"{path} sha256={hashlib.sha256(raw).hexdigest()}"
     elif native_layers:
         data = {"default": "G4P4K"}
-        source = "environment"
+        source = "GLM-5.3 built-in policy" if glm53_target else "environment"
     else:
         raise ValueError(
             "GLM5_PREFILL_PIVOT_LAYER_CONFIG or GLM5_PREFILL_PIVOT_NATIVE_LAYERS "
@@ -80,9 +94,7 @@ def resolve_prefill_pivot_layers(config: Any) -> Optional[tuple[Optional[str], .
         raise ValueError("PIVOT 'layers' must map model layer IDs to settings")
     choices = list(overrides.items())
     if native_layers:
-        native_ids = _unique_keys(
-            (key.strip(), "native") for key in native_layers.split(",")
-        )
+        native_ids = _unique_keys((key, "native") for key in native_layers)
         choices.extend(native_ids.items())
     settings = [default if i in full_layers else None for i in range(num_layers)]
     for key, value in choices:

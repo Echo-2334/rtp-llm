@@ -82,6 +82,26 @@ class PrefillPivotPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not an indexer layer"):
             resolve_prefill_pivot_layers(model_config())
 
+    def test_glm53_builtin_policy_with_unset_or_stale_environment(self):
+        config = model_config()
+        config._is_glm52_architecture = True
+        expected = tuple(
+            None if i not in FULL_LAYERS else "native" if i in (34, 38, 62) else "G4P4K"
+            for i in range(78)
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(resolve_prefill_pivot_layers(config), expected)
+            os.environ["GLM5_PREFILL_PIVOT_MODE"] = "off"
+            os.environ["GLM5_PREFILL_PIVOT_NATIVE_LAYERS"] = "2"
+            self.assertEqual(resolve_prefill_pivot_layers(config), expected)
+            os.environ["GLM5_PREFILL_PIVOT_LAYER_CONFIG"] = str(self.path)
+            self.path.write_text('{"default":"G4P4K","layers":{"6":"native"}}')
+            settings = resolve_prefill_pivot_layers(config)
+            self.assertEqual(
+                [i for i, setting in enumerate(settings) if setting == "native"],
+                [6, 34, 38, 62],
+            )
+
     def test_invalid_configuration_fails_instead_of_silent_fallback(self):
         invalid = [
             "[]",
